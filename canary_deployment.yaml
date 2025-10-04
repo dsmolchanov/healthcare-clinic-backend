@@ -1,0 +1,262 @@
+# Canary Deployment Configuration for LangGraph Migration
+# Progressive rollout strategy for Phase 6
+
+version: "1.0"
+name: "LangGraph Migration Canary Deployment"
+
+deployment:
+  strategy: canary
+  stages:
+    - name: "Initial Canary"
+      percentage: 5
+      duration: "2h"
+      success_criteria:
+        error_rate: "< 1%"
+        p95_latency: "< 1000ms"
+        success_rate: "> 99%"
+      rollback_on_failure: true
+
+    - name: "Early Adopters"
+      percentage: 10
+      duration: "4h"
+      success_criteria:
+        error_rate: "< 2%"
+        p95_latency: "< 1000ms"
+        success_rate: "> 98%"
+      rollback_on_failure: true
+
+    - name: "Expanded Testing"
+      percentage: 25
+      duration: "12h"
+      success_criteria:
+        error_rate: "< 3%"
+        p95_latency: "< 1200ms"
+        success_rate: "> 97%"
+      rollback_on_failure: true
+
+    - name: "Half Rollout"
+      percentage: 50
+      duration: "24h"
+      success_criteria:
+        error_rate: "< 5%"
+        p95_latency: "< 1500ms"
+        success_rate: "> 95%"
+      rollback_on_failure: true
+
+    - name: "Majority Deployment"
+      percentage: 80
+      duration: "24h"
+      success_criteria:
+        error_rate: "< 5%"
+        p95_latency: "< 1500ms"
+        success_rate: "> 95%"
+      rollback_on_failure: true
+
+    - name: "Full Deployment"
+      percentage: 100
+      duration: "continuous"
+      success_criteria:
+        error_rate: "< 5%"
+        p95_latency: "< 2000ms"
+        success_rate: "> 95%"
+      rollback_on_failure: false
+
+feature_flags:
+  langgraph_enabled:
+    default: false
+    overrides:
+      - environment: "staging"
+        value: true
+      - environment: "production"
+        value: false
+        canary_percentage: 5  # Start with 5% in production
+
+  dual_lane_routing:
+    default: true
+    description: "Text direct to LangGraph, voice through LiveKit"
+
+  grok_integration:
+    default: false
+    overrides:
+      - environment: "staging"
+        value: true
+        percentage: 30
+      - environment: "production"
+        value: false
+        percentage: 10  # Start with 10% Grok traffic
+
+  rag_memory_enabled:
+    default: true
+    description: "Universal RAG and memory services"
+
+  appointment_tools_enabled:
+    default: true
+    description: "Calendar appointment scheduling"
+
+traffic_routing:
+  method: "weighted_random"
+  sticky_sessions: true  # Keep users in same deployment group
+  session_duration: "1h"
+
+  rules:
+    - name: "Internal Testing"
+      condition: "header:X-Test-Group == 'internal'"
+      route_to: "canary"
+
+    - name: "Beta Users"
+      condition: "user_tag == 'beta'"
+      route_to: "canary"
+      percentage: 100
+
+    - name: "Healthcare Clinics"
+      condition: "clinic_type == 'healthcare'"
+      route_to: "stable"  # Keep healthcare on stable initially
+
+    - name: "Default"
+      condition: "default"
+      route_to: "weighted"  # Use percentage-based routing
+
+monitoring:
+  metrics:
+    - name: "response_time"
+      type: "histogram"
+      buckets: [50, 100, 200, 500, 1000, 2000, 5000]
+
+    - name: "error_rate"
+      type: "counter"
+      labels: ["error_type", "phase", "provider"]
+
+    - name: "llm_provider"
+      type: "counter"
+      labels: ["provider", "model"]
+
+    - name: "rag_performance"
+      type: "histogram"
+      buckets: [50, 100, 200, 500]
+
+    - name: "memory_performance"
+      type: "histogram"
+      buckets: [20, 50, 100, 200]
+
+    - name: "webhook_processing"
+      type: "histogram"
+      buckets: [100, 200, 500, 1000]
+
+  alerts:
+    - name: "High Error Rate"
+      condition: "error_rate > 5%"
+      severity: "critical"
+      action: "rollback"
+
+    - name: "Slow Response Time"
+      condition: "p95_response_time > 2000ms"
+      severity: "warning"
+      action: "notify"
+
+    - name: "Grok Failures"
+      condition: "grok_error_rate > 10%"
+      severity: "warning"
+      action: "disable_grok"
+
+    - name: "Memory Spike"
+      condition: "memory_usage > 80%"
+      severity: "critical"
+      action: "scale_up"
+
+rollback:
+  automatic: true
+  conditions:
+    - "error_rate > 10%"
+    - "p95_latency > 3000ms"
+    - "success_rate < 90%"
+    - "manual_trigger"
+
+  procedure:
+    1. "Pause new deployments"
+    2. "Route all traffic to stable"
+    3. "Preserve canary for debugging"
+    4. "Notify engineering team"
+    5. "Create incident report"
+
+validation:
+  pre_deployment:
+    - name: "Unit Tests"
+      command: "pytest tests/"
+      required: true
+
+    - name: "Integration Tests"
+      command: "python test_phase6_integration.py"
+      required: true
+
+    - name: "Security Scan"
+      command: "security-scan ."
+      required: false
+
+    - name: "Performance Test"
+      command: "python load_test.py"
+      required: true
+
+  post_deployment:
+    - name: "Health Check"
+      endpoint: "/health"
+      expected_status: 200
+      timeout: 5s
+
+    - name: "LangGraph Test"
+      endpoint: "/langgraph/test"
+      expected_status: 200
+      timeout: 10s
+
+    - name: "RAG Test"
+      endpoint: "/api/knowledge/test"
+      expected_status: 200
+      timeout: 5s
+
+environments:
+  staging:
+    url: "https://staging-healthcare-clinic-backend.fly.dev"
+    deployment_strategy: "blue_green"
+    validation_required: false
+
+  production:
+    url: "https://healthcare-clinic-backend.fly.dev"
+    deployment_strategy: "canary"
+    validation_required: true
+    approval_required: true
+    approvers: ["engineering-lead", "product-owner"]
+
+rollout_schedule:
+  timezone: "UTC"
+  blackout_windows:
+    - start: "Friday 17:00"
+      end: "Monday 09:00"
+      reason: "Weekend - reduced monitoring"
+
+    - start: "December 23"
+      end: "January 3"
+      reason: "Holiday season"
+
+  preferred_windows:
+    - start: "Tuesday 10:00"
+      end: "Thursday 16:00"
+      reason: "Peak monitoring availability"
+
+notifications:
+  channels:
+    - type: "slack"
+      webhook: "${SLACK_WEBHOOK_URL}"
+      events: ["deployment_start", "stage_complete", "rollback", "error"]
+
+    - type: "email"
+      recipients: ["engineering@example.com"]
+      events: ["deployment_complete", "rollback"]
+
+    - type: "pagerduty"
+      api_key: "${PAGERDUTY_KEY}"
+      events: ["critical_error", "rollback"]
+
+documentation:
+  runbook: "https://docs.example.com/langgraph-migration-runbook"
+  rollback_procedure: "https://docs.example.com/rollback-procedure"
+  monitoring_dashboard: "https://grafana.example.com/langgraph-migration"
+  incident_template: "https://docs.example.com/incident-template"

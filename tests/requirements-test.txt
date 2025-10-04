@@ -1,0 +1,64 @@
+# Test Dependencies for Dental Clinic System
+
+# Core testing frameworks
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+unittest-xml-reporting==3.2.0
+
+# Coverage reporting
+coverage==7.3.2
+codecov==2.1.13
+
+# Mocking and fixtures
+mock==5.1.0
+faker==20.1.0
+factory-boy==3.3.0
+
+# Performance testing
+locust==2.17.0
+pytest-benchmark==4.0.0
+memory-profiler==0.61.0
+psutil==5.9.6
+
+# API testing
+httpx==0.25.2
+fastapi[all]==0.104.1
+requests-mock==1.11.0
+
+# Database testing
+pytest-postgresql==5.0.0
+testing.postgresql==1.3.0
+
+# Redis testing
+fakeredis==2.20.0
+redis==5.0.1
+
+# Twilio testing
+twilio==8.10.0
+
+# Load testing
+aioload==0.3.0
+asyncio-throttle==1.0.2
+
+# Security testing
+safety==2.3.5
+bandit==1.7.5
+
+# Time and date testing
+freezegun==1.2.2
+time-machine==2.13.0
+
+# Debugging
+ipdb==0.13.13
+pdbpp==0.10.3
+
+# Linting (optional for test quality)
+pylint==3.0.3
+black==23.11.0
+isort==5.12.0
+mypy==1.7.1
+
+# Documentation
+pytest-html==4.1.1
+allure-pytest==2.13.2

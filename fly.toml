@@ -1,0 +1,51 @@
+# fly.toml for Healthcare Clinics Backend
+app = 'healthcare-clinic-backend'
+primary_region = 'sjc'
+kill_signal = 'SIGINT'
+kill_timeout = '30s'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  PORT = '8080'
+
+# Define separate processes for web and worker
+[processes]
+  web = "python -m uvicorn main:app --host 0.0.0.0 --port 8080 --log-level info --timeout-keep-alive 75 --workers 1 --backlog 2048"
+  worker = "python run_worker.py"
+
+# Web service (HTTP)
+[[services]]
+  protocol = 'tcp'
+  internal_port = 8080
+  processes = ['web']  # Only web process exposes HTTP
+
+  [[services.ports]]
+    port = 80
+    handlers = ['http']
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ['tls', 'http']
+
+  [[services.http_checks]]
+    interval = '15s'
+    timeout = '5s'
+    grace_period = '60s'
+    method = 'GET'
+    path = '/health'
+
+[deploy]
+  strategy = 'rolling'
+
+# Persistent storage for Qdrant vector database
+[mounts]
+  source = "qdrant_data"
+  destination = "/app/qdrant_data"
+  processes = ["web"]
+
+# Scale configuration
+# fly scale count 1 --process-group web
+# fly scale count 1 --process-group worker

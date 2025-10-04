@@ -1,0 +1,48 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-dotenv==1.0.0
+supabase==2.15.0
+asyncpg==0.29.0
+twilio==8.10.0
+httpx==0.28.1
+pydantic>=2.7.3
+python-multipart==0.0.6
+cryptography==41.0.7
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+redis==5.0.1
+hiredis==2.2.3  # C parser for better Redis performance
+openai==1.58.1
+google-genai==1.40.0  # Gemini 2.5 Flash/Lite support
+zhipuai==2.1.5.20250825  # GLM-4.5 SDK
+requests==2.31.0
+# LangChain provider integrations for LLM factory
+langchain-openai==0.3.0
+langchain-google-genai==2.0.5
+langchain-community==0.3.0  # For ChatZhipuAI
+beautifulsoup4==4.12.2
+lxml>=4.9.2
+pymupdf==1.23.8
+python-docx==1.1.0
+pytesseract==0.3.10
+Pillow==10.1.0
+markdown==3.5.1
+chardet==5.2.0
+python-magic==0.4.27
+tiktoken==0.8.0
+# LangGraph for orchestration (using langchain-core instead of full langchain)
+langchain-core==0.3.29
+langgraph==0.2.40
+trafilatura==1.6.3
+extruct==0.16.0
+# Google Calendar Integration
+google-api-python-client==2.150.0
+google-auth==2.40.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+psutil==5.9.6
+apscheduler==3.10.4
+boto3==1.34.0
+# mem0 for advanced memory with Qdrant vector store (compatible with langchain-community==0.3.0)
+mem0ai>=0.1.17
+python-dateutil

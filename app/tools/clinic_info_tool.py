@@ -1,0 +1,173 @@
+"""
+Clinic Information Tool
+
+Provides basic information about the clinic including:
+- Number of doctors and their specializations
+- Clinic hours, location, contact info
+- General FAQs
+"""
+
+from typing import Dict, Any, List
+import logging
+import json
+
+logger = logging.getLogger(__name__)
+
+
+class ClinicInfoTool:
+    """Tool for retrieving clinic information"""
+
+    def __init__(self, clinic_id: str, redis_client=None):
+        """
+        Initialize clinic info tool
+
+        Args:
+            clinic_id: Clinic ID
+            redis_client: Optional Redis client for caching
+        """
+        self.clinic_id = clinic_id
+        self.redis_client = redis_client
+        self.cache = None
+        if redis_client:
+            from app.services.clinic_data_cache import ClinicDataCache
+            self.cache = ClinicDataCache(redis_client, default_ttl=3600)
+
+    async def get_doctor_count(self, supabase_client) -> Dict[str, Any]:
+        """
+        Get number of doctors and their specializations
+
+        Uses Redis cache if available for faster response
+        """
+        try:
+            # Try cache first
+            if self.cache:
+                doctors = await self.cache.get_doctors(self.clinic_id, supabase_client)
+                logger.debug(f"✅ Using cached doctors for clinic {self.clinic_id}")
+            else:
+                # Fallback to direct query (try active first, then is_active for backwards compat)
+                try:
+                    result = supabase_client.table('doctors').select(
+                        'id,first_name,last_name,specialization'
+                    ).eq('clinic_id', self.clinic_id).eq('active', True).execute()
+                    doctors = result.data
+                except Exception as e:
+                    # Try is_active for backwards compatibility
+                    if 'active does not exist' in str(e):
+                        result = supabase_client.table('doctors').select(
+                            'id,first_name,last_name,specialization'
+                        ).eq('clinic_id', self.clinic_id).eq('is_active', True).execute()
+                        doctors = result.data
+                    else:
+                        raise
+
+            total_count = len(doctors)
+
+            # Group by specialization
+            specializations = {}
+            for doc in doctors:
+                spec = doc.get('specialization', 'General Dentistry')
+                if spec not in specializations:
+                    specializations[spec] = []
+                name = f"{doc.get('first_name', '')} {doc.get('last_name', '')}".strip()
+                specializations[spec].append(name)
+
+            return {
+                'total_doctors': total_count,
+                'specializations': specializations,
+                'doctor_list': [
+                    f"{d.get('first_name', '')} {d.get('last_name', '')}".strip()
+                    for d in doctors
+                ]
+            }
+        except Exception as e:
+            logger.error(f"Error getting doctor count: {e}")
+            return {'total_doctors': 0, 'specializations': {}, 'doctor_list': []}
+
+    async def get_clinic_info(self, supabase_client) -> Dict[str, Any]:
+        """Get general clinic information"""
+        try:
+            result = supabase_client.table('clinics').select('*').eq(
+                'id', self.clinic_id
+            ).limit(1).execute()
+
+            if not result.data:
+                return {}
+
+            clinic = result.data[0]
+            return {
+                'name': clinic.get('name', ''),
+                'address': clinic.get('address', ''),
+                'phone': clinic.get('phone', ''),
+                'email': clinic.get('email', ''),
+                'hours': clinic.get('business_hours', {}),
+                'languages': clinic.get('supported_languages', ['en'])
+            }
+        except Exception as e:
+            logger.error(f"Error getting clinic info: {e}")
+            return {}
+
+
+async def format_doctor_info_for_prompt(clinic_id: str, supabase_client, redis_client=None) -> str:
+    """
+    Format doctor information for injection into LLM prompt context.
+    Returns a concise summary suitable for system prompt or context.
+
+    Uses Redis caching to avoid repeated database queries.
+    Cache TTL: 1 hour (doctors don't change frequently)
+    """
+    cache_key = f"clinic_doctors:{clinic_id}"
+
+    # Try to get from Redis cache first
+    if redis_client:
+        try:
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                doctor_info = json.loads(cached_data)
+                logger.info(f"✅ Using cached doctor info for clinic {clinic_id}: {doctor_info}")
+            else:
+                # Fetch from database and cache
+                tool = ClinicInfoTool(clinic_id)
+                doctor_info = await tool.get_doctor_count(supabase_client)
+                logger.info(f"📊 Fetched doctor info for clinic {clinic_id}: {doctor_info}")
+                # Only cache if we have doctors (don't cache empty results)
+                if doctor_info.get('total_doctors', 0) > 0:
+                    redis_client.setex(cache_key, 3600, json.dumps(doctor_info))
+                    logger.info(f"✅ Cached doctor info for clinic {clinic_id}")
+                else:
+                    logger.warning(f"⚠️ Not caching empty doctor list for clinic {clinic_id}")
+        except Exception as e:
+            logger.warning(f"Redis cache error, falling back to direct query: {e}")
+            tool = ClinicInfoTool(clinic_id)
+            doctor_info = await tool.get_doctor_count(supabase_client)
+            logger.info(f"📊 Fetched doctor info (no cache) for clinic {clinic_id}: {doctor_info}")
+    else:
+        # No Redis client, fetch directly
+        tool = ClinicInfoTool(clinic_id)
+        doctor_info = await tool.get_doctor_count(supabase_client)
+        logger.info(f"📊 Fetched doctor info (no redis) for clinic {clinic_id}: {doctor_info}")
+
+    total = doctor_info['total_doctors']
+    specs = doctor_info['specializations']
+
+    logger.info(f"Doctor count: {total}, Specializations: {list(specs.keys()) if specs else 'none'}")
+
+    if total == 0:
+        logger.warning(f"⚠️ No doctors found for clinic {clinic_id}, returning empty string")
+        return ""
+
+    # Create detailed summary with doctor names
+    summary_parts = [f"The clinic has {total} doctor{'s' if total > 1 else ''}"]
+
+    # Add doctor names by specialization for better context
+    if specs:
+        summary_parts.append(":\n")
+        for spec, names in specs.items():
+            if names:
+                summary_parts.append(f"  • {spec}: {', '.join(names)}\n")
+    else:
+        # Fallback: just list all doctors if no specialization grouping
+        if doctor_info['doctor_list']:
+            summary_parts.append(f": {', '.join(doctor_info['doctor_list'])}")
+        summary_parts.append(".")
+
+    return "".join(summary_parts)

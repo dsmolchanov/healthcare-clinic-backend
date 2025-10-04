@@ -1,0 +1,53 @@
+{
+  "test_timestamp": "2025-09-29T00:40:46.726390",
+  "metrics": [
+    {
+      "query": "How many doctors work in the clinic?",
+      "timestamp": "2025-09-29T00:40:32.918354",
+      "query_preprocessing_ms": 0.0002919696271419525,
+      "embedding_generation_ms": 467.6299160346389,
+      "rag_search_ms": 807.6970421243459,
+      "context_preparation_ms": 0.007458962500095367,
+      "openai_api_ms": 4081.2881249003112,
+      "response_processing_ms": 0.0008330680429935455,
+      "total_ms": 5356.684749945998,
+      "rag_results_count": 0,
+      "context_tokens": 35,
+      "response_tokens": 41
+    },
+    {
+      "query": "What specialties are available at the clinic?",
+      "timestamp": "2025-09-29T00:40:40.166590",
+      "query_preprocessing_ms": 0.002125045284628868,
+      "embedding_generation_ms": 1140.550334006548,
+      "rag_search_ms": 595.2681249473244,
+      "context_preparation_ms": 0.007833121344447136,
+      "openai_api_ms": 5011.021291837096,
+      "response_processing_ms": 0.0010409858077764511,
+      "total_ms": 6746.920374920592,
+      "rag_results_count": 0,
+      "context_tokens": 35,
+      "response_tokens": 34
+    },
+    {
+      "query": "Who are the doctors at this clinic?",
+      "timestamp": "2025-09-29T00:40:46.224515",
+      "query_preprocessing_ms": 0.001250067725777626,
+      "embedding_generation_ms": 335.68370807915926,
+      "rag_search_ms": 624.3124171160161,
+      "context_preparation_ms": 0.006667105481028557,
+      "openai_api_ms": 4596.687542041764,
+      "response_processing_ms": 0.000250060111284256,
+      "total_ms": 5556.757250102237,
+      "rag_results_count": 0,
+      "context_tokens": 35,
+      "response_tokens": 41
+    }
+  ],
+  "summary": {
+    "total_tests": 3,
+    "avg_total_latency_ms": 5886.787458322942,
+    "avg_openai_latency_ms": 4562.998986259724,
+    "avg_rag_latency_ms": 675.7591947292289
+  }
+}

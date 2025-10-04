@@ -1,0 +1,39 @@
+
+RAG EVALUATION REPORT
+=====================
+Generated: 2025-09-13T17:42:53.403848
+Clinic ID: 3e411ecb-3411-4add-91e2-8fa897310cb0
+
+PERFORMANCE METRICS
+-------------------
+Total Queries: 20
+Success Rate: 70.00%
+Hit@1: 65.00%
+Hit@3: 70.00%
+Hit@5: 70.00%
+
+LATENCY METRICS
+---------------
+Average: 471.02ms
+P50: 339.62ms
+P95: 896.62ms
+P99: 1008.77ms
+
+ERROR ANALYSIS
+--------------
+Total Errors: 0
+Error Types: 
+
+DIAGNOSTICS
+-----------
+Index Status: {
+  "status": "connected",
+  "total_vectors": 5,
+  "dimensions": 1536,
+  "index_fullness": 0.0
+}
+Embedding Test: success
+Metadata Fields: category, chunk_index, clinic_id, db_id, doc_id, indexed_at, language, text, total_chunks, type
+
+RECOMMENDATIONS
+---------------

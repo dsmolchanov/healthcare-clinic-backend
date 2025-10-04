@@ -1,0 +1,591 @@
+{
+  "dashboard": {
+    "title": "LangGraph Migration Monitoring Dashboard",
+    "version": "1.0.0",
+    "description": "Real-time monitoring for Phase 6 progressive rollout",
+    "refresh_interval": "10s",
+    "timezone": "UTC"
+  },
+  "panels": [
+    {
+      "id": "overview",
+      "title": "System Overview",
+      "type": "row",
+      "panels": [
+        {
+          "id": "health_status",
+          "title": "Health Status",
+          "type": "stat",
+          "targets": [
+            {
+              "query": "sum(up{job=~'langgraph|evolution|backend'})",
+              "legend": "Services Up"
+            }
+          ],
+          "thresholds": {
+            "ok": 3,
+            "warning": 2,
+            "critical": 1
+          }
+        },
+        {
+          "id": "success_rate",
+          "title": "Overall Success Rate",
+          "type": "gauge",
+          "targets": [
+            {
+              "query": "sum(rate(requests_success[5m])) / sum(rate(requests_total[5m])) * 100",
+              "legend": "Success %"
+            }
+          ],
+          "thresholds": {
+            "ok": 95,
+            "warning": 90,
+            "critical": 85
+          }
+        },
+        {
+          "id": "active_sessions",
+          "title": "Active Sessions",
+          "type": "stat",
+          "targets": [
+            {
+              "query": "sum(active_sessions)",
+              "legend": "Sessions"
+            }
+          ]
+        },
+        {
+          "id": "canary_traffic",
+          "title": "Canary Traffic %",
+          "type": "gauge",
+          "targets": [
+            {
+              "query": "sum(rate(requests_canary[5m])) / sum(rate(requests_total[5m])) * 100",
+              "legend": "Canary %"
+            }
+          ],
+          "thresholds": {
+            "stages": [5, 10, 25, 50, 80, 100]
+          }
+        }
+      ]
+    },
+    {
+      "id": "performance",
+      "title": "Performance Metrics",
+      "type": "row",
+      "panels": [
+        {
+          "id": "response_time",
+          "title": "Response Time Distribution",
+          "type": "graph",
+          "targets": [
+            {
+              "query": "histogram_quantile(0.50, response_time_bucket)",
+              "legend": "P50"
+            },
+            {
+              "query": "histogram_quantile(0.95, response_time_bucket)",
+              "legend": "P95"
+            },
+            {
+              "query": "histogram_quantile(0.99, response_time_bucket)",
+              "legend": "P99"
+            }
+          ],
+          "yaxis": {
+            "unit": "ms",
+            "max": 2000
+          },
+          "alerts": [
+            {
+              "condition": "P95 > 1000",
+              "severity": "warning"
+            },
+            {
+              "condition": "P95 > 1500",
+              "severity": "critical"
+            }
+          ]
+        },
+        {
+          "id": "text_vs_voice",
+          "title": "Text vs Voice Response Times",
+          "type": "graph",
+          "targets": [
+            {
+              "query": "histogram_quantile(0.95, response_time_bucket{type='text'})",
+              "legend": "Text P95"
+            },
+            {
+              "query": "histogram_quantile(0.95, response_time_bucket{type='voice'})",
+              "legend": "Voice P95"
+            }
+          ],
+          "yaxis": {
+            "unit": "ms"
+          },
+          "annotations": [
+            {
+              "value": 500,
+              "text": "Text Target",
+              "color": "green"
+            }
+          ]
+        },
+        {
+          "id": "throughput",
+          "title": "Request Throughput",
+          "type": "graph",
+          "targets": [
+            {
+              "query": "sum(rate(requests_total[1m]))",
+              "legend": "Requests/sec"
+            }
+          ],
+          "yaxis": {
+            "unit": "req/s"
+          }
+        }
+      ]
+    },
+    {
+      "id": "llm_providers",
+      "title": "LLM Provider Metrics",
+      "type": "row",
+      "panels": [
+        {
+          "id": "provider_distribution",
+          "title": "LLM Provider Distribution",
+          "type": "piechart",
+          "targets": [
+            {
+              "query": "sum(rate(llm_requests{provider='grok'}[5m]))",
+              "legend": "Grok"
+            },
+            {
+              "query": "sum(rate(llm_requests{provider='openai'}[5m]))",
+              "legend": "OpenAI"
+            }
+          ]
+        },
+        {
+          "id": "provider_latency",
+          "title": "Provider Response Times",
+          "type": "graph",
+          "targets": [
+            {
+              "query": "histogram_quantile(0.95, llm_response_time_bucket{provider='grok'})",
+              "legend": "Grok P95"
+            },
+            {
+              "query": "histogram_quantile(0.95, llm_response_time_bucket{provider='openai'})",
+              "legend": "OpenAI P95"
+            }
+          ],
+          "yaxis": {
+            "unit": "ms"
+          }
+        },
+        {
+          "id": "grok_circuit_breaker",
+          "title": "Grok Circuit Breaker Status",
+          "type": "stat",
+          "targets": [
+            {
+              "query": "grok_circuit_breaker_state",
+              "legend": "State"
+            }
+          ],
+          "mappings": {
+            "0": "Closed",
+            "1": "Open",
+            "2": "Half-Open"
+          },
+          "thresholds": {
+            "ok": 0,
+            "warning": 2,
+            "critical": 1
+          }
+        },
+        {
+          "id": "fallback_rate",
+          "title": "Fallback Rate",
+          "type": "stat",
+          "targets": [
+            {
+              "query": "sum(rate(llm_fallbacks[5m])) / sum(rate(llm_requests[5m])) * 100",
+              "legend": "Fallback %"
+            }
+          ],
+          "thresholds": {
+            "ok": 5,
+            "warning": 10,
+            "critical": 20
+          },
+          "unit": "%"
+        }
+      ]
+    },
+    {
+      "id": "rag_memory",
+      "title": "RAG & Memory Performance",
+      "type": "row",
+      "panels": [
+        {
+          "id": "rag_latency",
+          "title": "RAG Retrieval Latency",
+          "type": "graph",
+          "targets": [
+            {
+              "query": "histogram_quantile(0.95, rag_retrieval_time_bucket)",
+              "legend": "P95"
+            },
+            {
+              "query": "histogram_quantile(0.50, rag_retrieval_time_bucket)",
+              "legend": "P50"
+            }
+          ],
+          "yaxis": {
+            "unit": "ms"
+          },
+          "annotations": [
+            {
+              "value": 200,
+              "text": "Target",
+              "color": "green"
+            }
+          ]
+        },
+        {
+          "id": "memory_latency",
+          "title": "Memory Access Latency",
+          "type": "graph",
+          "targets": [
+            {
+              "query": "histogram_quantile(0.95, memory_access_time_bucket)",
+              "legend": "P95"
+            },
+            {
+              "query": "histogram_quantile(0.50, memory_access_time_bucket)",
+              "legend": "P50"
+            }
+          ],
+          "yaxis": {
+            "unit": "ms"
+          },
+          "annotations": [
+            {
+              "value": 100,
+              "text": "Target",
+              "color": "green"
+            }
+          ]
+        },
+        {
+          "id": "cache_hit_rate",
+          "title": "RAG Cache Hit Rate",
+          "type": "stat",
+          "targets": [
+            {
+              "query": "sum(rate(rag_cache_hits[5m])) / sum(rate(rag_requests[5m])) * 100",
+              "legend": "Cache Hit %"
+            }
+          ],
+          "unit": "%"
+        }
+      ]
+    },
+    {
+      "id": "errors",
+      "title": "Error Tracking",
+      "type": "row",
+      "panels": [
+        {
+          "id": "error_rate",
+          "title": "Error Rate by Phase",
+          "type": "graph",
+          "targets": [
+            {
+              "query": "sum(rate(errors{phase='security'}[5m]))",
+              "legend": "Security"
+            },
+            {
+              "query": "sum(rate(errors{phase='langgraph'}[5m]))",
+              "legend": "LangGraph"
+            },
+            {
+              "query": "sum(rate(errors{phase='routing'}[5m]))",
+              "legend": "Routing"
+            },
+            {
+              "query": "sum(rate(errors{phase='rag_memory'}[5m]))",
+              "legend": "RAG/Memory"
+            },
+            {
+              "query": "sum(rate(errors{phase='grok'}[5m]))",
+              "legend": "Grok"
+            }
+          ],
+          "yaxis": {
+            "unit": "errors/sec"
+          }
+        },
+        {
+          "id": "error_types",
+          "title": "Error Types Distribution",
+          "type": "table",
+          "targets": [
+            {
+              "query": "topk(10, sum(increase(errors[1h])) by (error_type))",
+              "format": "table"
+            }
+          ],
+          "columns": [
+            {"field": "error_type", "title": "Error Type"},
+            {"field": "count", "title": "Count (1h)"}
+          ]
+        },
+        {
+          "id": "webhook_errors",
+          "title": "Webhook Processing Errors",
+          "type": "stat",
+          "targets": [
+            {
+              "query": "sum(rate(webhook_errors[5m]))",
+              "legend": "Errors/sec"
+            }
+          ],
+          "thresholds": {
+            "ok": 0.1,
+            "warning": 0.5,
+            "critical": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "appointments",
+      "title": "Appointment System",
+      "type": "row",
+      "panels": [
+        {
+          "id": "appointment_operations",
+          "title": "Appointment Operations",
+          "type": "graph",
+          "targets": [
+            {
+              "query": "sum(rate(appointment_operations{type='check_availability'}[5m]))",
+              "legend": "Check Availability"
+            },
+            {
+              "query": "sum(rate(appointment_operations{type='book'}[5m]))",
+              "legend": "Bookings"
+            },
+            {
+              "query": "sum(rate(appointment_operations{type='cancel'}[5m]))",
+              "legend": "Cancellations"
+            },
+            {
+              "query": "sum(rate(appointment_operations{type='reschedule'}[5m]))",
+              "legend": "Reschedules"
+            }
+          ],
+          "yaxis": {
+            "unit": "ops/sec"
+          }
+        },
+        {
+          "id": "appointment_success_rate",
+          "title": "Appointment Success Rate",
+          "type": "stat",
+          "targets": [
+            {
+              "query": "sum(rate(appointment_operations_success[5m])) / sum(rate(appointment_operations_total[5m])) * 100",
+              "legend": "Success %"
+            }
+          ],
+          "thresholds": {
+            "ok": 95,
+            "warning": 90,
+            "critical": 85
+          },
+          "unit": "%"
+        }
+      ]
+    },
+    {
+      "id": "infrastructure",
+      "title": "Infrastructure",
+      "type": "row",
+      "panels": [
+        {
+          "id": "cpu_usage",
+          "title": "CPU Usage",
+          "type": "graph",
+          "targets": [
+            {
+              "query": "avg(cpu_usage{service='backend'})",
+              "legend": "Backend"
+            },
+            {
+              "query": "avg(cpu_usage{service='langgraph'})",
+              "legend": "LangGraph"
+            },
+            {
+              "query": "avg(cpu_usage{service='evolution'})",
+              "legend": "Evolution"
+            }
+          ],
+          "yaxis": {
+            "unit": "%",
+            "max": 100
+          },
+          "alerts": [
+            {
+              "condition": "value > 80",
+              "severity": "warning"
+            },
+            {
+              "condition": "value > 90",
+              "severity": "critical"
+            }
+          ]
+        },
+        {
+          "id": "memory_usage",
+          "title": "Memory Usage",
+          "type": "graph",
+          "targets": [
+            {
+              "query": "avg(memory_usage{service='backend'})",
+              "legend": "Backend"
+            },
+            {
+              "query": "avg(memory_usage{service='langgraph'})",
+              "legend": "LangGraph"
+            },
+            {
+              "query": "avg(memory_usage{service='evolution'})",
+              "legend": "Evolution"
+            }
+          ],
+          "yaxis": {
+            "unit": "%",
+            "max": 100
+          },
+          "alerts": [
+            {
+              "condition": "value > 80",
+              "severity": "warning"
+            },
+            {
+              "condition": "value > 90",
+              "severity": "critical"
+            }
+          ]
+        },
+        {
+          "id": "database_connections",
+          "title": "Database Connections",
+          "type": "stat",
+          "targets": [
+            {
+              "query": "sum(pg_connections_active)",
+              "legend": "Active"
+            }
+          ],
+          "thresholds": {
+            "ok": 50,
+            "warning": 80,
+            "critical": 95
+          },
+          "max": 100
+        }
+      ]
+    }
+  ],
+  "alerts": [
+    {
+      "name": "High Error Rate",
+      "condition": "sum(rate(errors[5m])) > 0.05",
+      "severity": "critical",
+      "action": "rollback",
+      "notification": ["slack", "pagerduty"]
+    },
+    {
+      "name": "Slow Response Time",
+      "condition": "histogram_quantile(0.95, response_time_bucket) > 2000",
+      "severity": "warning",
+      "action": "notify",
+      "notification": ["slack"]
+    },
+    {
+      "name": "Grok Circuit Breaker Open",
+      "condition": "grok_circuit_breaker_state == 1",
+      "severity": "warning",
+      "action": "notify",
+      "notification": ["slack"]
+    },
+    {
+      "name": "High Fallback Rate",
+      "condition": "sum(rate(llm_fallbacks[5m])) / sum(rate(llm_requests[5m])) > 0.2",
+      "severity": "warning",
+      "action": "investigate",
+      "notification": ["slack"]
+    },
+    {
+      "name": "Low Success Rate",
+      "condition": "sum(rate(requests_success[5m])) / sum(rate(requests_total[5m])) < 0.90",
+      "severity": "critical",
+      "action": "rollback",
+      "notification": ["slack", "pagerduty", "email"]
+    },
+    {
+      "name": "Memory Pressure",
+      "condition": "avg(memory_usage) > 90",
+      "severity": "critical",
+      "action": "scale_up",
+      "notification": ["slack", "pagerduty"]
+    },
+    {
+      "name": "Database Connection Pool Exhaustion",
+      "condition": "pg_connections_active > 90",
+      "severity": "warning",
+      "action": "scale_up",
+      "notification": ["slack"]
+    }
+  ],
+  "queries": {
+    "saved_queries": [
+      {
+        "name": "Canary vs Stable Performance",
+        "query": "histogram_quantile(0.95, response_time_bucket{deployment='canary'}) - histogram_quantile(0.95, response_time_bucket{deployment='stable'})"
+      },
+      {
+        "name": "Error Rate Trend",
+        "query": "sum(rate(errors[1h])) - sum(rate(errors[1h] offset 1h))"
+      },
+      {
+        "name": "Grok vs OpenAI Cost",
+        "query": "(sum(llm_tokens{provider='grok'}) * 0.002) + (sum(llm_tokens{provider='openai'}) * 0.001)"
+      },
+      {
+        "name": "Peak Load Times",
+        "query": "max_over_time(sum(rate(requests_total[5m]))[24h:])"
+      }
+    ]
+  },
+  "export": {
+    "grafana": {
+      "version": "9.0",
+      "format": "json",
+      "datasource": "Prometheus"
+    },
+    "datadog": {
+      "api_key": "${DATADOG_API_KEY}",
+      "format": "json"
+    }
+  }
+}
