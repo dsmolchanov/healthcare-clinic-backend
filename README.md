@@ -189,3 +189,13 @@ For issues or questions, please create a GitHub issue.
 
 **Version**: 1.0.0
 **Last Updated**: October 2025
+
+
+## 🚀 Auto-Deployment
+
+This repository is configured with GitHub Actions for automatic deployment to Fly.io. Every push to `main` or `master` branch will trigger a deployment.
+
+### Deployment Status
+
+Check the [Actions tab](https://github.com/dsmolchanov/healthcare-clinic-backend/actions) to see deployment status.
+
