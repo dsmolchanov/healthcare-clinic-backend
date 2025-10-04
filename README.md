@@ -199,3 +199,16 @@ This repository is configured with GitHub Actions for automatic deployment to Fl
 
 Check the [Actions tab](https://github.com/dsmolchanov/healthcare-clinic-backend/actions) to see deployment status.
 
+
+
+## 📦 Repository Structure
+
+- **** - Main application code
+  -  - API endpoints and webhooks
+  -  - Business logic and integrations
+  -  - Background workers
+  -  - HIPAA compliance and PHI handling
+- **** - Comprehensive test suite
+- **** - Utility scripts
+- **** - CI/CD pipelines
+
