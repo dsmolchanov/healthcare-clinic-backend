@@ -353,6 +353,68 @@ class IntentRouter:
 
         return None
 
+    def _parse_date_from_text(self, text: str) -> Optional[str]:
+        """
+        Extract date reference from text (tomorrow, today, specific day)
+
+        Returns:
+            Date string (e.g., "tomorrow", "Monday") or None
+        """
+        text_lower = text.lower()
+
+        # English date keywords
+        if 'tomorrow' in text_lower:
+            return 'tomorrow'
+        if 'today' in text_lower:
+            return 'today'
+        if 'monday' in text_lower:
+            return 'Monday'
+        if 'tuesday' in text_lower:
+            return 'Tuesday'
+        if 'wednesday' in text_lower:
+            return 'Wednesday'
+        if 'thursday' in text_lower:
+            return 'Thursday'
+        if 'friday' in text_lower:
+            return 'Friday'
+        if 'saturday' in text_lower:
+            return 'Saturday'
+        if 'sunday' in text_lower:
+            return 'Sunday'
+
+        # Spanish
+        if 'mañana' in text_lower:
+            return 'mañana'
+        if 'hoy' in text_lower:
+            return 'hoy'
+        if 'lunes' in text_lower:
+            return 'lunes'
+        if 'martes' in text_lower:
+            return 'martes'
+        if 'miércoles' in text_lower or 'miercoles' in text_lower:
+            return 'miércoles'
+        if 'jueves' in text_lower:
+            return 'jueves'
+        if 'viernes' in text_lower:
+            return 'viernes'
+        if 'sábado' in text_lower or 'sabado' in text_lower:
+            return 'sábado'
+        if 'domingo' in text_lower:
+            return 'domingo'
+
+        # Russian
+        if 'завтра' in text_lower:
+            return 'завтра'
+        if 'сегодня' in text_lower:
+            return 'сегодня'
+
+        # Specific date pattern (DD/MM, MM/DD, YYYY-MM-DD)
+        date_match = re.search(r'\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?', text_lower)
+        if date_match:
+            return date_match.group(0)
+
+        return None
+
     async def _handle_time_confirmation(
         self,
         message: Dict[str, Any],
@@ -389,8 +451,18 @@ class IntentRouter:
         hour, minute = time_info
         logger.info(f"Parsed time: {hour:02d}:{minute:02d}")
 
+        # CRITICAL: Check if date is mentioned in the message
+        date_info = self._parse_date_from_text(user_text)
+
         # Templates for responses
         responses = {
+            'has_date': {
+                'en': f"Perfect! I'm booking you for {date_info} at {hour}:{minute:02d}. Let me check availability with the doctor you requested.",
+                'es': f"¡Perfecto! Le reservo para {date_info} a las {hour}:{minute:02d}. Déjeme verificar disponibilidad con el doctor que solicitó.",
+                'ru': f"Отлично! Записываю вас на {date_info} на {hour}:{minute:02d}. Проверю доступность доктора.",
+                'he': f"מעולה! אני מזמין לך ל-{date_info} ב-{hour}:{minute:02d}. אבדוק זמינות עם הרופא שביקשת.",
+                'pt': f"Perfeito! Estou agendando para {date_info} às {hour}:{minute:02d}. Vou verificar a disponibilidade com o médico solicitado."
+            },
             'need_date': {
                 'en': f"Perfect! For {hour}:{minute:02d}. What day would you like to come in?",
                 'es': f"¡Perfecto! Para las {hour}:{minute:02d}. ¿Qué día le gustaría venir?",
@@ -407,9 +479,15 @@ class IntentRouter:
             }
         }
 
-        # For now, ask for date (full booking needs date context from conversation)
-        # In production, this would check conversation state for partial booking
-        response_text = responses['need_date'].get(lang, responses['need_date']['en'])
+        # If date is mentioned, acknowledge it. Otherwise ask for it.
+        if date_info:
+            logger.info(f"✅ Date extracted: {date_info}")
+            # IMPORTANT: This needs full LLM processing to check doctor availability & complete booking
+            # Return None to pass to full processing lane with context
+            return None
+        else:
+            logger.info("⚠️ No date mentioned, asking for date")
+            response_text = responses['need_date'].get(lang, responses['need_date']['en'])
 
         # Store messages (fire-and-forget)
         async def store_async():

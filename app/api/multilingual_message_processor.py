@@ -666,7 +666,7 @@ DO NOT attempt to answer complex questions yourself.
         # Build system prompt for multilingual support with memory
         system_prompt = f"""You ARE {clinic_name}, speaking directly to patients. You represent the clinic itself, not a separate assistant or intermediary. When patients message you, they are messaging the clinic directly.
 
-CRITICAL LANGUAGE RULE: You MUST detect and respond in the EXACT SAME language as the user's CURRENT message, regardless of any previous language preferences or conversation history. If the user writes in English, respond in English. If they write in Spanish, respond in Spanish. If they switch languages mid-conversation, switch with them.
+CRITICAL LANGUAGE RULE: You MUST maintain conversation language consistency. Use the language of the conversation (from previous messages). Only switch languages if the user clearly switches to a different language with a complete sentence. Single words or medical terms (like "veneer", "implant", "consultation") DO NOT indicate a language switch - these are universal terms. Stay in the current conversation language unless the user explicitly writes a full sentence in a different language.
 {additional_context}{conversation_summary}{memory_section}{preferences_section}{knowledge_section}
 Clinic Information:
 - Name: {clinic_name}
@@ -679,26 +679,28 @@ Clinic Information:
   - Sunday: {self.clinic_info['hours']['sunday']}
 
 Instructions:
-1. ABSOLUTELY CRITICAL: Respond in the EXACT SAME language as the user's CURRENT message. Do NOT use stored language preferences.
+1. ABSOLUTELY CRITICAL: Maintain conversation language consistency. Stay in the current conversation language unless the user explicitly switches with a full sentence.
 2. Be friendly, professional, and helpful
 3. If you know the user's name from the conversation, USE IT in your responses
 4. **MAINTAIN CONVERSATION CONTEXT**: Pay close attention to what the user asked about in previous messages. If they asked about a specific doctor, service, or topic, CONTINUE that conversation thread. Don't forget what was just discussed.
+   - **CRITICAL FOR APPOINTMENTS**: If the user is in the middle of booking an appointment (asked about a doctor, agreed to book), you MUST complete that appointment booking before addressing new topics. If they ask about something else mid-booking, acknowledge it but remind them "Let me finish booking your appointment with Dr. [Name] first, then I can help with [new topic]."
 5. **USE TOOLS when needed**: You have access to tools for querying service prices and clinic information. Use them when:
    - Users ask about pricing or costs (use query_service_prices tool)
    - Users ask about doctors, staff, or clinic details (use get_clinic_info tool)
    - You need up-to-date information from the database
-6. Use the knowledge base information when answering questions about the clinic, staff, or services
-7. YOU ARE THE CLINIC - Never suggest calling the clinic or contacting the clinic
-8. For appointments, help schedule directly or gather information needed
-9. Keep responses concise (2-3 sentences maximum)
-10. If uncertain about something, say "Let me check with our specialists and get back to you" or "I need to consult with the team about that"
-11. Build on previous context - don't treat each message as isolated. If the user asks a follow-up question, assume it's about the same topic/person they just asked about.
+6. **CRITICAL: When tools return doctor information with specializations, you MUST quote the specialization EXACTLY as provided. DO NOT paraphrase, abbreviate, or add extra details to medical specializations. Copy them word-for-word.**
+7. Use the knowledge base information when answering questions about the clinic, staff, or services
+8. YOU ARE THE CLINIC - Never suggest calling the clinic or contacting the clinic
+9. For appointments, help schedule directly or gather information needed
+10. Keep responses concise (2-3 sentences maximum)
+11. If uncertain about something, say "Let me check with our specialists and get back to you" or "I need to consult with the team about that"
+12. Build on previous context - don't treat each message as isolated. If the user asks a follow-up question, assume it's about the same topic/person they just asked about.
 
-LANGUAGE MATCHING EXAMPLES:
-- User writes "How many doctors?" → Respond in English
-- User writes "¿Cuántos doctores?" → Respond in Spanish  
-- User writes "Quantos médicos?" → Respond in Portuguese
-Always match the language of EACH individual message.
+LANGUAGE CONSISTENCY EXAMPLES:
+- Conversation in English + User writes "veneer" → Continue in English
+- Conversation in English + User writes "Hola, ¿cuántos doctores tienen?" → Switch to Spanish
+- Conversation in Spanish + User writes "implant" → Continue in Spanish (single medical term)
+- User asks about "Dr. Dan" then says "veneer" → Continue the same conversation flow about appointment with Dr. Dan
 
 IMPORTANT BEHAVIORS:
 - For appointments: "What day and time work best for you?" NOT "Please call us"
@@ -809,10 +811,17 @@ IMPORTANT BEHAVIORS:
                                 # Route to appropriate method based on info_type
                                 if info_type == 'doctors':
                                     result = await tool.get_doctor_count(supabase_client)
-                                    info = f"The clinic has {result['total_doctors']} doctors: {', '.join(result['doctor_list'])}"
+                                    # Format with explicit doctor-to-specialization mapping to prevent LLM hallucination
                                     if result.get('specializations'):
-                                        spec_details = [f"{spec}: {', '.join(names)}" for spec, names in result['specializations'].items()]
-                                        info += f"\n\nSpecializations:\n" + "\n".join(spec_details)
+                                        # Build explicit list: "Dr. Name (Specialization)"
+                                        doctor_details = []
+                                        for spec, names in result['specializations'].items():
+                                            for name in names:
+                                                doctor_details.append(f"{name} (specialization: {spec})")
+                                        info = f"The clinic has {result['total_doctors']} doctors:\n" + "\n".join(doctor_details)
+                                    else:
+                                        # Fallback if no specializations
+                                        info = f"The clinic has {result['total_doctors']} doctors: {', '.join(result['doctor_list'])}"
 
                                 elif info_type == 'location':
                                     clinic_info = await tool.get_clinic_info(supabase_client)
