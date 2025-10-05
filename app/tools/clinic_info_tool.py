@@ -110,6 +110,9 @@ class ClinicInfoTool:
             clinic_info = {
                 'name': clinic.get('name', ''),
                 'address': clinic.get('address', ''),
+                'city': clinic.get('city', ''),
+                'state': clinic.get('state', ''),
+                'country': clinic.get('country', ''),
                 'phone': clinic.get('phone', ''),
                 'email': clinic.get('email', ''),
                 'hours': clinic.get('business_hours', {}),

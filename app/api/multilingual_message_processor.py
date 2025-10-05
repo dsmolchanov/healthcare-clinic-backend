@@ -816,7 +816,15 @@ IMPORTANT BEHAVIORS:
 
                                 elif info_type == 'location':
                                     clinic_info = await tool.get_clinic_info(supabase_client)
-                                    info = f"Address: {clinic_info.get('address', 'Not available')}\nPhone: {clinic_info.get('phone', 'Not available')}\nEmail: {clinic_info.get('email', 'Not available')}"
+                                    address_parts = [clinic_info.get('address', 'Not available')]
+                                    if clinic_info.get('city'):
+                                        address_parts.append(clinic_info.get('city'))
+                                    if clinic_info.get('state'):
+                                        address_parts.append(clinic_info.get('state'))
+                                    if clinic_info.get('country'):
+                                        address_parts.append(clinic_info.get('country'))
+                                    full_address = ', '.join(address_parts)
+                                    info = f"Address: {full_address}\nPhone: {clinic_info.get('phone', 'Not available')}\nEmail: {clinic_info.get('email', 'Not available')}"
 
                                 elif info_type == 'hours':
                                     clinic_info = await tool.get_clinic_info(supabase_client)
