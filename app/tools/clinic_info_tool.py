@@ -86,6 +86,19 @@ class ClinicInfoTool:
     async def get_clinic_info(self, supabase_client) -> Dict[str, Any]:
         """Get general clinic information"""
         try:
+            # Check Redis cache first
+            if self.redis_client:
+                cache_key = f"clinic:{self.clinic_id}:info"
+                try:
+                    cached_data = self.redis_client.get(cache_key)
+                    if cached_data:
+                        clinic_info = json.loads(cached_data)
+                        logger.debug(f"✅ Using cached clinic info for {self.clinic_id}")
+                        return clinic_info
+                except Exception as cache_error:
+                    logger.warning(f"Redis cache error, falling back to DB: {cache_error}")
+
+            # Cache miss or no Redis - fetch from database
             result = supabase_client.table('clinics').select('*').eq(
                 'id', self.clinic_id
             ).limit(1).execute()
@@ -94,7 +107,7 @@ class ClinicInfoTool:
                 return {}
 
             clinic = result.data[0]
-            return {
+            clinic_info = {
                 'name': clinic.get('name', ''),
                 'address': clinic.get('address', ''),
                 'phone': clinic.get('phone', ''),
@@ -102,6 +115,17 @@ class ClinicInfoTool:
                 'hours': clinic.get('business_hours', {}),
                 'languages': clinic.get('supported_languages', ['en'])
             }
+
+            # Cache the result for future use
+            if self.redis_client:
+                try:
+                    cache_key = f"clinic:{self.clinic_id}:info"
+                    self.redis_client.setex(cache_key, 3600, json.dumps(clinic_info))
+                    logger.debug(f"✅ Cached clinic info for {self.clinic_id}")
+                except Exception as cache_error:
+                    logger.warning(f"Failed to cache clinic info: {cache_error}")
+
+            return clinic_info
         except Exception as e:
             logger.error(f"Error getting clinic info: {e}")
             return {}
