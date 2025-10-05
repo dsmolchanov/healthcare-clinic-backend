@@ -51,8 +51,8 @@ async def warmup_clinic_data(clinic_ids: List[str] = None):
                 tool = ClinicInfoTool(clinic_id, redis)
                 clinic_info = await tool.get_clinic_info(supabase)
 
-                # Cache clinic info separately for fast access
-                cache_key = f"clinic:{clinic_id}:info"
+                # Cache clinic info separately for fast access (v2 includes city/state/country)
+                cache_key = f"clinic:{clinic_id}:info:v2"
                 redis.setex(cache_key, 3600, json.dumps(clinic_info))
 
                 # Fetch all data in parallel for faster warmup

@@ -88,13 +88,17 @@ class ClinicInfoTool:
         try:
             # Check Redis cache first
             if self.redis_client:
-                cache_key = f"clinic:{self.clinic_id}:info"
+                cache_key = f"clinic:{self.clinic_id}:info:v2"  # v2 includes city/state/country
                 try:
                     cached_data = self.redis_client.get(cache_key)
                     if cached_data:
                         clinic_info = json.loads(cached_data)
-                        logger.debug(f"✅ Using cached clinic info for {self.clinic_id}")
-                        return clinic_info
+                        # Validate cache has required fields (city, state, country)
+                        if 'city' in clinic_info and 'state' in clinic_info and 'country' in clinic_info:
+                            logger.debug(f"✅ Using cached clinic info v2 for {self.clinic_id}")
+                            return clinic_info
+                        else:
+                            logger.info(f"⚠️ Cache invalid (missing fields), refreshing for {self.clinic_id}")
                 except Exception as cache_error:
                     logger.warning(f"Redis cache error, falling back to DB: {cache_error}")
 
@@ -122,9 +126,9 @@ class ClinicInfoTool:
             # Cache the result for future use
             if self.redis_client:
                 try:
-                    cache_key = f"clinic:{self.clinic_id}:info"
+                    cache_key = f"clinic:{self.clinic_id}:info:v2"  # v2 includes city/state/country
                     self.redis_client.setex(cache_key, 3600, json.dumps(clinic_info))
-                    logger.debug(f"✅ Cached clinic info for {self.clinic_id}")
+                    logger.debug(f"✅ Cached clinic info v2 for {self.clinic_id}")
                 except Exception as cache_error:
                     logger.warning(f"Failed to cache clinic info: {cache_error}")
 
