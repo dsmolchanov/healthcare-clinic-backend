@@ -133,20 +133,31 @@ async def supabase_appointment_webhook(
     try:
         # Get webhook payload
         payload = await request.json()
-        
+
         logger.info(f"Received appointment sync webhook: {payload.get('type')}")
-        
+
         # Supabase webhook format
         webhook_type = payload.get('type')  # INSERT, UPDATE, DELETE
         record = payload.get('record', {})
         old_record = payload.get('old_record', {})
-        
+
         appointment_id = record.get('id') or old_record.get('id')
-        
+
         if not appointment_id:
             logger.warning("No appointment ID in webhook payload")
             return {'success': False, 'error': 'Missing appointment ID'}
-        
+
+        # Skip if this update is from calendar sync worker (prevent loops)
+        # Check if google_event_id was just set (meaning this is a sync update)
+        if webhook_type == 'UPDATE':
+            old_google_id = old_record.get('google_event_id')
+            new_google_id = record.get('google_event_id')
+
+            # If google_event_id was just added, this is a sync operation - skip to prevent loop
+            if not old_google_id and new_google_id:
+                logger.info(f"Skipping webhook for appointment {appointment_id} - sync operation detected")
+                return {'success': True, 'note': 'Sync operation - skipping to prevent loop'}
+
         # Only process scheduled/confirmed appointments
         status = record.get('status')
         if webhook_type in ['INSERT', 'UPDATE'] and status not in ['scheduled', 'confirmed']:
