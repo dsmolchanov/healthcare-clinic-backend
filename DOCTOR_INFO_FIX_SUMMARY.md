@@ -122,7 +122,7 @@ cache.invalidate_doctors(clinic_id)
    - Enhanced `format_doctor_info_for_prompt()` to include doctor names
    - Added Redis caching support
 
-2. `app/api/multilingual_message_processor.py`
+2. `app/apps/voice-api/multilingual_message_processor.py`
    - Updated to pass Redis client to doctor info function
 
 3. `app/services/clinic_data_cache.py` (NEW)

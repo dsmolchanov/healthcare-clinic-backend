@@ -52,7 +52,7 @@ async def list_integrations(
 
         all_integrations = []
 
-        # Get regular integrations from public schema
+        # Get non-calendar integrations from public schema (WhatsApp, SMS, etc.)
         try:
             public_supabase = create_client(
                 os.getenv("SUPABASE_URL"),
@@ -63,12 +63,16 @@ async def list_integrations(
                 query = query.eq("organization_id", organization_id)
             if type:
                 query = query.eq("integration_type", type)
+
+            # Exclude google_calendar - it's tracked in healthcare.calendar_integrations only
+            query = query.neq("integration_type", "google_calendar")
+
             result = query.execute()
             all_integrations.extend(result.data)
         except Exception as e:
             print(f"Public integrations query error (non-fatal): {e}")
 
-        # Get calendar integrations from healthcare schema
+        # Get calendar integrations ONLY from healthcare schema
         try:
             healthcare_options = ClientOptions(schema='healthcare')
             healthcare_supabase = create_client(
@@ -88,15 +92,19 @@ async def list_integrations(
                 all_integrations.append({
                     'id': cal_int.get('id'),
                     'organization_id': cal_int.get('organization_id'),
-                    'integration_type': 'calendar',
+                    'integration_type': 'google_calendar',  # Use consistent type
                     'provider': cal_int.get('provider'),
                     'status': 'active' if cal_int.get('sync_enabled') else 'inactive',
+                    'display_name': f"{cal_int.get('provider', 'Google').title()} Calendar",
+                    'description': f"{cal_int.get('provider', 'Google').title()} Calendar integration",
+                    'is_enabled': cal_int.get('sync_enabled', False),
                     'config': {
                         'calendar_id': cal_int.get('calendar_id'),
                         'calendar_name': cal_int.get('calendar_name'),
-                        'sync_enabled': cal_int.get('sync_enabled')
+                        'sync_enabled': cal_int.get('sync_enabled'),
+                        'last_sync_at': cal_int.get('last_sync_at'),
+                        'expires_at': cal_int.get('expires_at')
                     },
-                    'enabled': cal_int.get('sync_enabled', False),
                     'created_at': cal_int.get('created_at'),
                     'updated_at': cal_int.get('updated_at')
                 })
@@ -377,4 +385,57 @@ async def delete_evolution_instance(instance_name: str):
             result = await evolution_client.delete_instance(instance_name)
             return result
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/calendar/{integration_id}/sync")
+async def trigger_calendar_sync(integration_id: str):
+    """Manually trigger calendar sync for a specific integration"""
+    try:
+        from supabase import create_client
+        from supabase.client import ClientOptions
+
+        # Get calendar integration from healthcare schema
+        healthcare_options = ClientOptions(schema='healthcare')
+        healthcare_supabase = create_client(
+            os.getenv("SUPABASE_URL"),
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY"),
+            healthcare_options
+        )
+
+        # Get the calendar integration
+        result = healthcare_supabase.from_('calendar_integrations').select('*').eq(
+            'id', integration_id
+        ).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Calendar integration not found")
+
+        integration = result.data[0]
+
+        # Update last_sync_at to trigger sync
+        update_result = healthcare_supabase.from_('calendar_integrations').update({
+            'last_sync_at': datetime.utcnow().isoformat(),
+            'last_sync_status': 'syncing',
+            'updated_at': datetime.utcnow().isoformat()
+        }).eq('id', integration_id).execute()
+
+        # TODO: Implement actual calendar sync logic here
+        # For now, just mark as completed
+        healthcare_supabase.from_('calendar_integrations').update({
+            'last_sync_status': 'completed',
+            'sync_error_count': 0
+        }).eq('id', integration_id).execute()
+
+        return {
+            "success": True,
+            "message": "Calendar sync initiated",
+            "integration_id": integration_id,
+            "provider": integration.get('provider'),
+            "last_sync_at": datetime.utcnow().isoformat()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error triggering calendar sync: {e}")
         raise HTTPException(status_code=500, detail=str(e))

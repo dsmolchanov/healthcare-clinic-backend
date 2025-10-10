@@ -77,14 +77,14 @@ tests/test_faq_orchestrator_integration.py::test_high_confidence_faq_response PA
 - ✅ `/migrations/seed_sample_faqs.sql` - Sample FAQ data
 
 ### Backend Implementation
-- ✅ `/clinics/backend/app/tools/faq_query_tool.py` - FAQQueryTool class (350+ lines)
-- ✅ `/clinics/backend/app/tools/tool_definitions.py` - Added FAQ_QUERY_TOOL definition
-- ✅ `/clinics/backend/app/services/intent_router.py` - Added FAQ_QUERY intent
-- ✅ `/clinics/backend/app/services/orchestrator/templates/healthcare_template.py` - Added FAQ node
+- ✅ `/apps/healthcare-backend/app/tools/faq_query_tool.py` - FAQQueryTool class (350+ lines)
+- ✅ `/apps/healthcare-backend/app/tools/tool_definitions.py` - Added FAQ_QUERY_TOOL definition
+- ✅ `/apps/healthcare-backend/app/services/intent_router.py` - Added FAQ_QUERY intent
+- ✅ `/apps/healthcare-backend/app/services/orchestrator/templates/healthcare_template.py` - Added FAQ node
 
 ### Tests
-- ✅ `/clinics/backend/tests/test_faq_query_tool.py` - 7 unit tests
-- ✅ `/clinics/backend/tests/test_faq_orchestrator_integration.py` - 3 integration tests
+- ✅ `/apps/healthcare-backend/tests/test_faq_query_tool.py` - 7 unit tests
+- ✅ `/apps/healthcare-backend/tests/test_faq_orchestrator_integration.py` - 3 integration tests
 
 ### Documentation
 - ✅ `/thoughts/shared/research/2025-10-02_faq_fts_implementation_research.md` - Research doc

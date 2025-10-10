@@ -8,7 +8,7 @@ The RAG (Retrieval-Augmented Generation) system is functional but had a 70% succ
 
 ### RAG System Components
 
-1. **Document Ingestion Pipeline** (`app/api/knowledge_ingestion.py`)
+1. **Document Ingestion Pipeline** (`app/apps/voice-api/knowledge_ingestion.py`)
    - Processes multiple document formats (PDF, DOCX, TXT, CSV, HTML, Markdown)
    - Chunks documents using RecursiveCharacterTextSplitter (1000 chars, 200 overlap)
    - Generates embeddings using OpenAI's text-embedding-3-small model
@@ -20,7 +20,7 @@ The RAG (Retrieval-Augmented Generation) system is functional but had a 70% succ
    - Cosine similarity metric
    - Metadata filtering by clinic_id
 
-3. **Retrieval System** (`app/api/multilingual_message_processor.py`)
+3. **Retrieval System** (`app/apps/voice-api/multilingual_message_processor.py`)
    - PineconeKnowledgeBase class handles searches
    - Filters by clinic_id metadata
    - Returns top 3 results above similarity threshold
@@ -72,7 +72,7 @@ The RAG (Retrieval-Augmented Generation) system is functional but had a 70% succ
 
 ## Solutions Implemented
 
-### 1. Improved Knowledge Base (`app/api/improved_knowledge_base.py`)
+### 1. Improved Knowledge Base (`app/apps/voice-api/improved_knowledge_base.py`)
 
 ```python
 class ImprovedPineconeKnowledgeBase:

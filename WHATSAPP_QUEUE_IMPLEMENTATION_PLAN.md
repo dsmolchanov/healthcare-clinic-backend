@@ -13,7 +13,7 @@ Implement a production-ready queue-worker architecture to decouple HTTP request 
 
 ### Existing Architecture
 - **Backend**: FastAPI application at `clinics/backend/`
-- **Evolution Webhook**: `app/api/evolution_webhook.py` handles incoming WhatsApp messages
+- **Evolution Webhook**: `app/apps/voice-api/evolution_webhook.py` handles incoming WhatsApp messages
 - **Message Router**: `app/services/message_router.py` routes to LangGraph for AI processing
 - **Current Send Pattern**: Direct HTTP call to Evolution API with fire-and-forget attempt
 - **Current Problem**: `send_whatsapp_via_evolution()` function (line 361-477 in evolution_webhook.py) attempts immediate send with no retry mechanism
@@ -241,7 +241,7 @@ EVOLUTION_HTTP_TIMEOUT = 15.0  # seconds (Evolution may take time to reconnect)
 ```
 
 #### 2. Integrate with Existing Evolution Webhook
-**File**: `clinics/backend/app/api/evolution_webhook.py`
+**File**: `clinics/backend/app/apps/voice-api/evolution_webhook.py`
 **Changes**: Replace direct send with queue enqueue
 
 **Before** (line 361-477):

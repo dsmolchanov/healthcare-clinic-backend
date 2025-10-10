@@ -294,7 +294,7 @@
    ```
 
 2. **Re-authenticate** (if tokens invalid)
-   - Direct user to: https://healthcare-clinic-backend.fly.dev/api/onboarding/calendar/setup
+   - Direct user to: https://healthcare-clinic-backend.fly.dev/apps/voice-api/onboarding/calendar/setup
    - Complete OAuth flow
    - Verify webhook registration
 
@@ -344,10 +344,10 @@ fly logs --app healthcare-clinic-backend | grep -i backup
 curl https://healthcare-clinic-backend.fly.dev/health
 
 # Detailed component health
-curl https://healthcare-clinic-backend.fly.dev/api/health/detailed
+curl https://healthcare-clinic-backend.fly.dev/apps/voice-api/health/detailed
 
 # Service degradation status
-curl https://healthcare-clinic-backend.fly.dev/api/health/degradation
+curl https://healthcare-clinic-backend.fly.dev/apps/voice-api/health/degradation
 ```
 
 ### Key Metrics to Monitor

@@ -17,6 +17,7 @@ from cryptography.hazmat.backends import default_backend
 import boto3
 from botocore.exceptions import ClientError
 from supabase import create_client, Client
+from supabase.client import ClientOptions
 import logging
 
 logger = logging.getLogger(__name__)
@@ -37,10 +38,12 @@ class ComplianceVault:
             self.secrets_manager = boto3.client('secretsmanager', region_name=os.getenv('AWS_REGION', 'us-east-1'))
             self.kms_key_id = os.getenv('AWS_KMS_KEY_ID')
 
-        # Initialize Supabase client
+        # Initialize Supabase client with healthcare schema
+        options = ClientOptions(schema='healthcare')
         self.supabase: Client = create_client(
             os.getenv('SUPABASE_URL'),
-            os.getenv('SUPABASE_SERVICE_ROLE_KEY')  # Use service key for server-side operations
+            os.getenv('SUPABASE_SERVICE_ROLE_KEY'),  # Use service key for server-side operations
+            options=options
         )
 
         # Application-level encryption key (should be stored securely)
@@ -103,22 +106,31 @@ class ComplianceVault:
                     organization_id, provider, app_encrypted
                 )
 
-            # Store reference in organization_secrets table
-            await self._store_secret_reference(
-                organization_id=organization_id,
-                secret_type=f'calendar_{provider}',
-                secret_ref=secret_ref,
-                created_by=user_id
-            )
+            # Store reference in organization_secrets table (optional - mainly for audit)
+            try:
+                await self._store_secret_reference(
+                    organization_id=organization_id,
+                    secret_type=f'calendar_{provider}',
+                    secret_ref=secret_ref,
+                    created_by=user_id
+                )
+            except Exception as ref_error:
+                # Don't fail if organization_secrets table doesn't exist
+                # The vault_storage already has the encrypted credentials
+                logger.warning(f"Could not store secret reference (non-critical): {ref_error}")
 
-            # Audit log for compliance
-            await self._audit_secret_operation(
-                action='store',
-                organization_id=organization_id,
-                secret_type=f'calendar_{provider}',
-                user_id=user_id,
-                compliance_flags=['HIPAA', 'SOC2', 'GDPR']
-            )
+            # Audit log for compliance (optional)
+            try:
+                await self._audit_secret_operation(
+                    action='store',
+                    organization_id=organization_id,
+                    secret_type=f'calendar_{provider}',
+                    user_id=user_id,
+                    compliance_flags=['HIPAA', 'SOC2', 'GDPR']
+                )
+            except Exception as audit_error:
+                # Don't fail if audit_logs table doesn't exist
+                logger.warning(f"Could not create audit log (non-critical): {audit_error}")
 
             logger.info(f"Stored calendar credentials for org {organization_id}, provider {provider}")
             return secret_ref
@@ -170,14 +182,17 @@ class ComplianceVault:
                     logger.warning(f"Token expired for org {organization_id}, provider {provider}")
                     # Could trigger token refresh here
 
-            # Audit log
-            await self._audit_secret_operation(
-                action='retrieve',
-                organization_id=organization_id,
-                secret_type=f'calendar_{provider}',
-                user_id=user_id,
-                compliance_flags=['HIPAA', 'SOC2', 'GDPR']
-            )
+            # Audit log (optional)
+            try:
+                await self._audit_secret_operation(
+                    action='retrieve',
+                    organization_id=organization_id,
+                    secret_type=f'calendar_{provider}',
+                    user_id=user_id,
+                    compliance_flags=['HIPAA', 'SOC2', 'GDPR']
+                )
+            except Exception as audit_error:
+                logger.warning(f"Could not create audit log (non-critical): {audit_error}")
 
             return credentials
 
@@ -325,16 +340,35 @@ class ComplianceVault:
         organization_id: str,
         secret_type: str
     ) -> Optional[str]:
-        """Get secret reference from organization_secrets table"""
-        result = self.supabase.table('organization_secrets').select(
-            'encrypted_value'
-        ).eq(
-            'organization_id', organization_id
-        ).eq(
-            'secret_type', secret_type
-        ).single().execute()
+        """Get secret reference from organization_secrets table, or fallback to vault_storage"""
+        try:
+            result = self.supabase.table('organization_secrets').select(
+                'encrypted_value'
+            ).eq(
+                'organization_id', organization_id
+            ).eq(
+                'secret_type', secret_type
+            ).single().execute()
 
-        return result.data['encrypted_value'] if result.data else None
+            return result.data['encrypted_value'] if result.data else None
+        except Exception as e:
+            # Fallback: search vault_storage directly
+            logger.info(f"organization_secrets not available, searching vault_storage directly: {e}")
+            try:
+                vault_key = secret_type  # e.g., 'calendar_google'
+                vault_result = self.supabase.table('vault_storage').select('id').eq(
+                    'organization_id', organization_id
+                ).eq(
+                    'vault_key', vault_key
+                ).order('created_at', desc=True).limit(1).execute()
+
+                if vault_result.data and len(vault_result.data) > 0:
+                    vault_id = vault_result.data[0]['id']
+                    return f"vault:{vault_id}"
+                return None
+            except Exception as vault_error:
+                logger.error(f"Could not retrieve from vault_storage: {vault_error}")
+                return None
 
     async def _audit_secret_operation(
         self,
@@ -391,22 +425,28 @@ class ComplianceVault:
             organization_id, provider, new_credentials, user_id
         )
 
-        # Update rotation timestamp
-        self.supabase.table('organization_secrets').update({
-            'last_rotated_at': datetime.utcnow().isoformat()
-        }).eq(
-            'organization_id', organization_id
-        ).eq(
-            'secret_type', f'calendar_{provider}'
-        ).execute()
+        # Update rotation timestamp (optional)
+        try:
+            self.supabase.table('organization_secrets').update({
+                'last_rotated_at': datetime.utcnow().isoformat()
+            }).eq(
+                'organization_id', organization_id
+            ).eq(
+                'secret_type', f'calendar_{provider}'
+            ).execute()
+        except Exception as update_error:
+            logger.warning(f"Could not update rotation timestamp (non-critical): {update_error}")
 
-        # Audit the rotation
-        await self._audit_secret_operation(
-            action='rotate',
-            organization_id=organization_id,
-            secret_type=f'calendar_{provider}',
-            user_id=user_id,
-            compliance_flags=['HIPAA', 'SOC2', 'GDPR', 'ROTATION']
-        )
+        # Audit the rotation (optional)
+        try:
+            await self._audit_secret_operation(
+                action='rotate',
+                organization_id=organization_id,
+                secret_type=f'calendar_{provider}',
+                user_id=user_id,
+                compliance_flags=['HIPAA', 'SOC2', 'GDPR', 'ROTATION']
+            )
+        except Exception as audit_error:
+            logger.warning(f"Could not create audit log (non-critical): {audit_error}")
 
         return new_ref

@@ -32,7 +32,7 @@ Key features:
 
 ### 2. Enhanced Knowledge Ingestion Pipeline
 
-**File**: `app/api/enhanced_knowledge_ingestion.py`
+**File**: `app/apps/voice-api/enhanced_knowledge_ingestion.py`
 
 Improvements:
 - Integrates multimodal processor for PDFs

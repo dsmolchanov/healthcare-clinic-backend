@@ -6,9 +6,71 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import os
+import uuid
+from datetime import datetime, timedelta
+import aiohttp
 from supabase import create_client, Client
 
 router = APIRouter(prefix="/api/onboarding", tags=["quick-onboarding"])
+
+
+async def _register_google_webhook(
+    calendar_id: str,
+    access_token: str,
+    clinic_id: str
+) -> Dict[str, Any]:
+    """
+    Register Google Calendar push notification channel
+
+    Docs: https://developers.google.com/calendar/api/guides/push
+
+    Args:
+        calendar_id: Google Calendar ID
+        access_token: OAuth access token
+        clinic_id: Clinic UUID
+
+    Returns:
+        Webhook registration result from Google API
+    """
+    # Get Supabase client with healthcare schema
+    from supabase.client import ClientOptions
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    options = ClientOptions(schema='healthcare')
+    supabase = create_client(supabase_url, supabase_key, options=options)
+
+    webhook_url = f"{os.getenv('APP_BASE_URL', 'https://healthcare-clinic-backend.fly.dev')}/webhooks/calendar/google"
+    channel_id = f"clinic_{clinic_id}_{uuid.uuid4().hex[:8]}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/watch",
+            headers={
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            },
+            json={
+                'id': channel_id,
+                'type': 'web_hook',
+                'address': webhook_url,
+                'expiration': int((datetime.utcnow() + timedelta(days=7)).timestamp() * 1000)
+            }
+        ) as response:
+            if response.status != 200:
+                error = await response.text()
+                raise ValueError(f"Webhook registration failed: {error}")
+
+            result = await response.json()
+
+            # Store channel info for renewal and webhook validation
+            supabase.table('webhook_channels').insert({
+                'clinic_id': clinic_id,
+                'channel_id': channel_id,
+                'resource_id': result['resourceId'],
+                'expiration': datetime.fromtimestamp(int(result['expiration']) / 1000).isoformat()
+            }).execute()
+
+            return result
 
 class QuickRegistration(BaseModel):
     """Minimal registration - we'll fill in the rest"""
@@ -465,28 +527,66 @@ async def handle_calendar_callback(code: str = None, state: str = None, error: s
         try:
             service = get_service()
 
-            # Get organization_id for clinic
-            # Try to get clinic info - use RPC to handle schema
+            # Get organization_id - handle both clinic_id and organization_id in path parameter
+            org_id = None
+            actual_clinic_id = clinic_id
+
+            # First, try to get clinic info
             try:
                 clinic_result = service.supabase.rpc('fetch_clinic', {
                     'p_clinic_id': clinic_id
                 }).execute()
 
-                if not clinic_result.data:
-                    raise ValueError(f"Clinic not found: {clinic_id}")
+                if clinic_result.data and clinic_result.data.get('success'):
+                    # It's a valid clinic_id
+                    clinic_data = clinic_result.data.get('data', {})
+                    org_id = clinic_data.get('organization_id')
+                else:
+                    # Not found as clinic, might be organization_id
+                    raise ValueError("Not a clinic")
+            except:
+                # clinic_id might actually be organization_id - check if it's a valid org
+                # and find/create a default clinic for it
+                print(f"ID {clinic_id} not found as clinic, checking if it's an organization...")
 
-                org_id = clinic_result.data.get('organization_id')
-            except Exception as fetch_error:
-                # Fallback to direct table query
-                print(f"RPC fetch failed, trying direct query: {fetch_error}")
-                clinic_result = service.supabase.table('clinics').select('organization_id').eq(
-                    'id', clinic_id
-                ).execute()
+                # Try to find first clinic for this organization
+                try:
+                    print(f"Searching for clinics with organization_id: {clinic_id}")
+                    clinics_result = service.supabase.rpc('list_clinics', {
+                        'p_organization_id': clinic_id,
+                        'p_limit': 1
+                    }).execute()
 
-                if not clinic_result.data:
-                    raise ValueError(f"Clinic not found: {clinic_id}")
+                    print(f"Clinics result: {clinics_result.data}")
 
-                org_id = clinic_result.data[0]['organization_id']
+                    if clinics_result.data and clinics_result.data.get('success'):
+                        clinics = clinics_result.data.get('data', [])
+                        if clinics and len(clinics) > 0:
+                            # Use first clinic for this organization
+                            actual_clinic_id = clinics[0]['id']
+                            org_id = clinic_id  # The path param was actually org_id
+                            print(f"✅ Found clinic {actual_clinic_id} for organization {org_id}")
+                        else:
+                            # No clinics exist, assume clinic_id is org_id and store at org level
+                            org_id = clinic_id
+                            actual_clinic_id = None  # Calendar at org level
+                            print(f"⚠️  No clinics found for organization {org_id}, storing at org level")
+                    else:
+                        # Treat as organization_id
+                        org_id = clinic_id
+                        actual_clinic_id = None
+                        print(f"⚠️  Using {clinic_id} as organization_id directly (no success flag)")
+                except Exception as list_error:
+                    print(f"❌ Error listing clinics: {list_error}")
+                    import traceback
+                    traceback.print_exc()
+                    # Last resort: use clinic_id as org_id
+                    org_id = clinic_id
+                    actual_clinic_id = None
+
+            # Validate organization_id was retrieved
+            if not org_id:
+                raise ValueError(f"Could not determine organization ID from: {clinic_id}")
 
             # Build credentials
             credentials = {
@@ -513,7 +613,7 @@ async def handle_calendar_callback(code: str = None, state: str = None, error: s
             # This stores ONLY vault reference and metadata, NOT the actual credentials
             try:
                 result = service.supabase.rpc('save_calendar_integration', {
-                    'p_clinic_id': clinic_id,
+                    'p_clinic_id': actual_clinic_id,  # Use actual_clinic_id (might be None for org-level)
                     'p_organization_id': org_id,
                     'p_provider': 'google',
                     'p_calendar_id': 'primary',
@@ -530,21 +630,51 @@ async def handle_calendar_callback(code: str = None, state: str = None, error: s
                     print(f"❌ Failed to save calendar integration: {error_msg}")
                     raise ValueError(f"Failed to save calendar integration: {error_msg}")
 
-                print(f"Successfully stored calendar integration for clinic {clinic_id}")
+                # Get the integration_id from the result
+                healthcare_integration_id = result.data.get('integration_id')
+
+                clinic_info = f"clinic {actual_clinic_id}" if actual_clinic_id else f"organization {org_id}"
+                print(f"Successfully stored calendar integration for {clinic_info}")
                 print(f"  - Vault reference: {vault_ref}")
-                print(f"  - Integration ID: {result.data.get('integration_id')}")
+                print(f"  - Integration ID: {healthcare_integration_id}")
                 print(f"  - Status: {result.data.get('status')}")
+
+                # Register Google Calendar webhook for push notifications
+                if actual_clinic_id:  # Only register webhook if we have a clinic_id
+                    try:
+                        webhook_result = await _register_google_webhook(
+                            calendar_id='primary',
+                            access_token=tokens.get('access_token'),
+                            clinic_id=actual_clinic_id
+                        )
+                        print(f"✅ Webhook registered for clinic {actual_clinic_id}: {webhook_result}")
+                    except Exception as webhook_error:
+                        print(f"⚠️  Failed to register webhook (will fallback to polling): {webhook_error}")
+                        # Continue without webhook - polling will handle sync
 
             except Exception as insert_error:
                 print(f"❌ Failed to save calendar integration: {insert_error}")
                 raise ValueError(f"Failed to save calendar integration: {insert_error}")
-            
+
+            # Clean up old public.integrations records (we only use healthcare.calendar_integrations now)
+            try:
+                # Delete any old records in public.integrations for this calendar
+                delete_result = service.supabase.table('integrations').delete().eq(
+                    'organization_id', org_id
+                ).eq('integration_type', 'google_calendar').execute()
+
+                print(f"🧹 Cleaned up {len(delete_result.data) if delete_result.data else 0} old public.integrations records")
+                print(f"ℹ️  Calendar integration is tracked in healthcare.calendar_integrations only")
+            except Exception as int_error:
+                print(f"⚠️  Could not clean up old integrations (non-critical): {int_error}")
+
             # Trigger webhook to notify frontend
             try:
                 import httpx
                 async with httpx.AsyncClient() as client:
+                    # Use organization_id for webhook since that's what the frontend is tracking
                     await client.post(
-                        f"https://healthcare-clinic-backend.fly.dev/webhooks/calendar-connected/{clinic_id}"
+                        f"https://healthcare-clinic-backend.fly.dev/webhooks/calendar-connected/{org_id}"
                     )
             except:
                 pass  # Don't fail if webhook fails

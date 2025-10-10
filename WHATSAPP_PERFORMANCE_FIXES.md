@@ -93,7 +93,7 @@ return await once(dedup_key, _fetch_session)
 
 ---
 
-**File:** `app/api/evolution_webhook.py`
+**File:** `app/apps/voice-api/evolution_webhook.py`
 
 **3. Org→Clinic Caching** ⭐⭐⭐
 ```python
@@ -182,7 +182,7 @@ b596196  perf: deduplication + caching + 1s send cap
 ```
 app/main.py                      (HTTP/2, health, warmup)
 app/memory/conversation_memory.py (deduplication, caching)
-app/api/evolution_webhook.py     (org→clinic cache, send timeout)
+app/apps/voice-api/evolution_webhook.py     (org→clinic cache, send timeout)
 fly.toml                         (2 workers, health checks)
 ```
 

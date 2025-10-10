@@ -303,6 +303,10 @@ app.include_router(medical_director.router)
 from app.webhooks import calendar_webhooks
 app.include_router(calendar_webhooks.router)
 
+# Include Appointment Sync Webhook for automatic calendar sync
+from app.webhooks import appointment_sync_webhook
+app.include_router(appointment_sync_webhook.router)
+
 # Include Unified Appointments API (Phase 2: Direct Replacement)
 from app.api import appointments_api
 app.include_router(appointments_api.router)
@@ -340,6 +344,10 @@ from app.api import memory_health
 app.include_router(admin_streams.router)
 app.include_router(agents_api.router)
 app.include_router(calendar_sync.router)
+
+# Calendar Management (Multi-Doctor)
+from app.api import calendar_management
+app.include_router(calendar_management.router)
 app.include_router(memory_health.router)
 
 # ============================================================================

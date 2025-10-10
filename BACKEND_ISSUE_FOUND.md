@@ -102,7 +102,7 @@ Move the import outside the function:
 # At top of app/main.py after other imports
 from app.api.multilingual_message_processor import handle_process_message, MessageRequest
 
-@app.post("/api/process-message")
+@app.post("/apps/voice-api/process-message")
 async def process_message(request: Request):
     """Process incoming messages from API server with AI and RAG"""
     try:
@@ -117,7 +117,7 @@ Wrap the processing in a timeout:
 ```python
 import asyncio
 
-@app.post("/api/process-message")
+@app.post("/apps/voice-api/process-message")
 async def process_message(request: Request):
     """Process incoming messages from API server with AI and RAG"""
     try:

@@ -12,9 +12,9 @@ Phase 6 involves migrating 40+ direct `OpenAI()` instantiations to use the unifi
 Total files with direct OpenAI imports: **19 files**
 
 ### Priority 1: Core Message Processing (COMPLETED ✅)
-1. ✅ `app/api/response_constructor.py` - LLM factory injected via constructor
-2. ✅ `app/api/whatsapp_webhook.py` - Using factory with lazy initialization
-3. ✅ `app/api/multilingual_message_processor.py` - Factory getter added (embeddings deferred)
+1. ✅ `app/apps/voice-api/response_constructor.py` - LLM factory injected via constructor
+2. ✅ `app/apps/voice-api/whatsapp_webhook.py` - Using factory with lazy initialization
+3. ✅ `app/apps/voice-api/multilingual_message_processor.py` - Factory getter added (embeddings deferred)
 
 ### Priority 2: Supporting Services (PENDING)
 4. ⏳ `app/services/followup_scheduler.py` - Needs factory integration
@@ -24,19 +24,19 @@ Total files with direct OpenAI imports: **19 files**
 
 ### Priority 3: Knowledge Base & RAG (DEFERRED - Embeddings)
 These files use OpenAI primarily for embeddings, not chat completions:
-- `app/api/knowledge_ingestion_fixed.py`
-- `app/api/rag_cache.py`
-- `app/api/knowledge_ingestion.py`
-- `app/api/enhanced_knowledge_ingestion.py`
-- `app/api/structured_data_embedder.py`
-- `app/api/improved_knowledge_base.py`
+- `app/apps/voice-api/knowledge_ingestion_fixed.py`
+- `app/apps/voice-api/rag_cache.py`
+- `app/apps/voice-api/knowledge_ingestion.py`
+- `app/apps/voice-api/enhanced_knowledge_ingestion.py`
+- `app/apps/voice-api/structured_data_embedder.py`
+- `app/apps/voice-api/improved_knowledge_base.py`
 
 **Note**: Embeddings migration will be addressed in a future phase when we add embedding support to the factory.
 
 ### Priority 4: Alternative Processors (LOW PRIORITY)
-- `app/api/simple_message_processor.py`
-- `app/api/message_processor.py`
-- `app/api/whatsapp_webhook_simple.py`
+- `app/apps/voice-api/simple_message_processor.py`
+- `app/apps/voice-api/message_processor.py`
+- `app/apps/voice-api/whatsapp_webhook_simple.py`
 - `app/main.py` (has fallback OpenAI usage)
 
 ## Changes Made

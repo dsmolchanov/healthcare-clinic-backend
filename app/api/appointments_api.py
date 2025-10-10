@@ -17,8 +17,22 @@ from ..services.unified_appointment_service import (
     AppointmentType,
     AppointmentStatus
 )
+from ..services.external_calendar_service import ExternalCalendarService
 
 logger = logging.getLogger(__name__)
+
+# Background task for instant calendar sync
+async def sync_appointment_to_google(appointment_id: str):
+    """Sync appointment to Google Calendar instantly (background task)"""
+    try:
+        calendar_service = ExternalCalendarService()
+        result = await calendar_service.sync_appointment_to_calendar(appointment_id)
+        if result.get('success'):
+            logger.info(f"Instant sync: Appointment {appointment_id} synced to Google Calendar")
+        else:
+            logger.warning(f"Instant sync failed for {appointment_id}: {result.get('error')}")
+    except Exception as e:
+        logger.error(f"Instant sync error for {appointment_id}: {e}")
 
 # Create router
 router = APIRouter(prefix="/api/appointments", tags=["Appointments"])
@@ -197,6 +211,12 @@ async def book_appointment(
                 request.patient_email
             )
 
+            # Instant sync to Google Calendar (no more 15-minute wait!)
+            background_tasks.add_task(
+                sync_appointment_to_google,
+                result.appointment_id
+            )
+
         return AppointmentResponse(
             success=result.success,
             appointment_id=result.appointment_id,
@@ -235,6 +255,12 @@ async def reschedule_appointment(
                 send_reschedule_notification,
                 appointment_id,
                 request.new_start_time
+            )
+
+            # Instant sync to Google Calendar after reschedule
+            background_tasks.add_task(
+                sync_appointment_to_google,
+                appointment_id
             )
 
         return AppointmentResponse(

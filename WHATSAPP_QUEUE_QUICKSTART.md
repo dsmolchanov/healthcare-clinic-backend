@@ -32,7 +32,7 @@ Total Latency: ~6-10 seconds end-to-end
 ## Key Components
 
 ### 1. Web Process (Webhook Handler)
-- **Location**: `app/api/evolution_webhook.py`
+- **Location**: `app/apps/voice-api/evolution_webhook.py`
 - **Purpose**: Receives WhatsApp messages, processes with AI, queues response
 - **Scaling**: 2 machines on Fly.io
 - **Command**: `uvicorn main:app --host 0.0.0.0 --port 8080`

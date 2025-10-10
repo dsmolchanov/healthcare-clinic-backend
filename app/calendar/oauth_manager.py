@@ -17,6 +17,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from supabase import create_client, Client
+from supabase.client import ClientOptions
 
 from ..security.compliance_vault import ComplianceVault
 
@@ -29,9 +30,12 @@ class CalendarOAuthManager:
     """
 
     def __init__(self):
+        # Initialize with healthcare schema
+        options = ClientOptions(schema='healthcare')
         self.supabase: Client = create_client(
             os.environ.get("SUPABASE_URL"),
-            os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+            os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
+            options=options
         )
 
         self.vault = ComplianceVault()
@@ -261,6 +265,18 @@ class CalendarOAuthManager:
             if not result.data or not result.data.get('success'):
                 raise ValueError(f"Failed to save calendar integration: {result.data.get('error')}")
 
+            # Register Google Calendar webhook for push notifications
+            try:
+                webhook_result = await self._register_google_webhook(
+                    calendar_id=calendar_id,
+                    access_token=tokens['access_token'],
+                    clinic_id=state_data['clinic_id']
+                )
+                logger.info(f"Webhook registered for clinic {state_data['clinic_id']}: {webhook_result}")
+            except Exception as e:
+                logger.warning(f"Failed to register webhook (will fallback to polling): {e}")
+                # Continue without webhook - polling will handle sync
+
             # Clean up state token
             self.supabase.table('oauth_states').delete().eq(
                 'state', state_data['state']
@@ -299,6 +315,58 @@ class CalendarOAuthManager:
         except Exception as e:
             logger.error(f"Failed to trigger backfill sync: {e}")
             # Don't fail OAuth flow if backfill fails
+
+    async def _register_google_webhook(
+        self,
+        calendar_id: str,
+        access_token: str,
+        clinic_id: str
+    ) -> Dict[str, Any]:
+        """
+        Register Google Calendar push notification channel
+
+        Docs: https://developers.google.com/calendar/api/guides/push
+
+        Args:
+            calendar_id: Google Calendar ID
+            access_token: OAuth access token
+            clinic_id: Clinic UUID
+
+        Returns:
+            Webhook registration result from Google API
+        """
+        webhook_url = f"{os.getenv('APP_BASE_URL', 'https://healthcare-clinic-backend.fly.dev')}/webhooks/calendar/google"
+        channel_id = f"clinic_{clinic_id}_{uuid.uuid4().hex[:8]}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/watch",
+                headers={
+                    'Authorization': f'Bearer {access_token}',
+                    'Content-Type': 'application/json'
+                },
+                json={
+                    'id': channel_id,
+                    'type': 'web_hook',
+                    'address': webhook_url,
+                    'expiration': int((datetime.utcnow() + timedelta(days=7)).timestamp() * 1000)
+                }
+            ) as response:
+                if response.status != 200:
+                    error = await response.text()
+                    raise ValueError(f"Webhook registration failed: {error}")
+
+                result = await response.json()
+
+                # Store channel info for renewal and webhook validation
+                self.supabase.table('webhook_channels').insert({
+                    'clinic_id': clinic_id,
+                    'channel_id': channel_id,
+                    'resource_id': result['resourceId'],
+                    'expiration': datetime.fromtimestamp(int(result['expiration']) / 1000).isoformat()
+                }).execute()
+
+                return result
 
     async def handle_outlook_callback(
         self,

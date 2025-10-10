@@ -11,7 +11,7 @@
 |-----------|--------|---------|
 | Flow Logic (Mock) | ✅ PASSED | All 5 scenarios completed successfully |
 | Backend Health | ✅ PASSED | Health endpoint responding (355ms) |
-| Backend API | ❌ TIMEOUT | `/api/process-message` timing out after 30s |
+| Backend API | ❌ TIMEOUT | `/apps/voice-api/process-message` timing out after 30s |
 | Widget Integration | ✅ READY | Frontend deployed and configured |
 | Database Schema | ✅ READY | Tables and RLS policies configured |
 
@@ -111,12 +111,12 @@ Comprehensive integration test including:
 
 ### Problem
 
-The `/api/process-message` endpoint is **timing out after 30 seconds** on all requests.
+The `/apps/voice-api/process-message` endpoint is **timing out after 30 seconds** on all requests.
 
 ### Evidence
 
 ```bash
-$ curl -X POST https://healthcare-clinic-backend.fly.dev/api/process-message \
+$ curl -X POST https://healthcare-clinic-backend.fly.dev/apps/voice-api/process-message \
   -H "Content-Type: application/json" \
   -d '{...}'
 
@@ -141,7 +141,7 @@ $ curl -X POST https://healthcare-clinic-backend.fly.dev/api/process-message \
 
 3. **Logs Analysis**: ⚠️ Issue Found
    - Only health check requests visible in logs
-   - No POST requests to `/api/process-message` appearing
+   - No POST requests to `/apps/voice-api/process-message` appearing
    - Suggests requests timing out before processing starts
 
 ### Root Cause Analysis
@@ -171,7 +171,7 @@ Likely causes (in order of probability):
 ### Code Location
 
 - **Endpoint**: `clinics/backend/app/main.py:585`
-- **Handler**: `clinics/backend/app/api/multilingual_message_processor.py`
+- **Handler**: `clinics/backend/app/apps/voice-api/multilingual_message_processor.py`
 - **Dependencies**:
   - OpenAI client (line 22)
   - Supabase client (line 25-28)
@@ -204,7 +204,7 @@ Likely causes (in order of probability):
 
 4. **Add Timeout Protection**
    ```python
-   @app.post("/api/process-message")
+   @app.post("/apps/voice-api/process-message")
    async def process_message(request: Request):
        try:
            # Add timeout wrapper
@@ -281,7 +281,7 @@ Navigate to: `https://plaintalk-frontend.vercel.app/intelligence/chat`
 
 Expected flow:
 1. User types message in widget
-2. Widget sends to `healthcare-clinic-backend.fly.dev/api/process-message`
+2. Widget sends to `healthcare-clinic-backend.fly.dev/apps/voice-api/process-message`
 3. Backend processes through LangGraph
 4. Response returned to widget
 5. Conversation stored in database

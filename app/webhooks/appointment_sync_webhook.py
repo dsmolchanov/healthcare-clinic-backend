@@ -1,0 +1,191 @@
+"""
+Appointment Calendar Sync Webhook
+Automatically syncs appointments to Google Calendar when they're created/updated
+"""
+import logging
+from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
+from typing import Dict, Any
+
+from app.services.external_calendar_service import ExternalCalendarService
+from app.db.supabase_client import get_supabase_client
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/webhooks/appointment-sync", tags=["Webhooks"])
+
+
+async def sync_appointment_to_calendar(appointment_id: str, operation: str):
+    """Background task to sync appointment to calendar"""
+    try:
+        logger.info(f"Syncing appointment {appointment_id} to calendar (operation: {operation})")
+        
+        supabase = get_supabase_client()
+        service = ExternalCalendarService()
+        
+        # Get appointment details
+        appointment = supabase.from_('appointments').select(
+            '*'
+        ).eq('id', appointment_id).single().execute()
+        
+        if not appointment.data:
+            logger.warning(f"Appointment {appointment_id} not found")
+            return
+        
+        appt = appointment.data
+        
+        # Skip if no doctor assigned
+        if not appt.get('doctor_id'):
+            logger.info(f"No doctor assigned to appointment {appointment_id}, skipping sync")
+            return
+        
+        # Get doctor details
+        doctor = supabase.from_('doctors').select('first_name, last_name').eq(
+            'id', appt['doctor_id']
+        ).single().execute()
+        
+        if not doctor.data:
+            logger.warning(f"Doctor not found for appointment {appointment_id}")
+            return
+        
+        doctor_name = f"{doctor.data['first_name']} {doctor.data['last_name']}"
+
+        # Handle DELETE/CANCEL operations
+        if operation == 'DELETE' or appt.get('status') == 'cancelled':
+            # TODO: Implement calendar event deletion
+            logger.info(f"Appointment {appointment_id} cancelled/deleted - calendar event deletion not yet implemented")
+            return
+
+        # Get service duration if available
+        duration_minutes = 30  # Default
+        appointment_type = appt.get('appointment_type')
+
+        if appointment_type:
+            try:
+                # Try to find matching service by name
+                service = supabase.from_('services').select(
+                    'duration_minutes'
+                ).eq('clinic_id', appt['clinic_id']).eq('name', appointment_type).execute()
+
+                if service.data and len(service.data) > 0:
+                    duration_minutes = service.data[0].get('duration_minutes', 30)
+                    logger.info(f"Using service duration: {duration_minutes} minutes for {appointment_type}")
+                else:
+                    logger.info(f"No service found for '{appointment_type}', using default 30 minutes")
+            except Exception as e:
+                logger.warning(f"Error fetching service duration: {e}, using default 30 minutes")
+
+        # Prepare appointment data
+        appointment_data = {
+            'id': appt['id'],
+            'clinic_id': appt['clinic_id'],
+            'doctor_id': appt['doctor_id'],
+            'doctor_name': doctor_name,
+            'patient_id': appt.get('patient_id'),
+            'patient_name': appt.get('patient_name', 'Unknown Patient'),
+            'appointment_date': appt['appointment_date'],
+            'start_time': appt['start_time'],
+            'end_time': appt.get('end_time'),
+            'duration_minutes': duration_minutes,
+            'appointment_type': appointment_type,
+            'reason_for_visit': appt.get('reason_for_visit'),
+            'notes': appt.get('notes')
+        }
+        
+        # Create calendar event
+        result = await service.create_calendar_event(appointment_data)
+        
+        if result.get('success'):
+            logger.info(f"✅ Successfully synced appointment {appointment_id} to calendar")
+        else:
+            logger.error(f"❌ Failed to sync appointment {appointment_id}: {result.get('error')}")
+            
+    except Exception as e:
+        logger.error(f"Error syncing appointment {appointment_id} to calendar: {e}", exc_info=True)
+
+
+@router.post("/supabase")
+async def supabase_appointment_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks
+):
+    """
+    Webhook endpoint for Supabase Database Webhooks
+    Receives notifications when appointments are created/updated/deleted
+    """
+    try:
+        # Get webhook payload
+        payload = await request.json()
+        
+        logger.info(f"Received appointment sync webhook: {payload.get('type')}")
+        
+        # Supabase webhook format
+        webhook_type = payload.get('type')  # INSERT, UPDATE, DELETE
+        record = payload.get('record', {})
+        old_record = payload.get('old_record', {})
+        
+        appointment_id = record.get('id') or old_record.get('id')
+        
+        if not appointment_id:
+            logger.warning("No appointment ID in webhook payload")
+            return {'success': False, 'error': 'Missing appointment ID'}
+        
+        # Only process scheduled/confirmed appointments
+        status = record.get('status')
+        if webhook_type in ['INSERT', 'UPDATE'] and status not in ['scheduled', 'confirmed']:
+            logger.info(f"Skipping sync for appointment {appointment_id} with status {status}")
+            return {'success': True, 'note': 'Appointment not in scheduled/confirmed status'}
+        
+        # Add background task to sync to calendar
+        background_tasks.add_task(
+            sync_appointment_to_calendar,
+            appointment_id=appointment_id,
+            operation=webhook_type
+        )
+        
+        return {
+            'success': True,
+            'appointment_id': appointment_id,
+            'operation': webhook_type
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing appointment sync webhook: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/pg-notify")
+async def pg_notify_appointment_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks
+):
+    """
+    Webhook endpoint for pg_notify events
+    Alternative to Supabase webhooks using PostgreSQL NOTIFY
+    """
+    try:
+        # Get notification payload
+        payload = await request.json()
+        
+        logger.info(f"Received pg_notify appointment sync: {payload}")
+        
+        appointment_id = payload.get('appointment_id')
+        operation = payload.get('operation', 'INSERT')
+        
+        if not appointment_id:
+            return {'success': False, 'error': 'Missing appointment ID'}
+        
+        # Add background task
+        background_tasks.add_task(
+            sync_appointment_to_calendar,
+            appointment_id=appointment_id,
+            operation=operation
+        )
+        
+        return {
+            'success': True,
+            'appointment_id': appointment_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing pg_notify webhook: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

@@ -62,7 +62,7 @@ python3 test_widget_flow_local.py
 **Findings**:
 - Backend is running
 - Health check works
-- `/api/process-message` times out
+- `/apps/voice-api/process-message` times out
 - Likely missing environment variables
 
 **Run it**:
@@ -185,7 +185,7 @@ Status: ✅ PASSED
 ## 🔧 Backend Issue Analysis
 
 ### Problem
-`/api/process-message` endpoint timing out after 30+ seconds
+`/apps/voice-api/process-message` endpoint timing out after 30+ seconds
 
 ### Root Cause (Most Likely)
 Missing or invalid environment variables:
@@ -250,7 +250,7 @@ python3 test_backend_quick.py
 
 **Backend (Timeout Issue)**:
 - Health: https://healthcare-clinic-backend.fly.dev/health ✅
-- API: https://healthcare-clinic-backend.fly.dev/api/process-message ⚠️
+- API: https://healthcare-clinic-backend.fly.dev/apps/voice-api/process-message ⚠️
 
 ---
 
@@ -412,7 +412,7 @@ https://vercel.com/dashboard
 ## 📚 Additional Resources
 
 - Widget Implementation: `plaintalk/widget/src/components/ChatInterface.tsx`
-- Backend Handler: `clinics/backend/app/api/multilingual_message_processor.py`
+- Backend Handler: `clinics/backend/app/apps/voice-api/multilingual_message_processor.py`
 - Frontend Integration: `plaintalk/frontend/src/pages/Intelligence.tsx`
 - Test Reports: `test_report_local_*.json`
 

@@ -37,7 +37,7 @@ The `get_unsynced_appointments` function might be filtering too aggressively.
 
 ## Code Flow After Migration
 
-1. User triggers sync via `/api/calendar/sync/bulk`
+1. User triggers sync via `/apps/voice-api/calendar/sync/bulk`
 2. Code calls `healthcare.get_calendar_integration_by_clinic()`
 3. If integration found, retrieves credentials from vault
 4. Creates Google Calendar event

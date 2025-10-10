@@ -9,7 +9,7 @@ This document describes how to integrate the PlainTalk chat widget with the What
 ### Widget Frontend (`/plaintalk/widget`)
 - **Technology**: React 18 + TypeScript + Shadow DOM
 - **Entry Point**: `src/components/ChatInterface.tsx`
-- **Current Endpoint**: `GET /api/widget-chat?body={message}`
+- **Current Endpoint**: `GET /apps/voice-api/widget-chat?body={message}`
 - **Default API URL**: `https://healthcare-clinic-backend.fly.dev`
 
 ### Backend (`/clinics/backend`)
@@ -53,7 +53,7 @@ Widget User                                    WhatsApp User
     ↓                                                 ↓
 WebSocket/SSE                                  Evolution API
     ↓                                                 ↓
-POST /api/widget/send                    POST /webhooks/evolution/
+POST /apps/voice-api/widget/send                    POST /webhooks/evolution/
     ↓                                                 ↓
     └──────────────────┬──────────────────────────────┘
                        ↓
@@ -131,7 +131,7 @@ Reuse the existing WhatsApp queue infrastructure for widget messages.
 
 #### Backend Changes
 
-**1. Create Widget Message Endpoint** (`app/api/widget_websocket.py`)
+**1. Create Widget Message Endpoint** (`app/apps/voice-api/widget_websocket.py`)
 
 ```python
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -399,10 +399,10 @@ async def widget_websocket(websocket: WebSocket, session_id: str):
 
 ### Phase 3: Add Fallback for REST API
 
-Keep the existing `/api/widget-chat` endpoint for backwards compatibility:
+Keep the existing `/apps/voice-api/widget-chat` endpoint for backwards compatibility:
 
 ```python
-@app.get("/api/widget-chat")
+@app.get("/apps/voice-api/widget-chat")
 async def widget_chat_get(body: str = "", session_id: str = ""):
     """Legacy REST endpoint - still works but slower"""
 
@@ -416,7 +416,7 @@ async def widget_chat_get(body: str = "", session_id: str = ""):
     return {
         "message_id": message_id,
         "status": "queued",
-        "poll_url": f"/api/widget-poll/{message_id}"
+        "poll_url": f"/apps/voice-api/widget-poll/{message_id}"
     }
 ```
 
@@ -546,7 +546,7 @@ If WebSocket is too complex, use SSE:
 ```python
 from fastapi.responses import StreamingResponse
 
-@app.post("/api/widget-stream")
+@app.post("/apps/voice-api/widget-stream")
 async def widget_stream(request: Request):
     async def event_generator():
         # Send immediate ack
@@ -566,7 +566,7 @@ async def widget_stream(request: Request):
 
 **Frontend**:
 ```typescript
-const eventSource = new EventSource(`${apiUrl}/api/widget-stream`);
+const eventSource = new EventSource(`${apiUrl}/apps/voice-api/widget-stream`);
 eventSource.onmessage = (event) => {
   const data = JSON.parse(event.data);
   if (data.type === 'message') {
@@ -586,7 +586,7 @@ eventSource.onmessage = (event) => {
 ## Support & Resources
 
 - **Widget Documentation**: `/plaintalk/widget/README-CHAT.md`
-- **Queue Documentation**: `/clinics/backend/WHATSAPP_QUEUE_IMPLEMENTATION.md`
+- **Queue Documentation**: `/apps/healthcare-backend/WHATSAPP_QUEUE_IMPLEMENTATION.md`
 - **WebSocket Docs**: https://fastapi.tiangolo.com/advanced/websockets/
 - **React WebSocket**: https://github.com/robtaussig/react-use-websocket
 

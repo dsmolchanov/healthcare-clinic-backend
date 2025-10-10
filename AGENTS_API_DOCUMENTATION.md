@@ -4,7 +4,7 @@
 
 The Agents API provides endpoints for managing the multi-agent system. All agents data is stored in the `core` schema and accessed via RPC functions to bypass RLS permissions.
 
-**Base URL**: `https://healthcare-clinic-backend.fly.dev/api/agents`
+**Base URL**: `https://healthcare-clinic-backend.fly.dev/apps/voice-api/agents`
 
 ## Endpoints
 
@@ -12,7 +12,7 @@ The Agents API provides endpoints for managing the multi-agent system. All agent
 
 Fetches all active agents for a specific organization.
 
-**Endpoint**: `GET /api/agents/organization/{organization_id}`
+**Endpoint**: `GET /apps/voice-api/agents/organization/{organization_id}`
 
 **Parameters**:
 - `organization_id` (path, required): Organization UUID
@@ -22,7 +22,7 @@ Fetches all active agents for a specific organization.
 
 **Example Request**:
 ```bash
-GET /api/agents/organization/4e8ddba1-ad52-4613-9a03-ec64636b3f6c
+GET /apps/voice-api/agents/organization/4e8ddba1-ad52-4613-9a03-ec64636b3f6c
 ```
 
 **Example Response**:
@@ -119,7 +119,7 @@ GET /api/agents/organization/4e8ddba1-ad52-4613-9a03-ec64636b3f6c
 
 Fetches a specific agent by ID.
 
-**Endpoint**: `GET /api/agents/{agent_id}`
+**Endpoint**: `GET /apps/voice-api/agents/{agent_id}`
 
 **Parameters**:
 - `agent_id` (path, required): Agent UUID
@@ -128,14 +128,14 @@ Fetches a specific agent by ID.
 
 **Example Request**:
 ```bash
-GET /api/agents/44da20c9-166a-4dab-b752-a4c5098526b4
+GET /apps/voice-api/agents/44da20c9-166a-4dab-b752-a4c5098526b4
 ```
 
 ### 3. Get Child Agents
 
 Fetches all child specialist agents for a parent orchestrator.
 
-**Endpoint**: `GET /api/agents/{agent_id}/children`
+**Endpoint**: `GET /apps/voice-api/agents/{agent_id}/children`
 
 **Parameters**:
 - `agent_id` (path, required): Parent agent UUID
@@ -144,7 +144,7 @@ Fetches all child specialist agents for a parent orchestrator.
 
 **Example Request**:
 ```bash
-GET /api/agents/44da20c9-166a-4dab-b752-a4c5098526b4/children
+GET /apps/voice-api/agents/44da20c9-166a-4dab-b752-a4c5098526b4/children
 ```
 
 **Example Response**:
@@ -164,7 +164,7 @@ GET /api/agents/44da20c9-166a-4dab-b752-a4c5098526b4/children
 
 Fetches all available agent templates from the marketplace.
 
-**Endpoint**: `GET /api/agents/templates/all`
+**Endpoint**: `GET /apps/voice-api/agents/templates/all`
 
 **Parameters**: None
 
@@ -241,7 +241,7 @@ export async function getAgentsForOrganization(
   organizationId: string
 ): Promise<Agent[]> {
   const response = await fetch(
-    `https://healthcare-clinic-backend.fly.dev/api/agents/organization/${organizationId}`
+    `https://healthcare-clinic-backend.fly.dev/apps/voice-api/agents/organization/${organizationId}`
   );
 
   if (!response.ok) {
@@ -387,11 +387,11 @@ Test the API with curl:
 
 ```bash
 # Get all agents for organization
-curl https://healthcare-clinic-backend.fly.dev/api/agents/organization/4e8ddba1-ad52-4613-9a03-ec64636b3f6c
+curl https://healthcare-clinic-backend.fly.dev/apps/voice-api/agents/organization/4e8ddba1-ad52-4613-9a03-ec64636b3f6c
 
 # Get single agent
-curl https://healthcare-clinic-backend.fly.dev/api/agents/44da20c9-166a-4dab-b752-a4c5098526b4
+curl https://healthcare-clinic-backend.fly.dev/apps/voice-api/agents/44da20c9-166a-4dab-b752-a4c5098526b4
 
 # Get templates
-curl https://healthcare-clinic-backend.fly.dev/api/agents/templates/all
+curl https://healthcare-clinic-backend.fly.dev/apps/voice-api/agents/templates/all
 ```

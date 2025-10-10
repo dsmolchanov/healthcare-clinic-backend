@@ -24,7 +24,7 @@ Successfully implemented a production-grade WhatsApp message queue system using 
 
 ### 2. Admin Endpoints
 **Files Modified/Created**:
-- ✅ `app/api/admin_streams.py` - Queue management endpoints
+- ✅ `app/apps/voice-api/admin_streams.py` - Queue management endpoints
   - `GET /admin/streams/health` - Comprehensive health check
   - `POST /admin/streams/reset-to-latest` - Skip backlog
   - `POST /admin/streams/reset-to-begin` - Reprocess all
@@ -248,7 +248,7 @@ app/services/whatsapp_queue/
 ├── rate_limiter.py
 └── worker.py
 
-app/api/
+app/apps/voice-api/
 └── admin_streams.py
 
 run_worker.py

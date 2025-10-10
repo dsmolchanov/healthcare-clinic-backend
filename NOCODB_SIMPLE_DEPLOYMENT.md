@@ -73,7 +73,7 @@ import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 serve(async (req) => {
   // Proxy requests to NocoDB Cloud API
   const url = new URL(req.url)
-  const targetUrl = `https://app.nocodb.com/api/v1${url.pathname}${url.search}`
+  const targetUrl = `https://app.nocodb.com/apps/voice-api/v1${url.pathname}${url.search}`
   
   const response = await fetch(targetUrl, {
     method: req.method,
@@ -183,7 +183,7 @@ Once deployed, you can use NocoDB's REST API:
 
 ```javascript
 // Example: Fetch patients
-const response = await fetch('https://clinic-nocodb.fly.dev/api/v1/db/data/noco/project/patients', {
+const response = await fetch('https://clinic-nocodb.fly.dev/apps/voice-api/v1/db/data/noco/project/patients', {
   headers: {
     'xc-auth': 'your-api-token'
   }
@@ -191,7 +191,7 @@ const response = await fetch('https://clinic-nocodb.fly.dev/api/v1/db/data/noco/
 const patients = await response.json();
 
 // Example: Create appointment
-const appointment = await fetch('https://clinic-nocodb.fly.dev/api/v1/db/data/noco/project/appointments', {
+const appointment = await fetch('https://clinic-nocodb.fly.dev/apps/voice-api/v1/db/data/noco/project/appointments', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',

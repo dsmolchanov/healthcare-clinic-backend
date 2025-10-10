@@ -106,7 +106,7 @@ clinics/backend/
 
 ### Upload Document
 ```bash
-POST /api/knowledge/upload
+POST /apps/voice-api/knowledge/upload
 Content-Type: multipart/form-data
 
 file: [binary]
@@ -116,7 +116,7 @@ organization_id: "uuid"
 
 ### Query Knowledge
 ```bash
-POST /api/process-message
+POST /apps/voice-api/process-message
 {
   "body": "Your question",
   "clinic_id": "uuid",

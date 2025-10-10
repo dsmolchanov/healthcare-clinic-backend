@@ -46,7 +46,7 @@ fly scale count 3 -a healthcare-clinic-backend-stable
 export DISABLE_HMAC_VERIFICATION=true
 
 # Restore previous webhook handler
-git checkout stable -- app/api/evolution_webhook.py
+git checkout stable -- app/apps/voice-api/evolution_webhook.py
 fly deploy -a healthcare-clinic-backend --strategy immediate
 
 # Re-enable after fix
@@ -277,7 +277,7 @@ curl -s https://healthcare-clinic-backend.fly.dev/metrics | grep pg_connections
 ### Customer Communication
 ```bash
 # Update status page
-curl -X POST https://status.example.com/api/incidents \
+curl -X POST https://status.example.com/apps/voice-api/incidents \
   -H "Authorization: Bearer $STATUS_API_KEY" \
   -d '{"status": "investigating", "message": "We are experiencing issues and investigating"}'
 

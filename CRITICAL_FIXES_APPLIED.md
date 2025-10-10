@@ -86,7 +86,7 @@ price = prices.get('PЛОМБА')  # O(1) lookup
 
 **Files:**
 - `clinics/backend/app/memory/conversation_memory.py`
-- `clinics/backend/app/api/multilingual_message_processor.py`
+- `clinics/backend/app/apps/voice-api/multilingual_message_processor.py`
 
 **Issue:** `message_metrics` table insert referenced a `message_id` that didn't exist yet because:
 1. Code generated a UUID for `assistant_message_id`

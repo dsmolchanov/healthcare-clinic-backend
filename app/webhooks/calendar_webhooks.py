@@ -13,6 +13,7 @@ from typing import Dict, Any, Optional
 
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 from supabase import create_client, Client
+from supabase.client import ClientOptions
 
 from ..services.external_calendar_service import ExternalCalendarService
 from ..services.websocket_manager import websocket_manager, NotificationType
@@ -22,61 +23,79 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks/calendar", tags=["Calendar Webhooks"])
 
-# Initialize services
+# Initialize services with healthcare schema
+options = ClientOptions(schema='healthcare')
 supabase: Client = create_client(
     os.environ.get("SUPABASE_URL"),
-    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
+    options=options
 )
 calendar_service = ExternalCalendarService()
 
 @router.post("/google")
 async def google_calendar_webhook(
     request: Request,
-    background_tasks: BackgroundTasks
+    x_goog_channel_id: Optional[str] = None,
+    x_goog_resource_state: Optional[str] = None,
+    x_goog_resource_id: Optional[str] = None
 ):
     """
     Handle Google Calendar push notifications for external changes
 
-    Google Calendar sends notifications when events are created, updated, or deleted
+    States:
+    - sync: Initial verification (respond with 200)
+    - exists: Resource exists (trigger sync)
+    - not_exists: Resource deleted (ignore for now)
     """
     try:
-        # Get headers and body
+        # Get headers
         headers = dict(request.headers)
-        body = await request.body()
 
-        logger.info(f"Received Google Calendar webhook: {headers}")
+        # Extract Google webhook headers (case-insensitive)
+        channel_id = x_goog_channel_id or headers.get('x-goog-channel-id')
+        resource_state = x_goog_resource_state or headers.get('x-goog-resource-state')
+        resource_id = x_goog_resource_id or headers.get('x-goog-resource-id')
 
-        # Verify webhook signature if configured
-        webhook_secret = os.environ.get("GOOGLE_CALENDAR_WEBHOOK_SECRET")
-        if webhook_secret and not verify_google_webhook_signature(headers, body, webhook_secret):
-            logger.warning("Invalid Google Calendar webhook signature")
-            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        logger.info(f"Received Google Calendar webhook - channel: {channel_id}, state: {resource_state}")
 
-        # Parse notification data
-        notification_data = {
-            'channel_id': headers.get('x-goog-channel-id'),
-            'channel_token': headers.get('x-goog-channel-token'),
-            'resource_id': headers.get('x-goog-resource-id'),
-            'resource_uri': headers.get('x-goog-resource-uri'),
-            'resource_state': headers.get('x-goog-resource-state'),
-            'message_number': headers.get('x-goog-message-number'),
-            'expiration': headers.get('x-goog-channel-expiration')
-        }
+        # Verify it's a sync message (initial verification)
+        if resource_state == 'sync':
+            logger.info(f"Webhook sync verification for channel {channel_id}")
+            return {"status": "verified"}
 
-        # Process the change in background
-        background_tasks.add_task(
-            handle_google_calendar_change,
-            notification_data
-        )
+        # Only process actual changes
+        if resource_state not in ['exists', 'not_exists']:
+            logger.debug(f"Ignoring webhook state: {resource_state}")
+            return {"status": "ignored"}
 
-        # Return success immediately
-        return {"status": "received", "channel_id": notification_data.get('channel_id')}
+        # Lookup clinic from channel_id (don't use .single() to avoid exceptions)
+        try:
+            channel = supabase.table('webhook_channels').select('clinic_id').eq(
+                'channel_id', channel_id
+            ).execute()
+
+            # Check if channel exists
+            if not channel.data or len(channel.data) == 0:
+                logger.info(f"Ignoring webhook for unknown/expired channel: {channel_id}")
+                return {"status": "ignored", "reason": "channel_not_found"}
+
+        except Exception as e:
+            # Database error - ignore gracefully
+            logger.info(f"Database error looking up channel {channel_id}: {e}")
+            return {"status": "ignored", "reason": "database_error"}
+
+        clinic_id = channel.data[0]['clinic_id']
+
+        # Trigger incremental sync for this clinic
+        sync_result = await calendar_service.sync_from_google_calendar(clinic_id)
+        logger.info(f"Webhook triggered sync for clinic {clinic_id}: {sync_result}")
+        return {"status": "synced", "result": sync_result}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Google Calendar webhook processing failed: {e}")
-        raise HTTPException(status_code=500, detail="Webhook processing failed")
+        logger.error(f"Google Calendar webhook processing failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/outlook")
 async def outlook_calendar_webhook(
