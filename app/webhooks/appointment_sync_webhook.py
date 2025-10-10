@@ -82,19 +82,37 @@ async def sync_appointment_to_calendar(appointment_id: str, operation: str):
             'doctor_name': doctor_name,
             'patient_id': appt.get('patient_id'),
             'patient_name': appt.get('patient_name', 'Unknown Patient'),
+            'patient_phone': appt.get('patient_phone'),
             'appointment_date': appt['appointment_date'],
             'start_time': appt['start_time'],
             'end_time': appt.get('end_time'),
             'duration_minutes': duration_minutes,
             'appointment_type': appointment_type,
             'reason_for_visit': appt.get('reason_for_visit'),
-            'notes': appt.get('notes')
+            'notes': appt.get('notes'),
+            'google_event_id': appt.get('google_event_id')
         }
-        
-        # Create calendar event
-        result = await service.create_calendar_event(appointment_data)
-        
+
+        # Check if appointment already has a google_event_id
+        if appt.get('google_event_id'):
+            logger.info(f"Appointment {appointment_id} already synced, updating existing event {appt['google_event_id']}")
+            result = await service.update_calendar_event(appointment_data)
+        else:
+            logger.info(f"Appointment {appointment_id} not yet synced, creating new event")
+            result = await service.create_calendar_event(appointment_data)
+
         if result.get('success'):
+            # Update appointment with google_event_id if this was a new event
+            if result.get('google_event_id') and not appt.get('google_event_id'):
+                try:
+                    supabase.from_('appointments').update({
+                        'google_event_id': result['google_event_id'],
+                        'calendar_synced_at': 'now()'
+                    }).eq('id', appointment_id).execute()
+                    logger.info(f"Updated appointment {appointment_id} with google_event_id: {result['google_event_id']}")
+                except Exception as update_error:
+                    logger.warning(f"Failed to update appointment with google_event_id: {update_error}")
+
             logger.info(f"✅ Successfully synced appointment {appointment_id} to calendar")
         else:
             logger.error(f"❌ Failed to sync appointment {appointment_id}: {result.get('error')}")

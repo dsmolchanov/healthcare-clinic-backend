@@ -995,6 +995,187 @@ class ExternalCalendarService:
             )
             return {'success': False, 'error': str(e)}
 
+    async def update_calendar_event(self, appointment_data: Dict) -> Dict[str, Any]:
+        """
+        Update an existing calendar event
+        Used when appointments are modified after initial creation
+        """
+        try:
+            doctor_id = appointment_data.get('doctor_id')
+            clinic_id = appointment_data.get('clinic_id')
+            google_event_id = appointment_data.get('google_event_id')
+
+            if not google_event_id:
+                logger.warning(f"No google_event_id found for appointment {appointment_data.get('id')}, creating new event")
+                return await self.create_calendar_event(appointment_data)
+
+            logger.info(f"Updating Google Calendar event {google_event_id} for appointment {appointment_data.get('id')}")
+
+            # Query healthcare.calendar_integrations using RPC
+            integration_result = self.supabase.rpc('get_calendar_integration_by_clinic', {
+                'p_clinic_id': clinic_id,
+                'p_provider': 'google'
+            }).execute()
+
+            if not integration_result.data or len(integration_result.data) == 0:
+                logger.info(f"No Google Calendar integration found for clinic {clinic_id}")
+                return {'success': True, 'note': 'Google Calendar not configured'}
+
+            calendar_integration = integration_result.data[0]
+
+            # Check if enabled and active
+            if not calendar_integration.get('sync_enabled'):
+                logger.info(f"Google Calendar integration disabled for clinic {clinic_id}")
+                return {'success': True, 'note': 'Google Calendar integration disabled'}
+
+            # Retrieve credentials from vault
+            vault_ref = calendar_integration.get('credentials_vault_ref')
+            if not vault_ref:
+                logger.error(f"No vault reference found for clinic {clinic_id}")
+                return {'success': False, 'error': 'Missing credentials vault reference'}
+
+            # Get credentials from vault
+            calendar_credentials = await self.vault.retrieve_calendar_credentials(
+                organization_id=calendar_integration.get('organization_id'),
+                provider='google'
+            )
+
+            if not calendar_credentials:
+                logger.error(f"Failed to retrieve credentials from vault for clinic {clinic_id}")
+                return {'success': False, 'error': 'Failed to retrieve calendar credentials'}
+
+            logger.info(f"Successfully retrieved calendar credentials for clinic {clinic_id}")
+
+            # Create Google Calendar service
+            credentials = Credentials.from_authorized_user_info(calendar_credentials)
+            service = build('calendar', 'v3', credentials=credentials)
+
+            # Prepare appointment times with Cancun timezone
+            from dateutil import parser, tz
+            cancun_tz = tz.gettz('America/Cancun')
+
+            if isinstance(appointment_data.get('start_time'), str):
+                # If string, combine with date and set Cancun timezone
+                date_str = appointment_data.get('appointment_date', appointment_data.get('date'))
+                start_datetime = parser.parse(f"{date_str} {appointment_data['start_time']}")
+
+                # Calculate end_time: use provided end_time, or calculate from duration_minutes
+                if appointment_data.get('end_time'):
+                    end_datetime = parser.parse(f"{date_str} {appointment_data['end_time']}")
+                else:
+                    # Use duration_minutes to calculate end_time
+                    duration = appointment_data.get('duration_minutes', 30)
+                    end_datetime = start_datetime + timedelta(minutes=duration)
+
+                # Set timezone to Cancun if naive
+                if start_datetime.tzinfo is None:
+                    start_datetime = start_datetime.replace(tzinfo=cancun_tz)
+                if end_datetime.tzinfo is None:
+                    end_datetime = end_datetime.replace(tzinfo=cancun_tz)
+            else:
+                start_datetime = appointment_data['start_time']
+                end_datetime = appointment_data.get('end_time', start_datetime + timedelta(minutes=appointment_data.get('duration_minutes', 30)))
+
+                # Set timezone to Cancun if naive
+                if start_datetime.tzinfo is None:
+                    start_datetime = start_datetime.replace(tzinfo=cancun_tz)
+                if end_datetime.tzinfo is None:
+                    end_datetime = end_datetime.replace(tzinfo=cancun_tz)
+
+            # Build rich event summary and description
+            patient_name = appointment_data.get('patient_name', 'Unknown Patient')
+            doctor_name = appointment_data.get('doctor_name', 'Doctor')
+            appointment_type = appointment_data.get('appointment_type', 'Appointment')
+
+            # Summary: "Root Canal - John Doe with Dr. Smith"
+            summary = f"{appointment_type} - {patient_name}"
+            if doctor_name and doctor_name != 'Doctor':
+                summary += f" with {doctor_name}"
+
+            # Description: Include patient phone and notes
+            description_parts = []
+            if appointment_data.get('patient_phone'):
+                description_parts.append(f"Patient: {patient_name} ({appointment_data['patient_phone']})")
+            else:
+                description_parts.append(f"Patient: {patient_name}")
+
+            if doctor_name and doctor_name != 'Doctor':
+                description_parts.append(f"Doctor: {doctor_name}")
+
+            if appointment_data.get('notes'):
+                description_parts.append(f"\nNotes: {appointment_data['notes']}")
+
+            if appointment_data.get('reason_for_visit'):
+                description_parts.append(f"Reason: {appointment_data['reason_for_visit']}")
+
+            description = "\n".join(description_parts)
+
+            # Update event data
+            event_update = {
+                'summary': summary,
+                'description': description,
+                'start': {
+                    'dateTime': start_datetime.isoformat(),
+                    'timeZone': 'America/Cancun',
+                },
+                'end': {
+                    'dateTime': end_datetime.isoformat(),
+                    'timeZone': 'America/Cancun',
+                },
+                'colorId': '1',  # Blue for appointments
+                'transparency': 'opaque',
+                'extendedProperties': {
+                    'private': {
+                        'appointment_id': str(appointment_data.get('id', '')),
+                        'doctor_id': str(doctor_id),
+                        'patient_id': str(appointment_data.get('patient_id', '')),
+                        'source': 'clinic_system'
+                    }
+                }
+            }
+
+            # Get doctor's calendar (either sub-calendar or primary)
+            target_calendar_id = await self._get_doctor_calendar(
+                doctor_id=doctor_id,
+                organization_id=calendar_integration.get('organization_id')
+            )
+
+            # Update the event
+            updated_event = service.events().update(
+                calendarId=target_calendar_id,
+                eventId=google_event_id,
+                body=event_update
+            ).execute()
+
+            # Log the operation
+            await self._log_calendar_operation(
+                doctor_id, 'google', 'update_event',
+                external_event_id=updated_event['id'],
+                internal_event_id=appointment_data.get('id'),
+                status='success',
+                request_data=event_update
+            )
+
+            logger.info(f"Updated Google Calendar event {updated_event['id']} for appointment {appointment_data.get('id')}")
+
+            return {
+                'success': True,
+                'google_event_id': updated_event['id'],
+                'event_link': updated_event.get('htmlLink'),
+                'event_html_link': updated_event.get('htmlLink')
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to update Google Calendar event: {e}", exc_info=True)
+            await self._log_calendar_operation(
+                appointment_data.get('doctor_id'), 'google', 'update_event',
+                internal_event_id=appointment_data.get('id'),
+                external_event_id=appointment_data.get('google_event_id'),
+                status='failed',
+                error_message=str(e)
+            )
+            return {'success': False, 'error': str(e)}
+
     async def sync_appointment_to_calendar(self, appointment_id: str) -> Dict[str, Any]:
         """
         Sync a specific appointment to external calendar
@@ -1018,11 +1199,16 @@ class ExternalCalendarService:
 
             appointment = appointment_result.data[0]
 
-            # Create calendar event
-            result = await self.create_calendar_event(appointment)
+            # Check if appointment already has a google_event_id
+            if appointment.get('google_event_id'):
+                logger.info(f"Appointment {appointment_id} already synced, updating existing event {appointment['google_event_id']}")
+                result = await self.update_calendar_event(appointment)
+            else:
+                logger.info(f"Appointment {appointment_id} not yet synced, creating new event")
+                result = await self.create_calendar_event(appointment)
 
             # Update appointment with calendar event ID using RPC function
-            if result.get('success') and result.get('google_event_id'):
+            if result.get('success') and result.get('google_event_id') and not appointment.get('google_event_id'):
                 try:
                     # Try to use RPC function for marking as synced
                     sync_result = self.supabase.rpc(
