@@ -142,14 +142,21 @@ async def supabase_appointment_webhook(
             return {'success': False, 'error': 'Missing appointment ID'}
 
         # Skip if this update is from calendar sync worker (prevent loops)
-        # Check if google_event_id was just set (meaning this is a sync update)
+        # Check if google_event_id or calendar_synced_at was just updated
         if webhook_type == 'UPDATE':
             old_google_id = old_record.get('google_event_id')
             new_google_id = record.get('google_event_id')
+            old_synced_at = old_record.get('calendar_synced_at')
+            new_synced_at = record.get('calendar_synced_at')
 
             # If google_event_id was just added, this is a sync operation - skip to prevent loop
             if not old_google_id and new_google_id:
-                logger.info(f"Skipping webhook for appointment {appointment_id} - sync operation detected")
+                logger.info(f"Skipping webhook for appointment {appointment_id} - sync operation detected (google_event_id added)")
+                return {'success': True, 'note': 'Sync operation - skipping to prevent loop'}
+
+            # If calendar_synced_at was just updated, this is also a sync operation
+            if old_synced_at != new_synced_at and new_synced_at:
+                logger.info(f"Skipping webhook for appointment {appointment_id} - sync operation detected (calendar_synced_at updated)")
                 return {'success': True, 'note': 'Sync operation - skipping to prevent loop'}
 
         # Only process scheduled/confirmed appointments

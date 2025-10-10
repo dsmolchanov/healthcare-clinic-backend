@@ -820,6 +820,46 @@ class ExternalCalendarService:
             logger.error(f"Failed to get external events: {e}")
             return []
 
+    async def _find_existing_event_by_appointment_id(
+        self,
+        service,
+        calendar_id: str,
+        appointment_id: str,
+        start_datetime: datetime,
+        end_datetime: datetime
+    ) -> Optional[str]:
+        """
+        Search Google Calendar for an existing event by appointment_id in extendedProperties
+        Returns google_event_id if found, None otherwise
+        """
+        try:
+            # Search for events around the appointment time (±7 days)
+            time_min = (start_datetime - timedelta(days=7)).isoformat()
+            time_max = (end_datetime + timedelta(days=7)).isoformat()
+
+            events_result = service.events().list(
+                calendarId=calendar_id,
+                timeMin=time_min,
+                timeMax=time_max,
+                privateExtendedProperty=f'appointment_id={appointment_id}',
+                singleEvents=True,
+                maxResults=10
+            ).execute()
+
+            events = events_result.get('items', [])
+
+            if events:
+                # Found existing event with matching appointment_id
+                existing_event_id = events[0]['id']
+                logger.info(f"Found existing event {existing_event_id} for appointment {appointment_id}")
+                return existing_event_id
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"Error searching for existing event: {e}")
+            return None
+
     async def create_calendar_event(self, appointment_data: Dict) -> Dict[str, Any]:
         """
         Create a calendar event directly (not through hold flow)
@@ -828,6 +868,7 @@ class ExternalCalendarService:
         try:
             doctor_id = appointment_data.get('doctor_id')
             clinic_id = appointment_data.get('clinic_id')
+            appointment_id = appointment_data.get('id')
 
             logger.info(f"Looking for calendar integration for clinic {clinic_id}")
 
@@ -960,6 +1001,21 @@ class ExternalCalendarService:
                 doctor_id=doctor_id,
                 organization_id=calendar_integration.get('organization_id')
             )
+
+            # Check if an event already exists for this appointment (prevents duplicates)
+            existing_event_id = await self._find_existing_event_by_appointment_id(
+                service=service,
+                calendar_id=target_calendar_id,
+                appointment_id=str(appointment_id),
+                start_datetime=start_datetime,
+                end_datetime=end_datetime
+            )
+
+            if existing_event_id:
+                # Event already exists, update it instead of creating duplicate
+                logger.info(f"Event already exists for appointment {appointment_id}, updating instead of creating")
+                appointment_data['google_event_id'] = existing_event_id
+                return await self.update_calendar_event(appointment_data)
 
             # Insert event into doctor's calendar
             created_event = service.events().insert(
@@ -1140,30 +1196,41 @@ class ExternalCalendarService:
                 organization_id=calendar_integration.get('organization_id')
             )
 
-            # Update the event
-            updated_event = service.events().update(
-                calendarId=target_calendar_id,
-                eventId=google_event_id,
-                body=event_update
-            ).execute()
+            # Try to update the event, handle 404 if event was deleted
+            try:
+                updated_event = service.events().update(
+                    calendarId=target_calendar_id,
+                    eventId=google_event_id,
+                    body=event_update
+                ).execute()
 
-            # Log the operation
-            await self._log_calendar_operation(
-                doctor_id, 'google', 'update_event',
-                external_event_id=updated_event['id'],
-                internal_event_id=appointment_data.get('id'),
-                status='success',
-                request_data=event_update
-            )
+                # Log the operation
+                await self._log_calendar_operation(
+                    doctor_id, 'google', 'update_event',
+                    external_event_id=updated_event['id'],
+                    internal_event_id=appointment_data.get('id'),
+                    status='success',
+                    request_data=event_update
+                )
 
-            logger.info(f"Updated Google Calendar event {updated_event['id']} for appointment {appointment_data.get('id')}")
+                logger.info(f"Updated Google Calendar event {updated_event['id']} for appointment {appointment_data.get('id')}")
 
-            return {
-                'success': True,
-                'google_event_id': updated_event['id'],
-                'event_link': updated_event.get('htmlLink'),
-                'event_html_link': updated_event.get('htmlLink')
-            }
+                return {
+                    'success': True,
+                    'google_event_id': updated_event['id'],
+                    'event_link': updated_event.get('htmlLink'),
+                    'event_html_link': updated_event.get('htmlLink')
+                }
+
+            except Exception as update_error:
+                # Check if event was deleted (404 error)
+                if '404' in str(update_error) or 'Not Found' in str(update_error):
+                    logger.warning(f"Event {google_event_id} not found, creating new event instead")
+                    # Clear google_event_id and create new event
+                    appointment_data['google_event_id'] = None
+                    return await self.create_calendar_event(appointment_data)
+                else:
+                    raise update_error
 
         except Exception as e:
             logger.error(f"Failed to update Google Calendar event: {e}", exc_info=True)
