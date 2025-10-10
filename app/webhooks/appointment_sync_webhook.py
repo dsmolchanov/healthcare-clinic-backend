@@ -21,39 +21,27 @@ async def sync_appointment_to_calendar(appointment_id: str, operation: str):
         
         supabase = get_supabase_client()
         service = ExternalCalendarService()
-        
-        # Get appointment details with patient and doctor info
-        appointment = supabase.from_('appointments').select(
-            '*, patients(first_name, last_name, phone), doctors(first_name, last_name)'
-        ).eq('id', appointment_id).single().execute()
-        
-        if not appointment.data:
+
+        # Get appointment details using RPC (includes patient and doctor names)
+        appointment = supabase.rpc('get_appointment_for_sync', {
+            'p_appointment_id': appointment_id
+        }).execute()
+
+        if not appointment.data or len(appointment.data) == 0:
             logger.warning(f"Appointment {appointment_id} not found")
             return
-        
-        appt = appointment.data
+
+        appt = appointment.data[0]
 
         # Skip if no doctor assigned
         if not appt.get('doctor_id'):
             logger.info(f"No doctor assigned to appointment {appointment_id}, skipping sync")
             return
 
-        # Extract patient name from joined data
-        patient_data = appt.get('patients')
-        if patient_data:
-            patient_name = f"{patient_data.get('first_name', '')} {patient_data.get('last_name', '')}".strip()
-            patient_phone = patient_data.get('phone')
-        else:
-            patient_name = appt.get('patient_name', 'Unknown Patient')
-            patient_phone = appt.get('patient_phone')
-
-        # Extract doctor name from joined data
-        doctor_data = appt.get('doctors')
-        if doctor_data:
-            doctor_name = f"{doctor_data.get('first_name', '')} {doctor_data.get('last_name', '')}".strip()
-        else:
-            logger.warning(f"Doctor not found for appointment {appointment_id}")
-            doctor_name = 'Doctor'
+        # RPC already returns patient_name, patient_phone, and doctor_name
+        patient_name = appt.get('patient_name', 'Unknown Patient')
+        patient_phone = appt.get('patient_phone')
+        doctor_name = appt.get('doctor_name', 'Doctor')
 
         # Handle DELETE/CANCEL operations
         if operation == 'DELETE' or appt.get('status') == 'cancelled':

@@ -1182,43 +1182,16 @@ class ExternalCalendarService:
         This is the main entry point for syncing appointments
         """
         try:
-            # Get appointment data with joined patient and doctor info
-            # First try with healthcare schema
-            try:
-                appointment_result = self.supabase.schema('healthcare').table('appointments').select(
-                    '*, patients(first_name, last_name, phone), doctors(first_name, last_name)'
-                ).eq('id', appointment_id).execute()
-            except:
-                # Fallback to default schema if healthcare schema access fails
-                appointment_result = self.supabase.table('appointments').select(
-                    '*, patients(first_name, last_name, phone), doctors(first_name, last_name)'
-                ).eq('id', appointment_id).execute()
+            # Get appointment data using RPC (includes patient and doctor names)
+            appointment_result = self.supabase.rpc('get_appointment_for_sync', {
+                'p_appointment_id': appointment_id
+            }).execute()
 
-            if not appointment_result.data:
+            if not appointment_result.data or len(appointment_result.data) == 0:
                 return {'success': False, 'error': 'Appointment not found'}
 
             appointment = appointment_result.data[0]
-
-            # Extract patient name from joined data
-            patient_data = appointment.get('patients')
-            if patient_data:
-                patient_name = f"{patient_data.get('first_name', '')} {patient_data.get('last_name', '')}".strip()
-                patient_phone = patient_data.get('phone')
-            else:
-                patient_name = appointment.get('patient_name', 'Unknown Patient')
-                patient_phone = appointment.get('patient_phone')
-
-            # Extract doctor name from joined data
-            doctor_data = appointment.get('doctors')
-            if doctor_data:
-                doctor_name = f"{doctor_data.get('first_name', '')} {doctor_data.get('last_name', '')}".strip()
-            else:
-                doctor_name = 'Doctor'
-
-            # Add extracted names to appointment dict
-            appointment['patient_name'] = patient_name
-            appointment['patient_phone'] = patient_phone
-            appointment['doctor_name'] = doctor_name
+            # RPC already returns patient_name, patient_phone, and doctor_name
 
             # Check if appointment already has a google_event_id
             if appointment.get('google_event_id'):
