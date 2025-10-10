@@ -46,7 +46,9 @@ WORKDIR /app
 COPY app/ ./app/
 COPY main.py .
 COPY run_worker.py .
+COPY test_queue_remote.py .
 # Copy .env file if it exists (for development/staging)
+COPY .env* ./
 
 # Expose port (Fly.io uses 8080 by default)
 EXPOSE 8080

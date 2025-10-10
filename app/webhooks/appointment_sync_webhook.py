@@ -62,12 +62,12 @@ async def sync_appointment_to_calendar(appointment_id: str, operation: str):
         if appointment_type:
             try:
                 # Try to find matching service by name
-                service = supabase.from_('services').select(
+                service_query = supabase.from_('services').select(
                     'duration_minutes'
                 ).eq('clinic_id', appt['clinic_id']).eq('name', appointment_type).execute()
 
-                if service.data and len(service.data) > 0:
-                    duration_minutes = service.data[0].get('duration_minutes', 30)
+                if service_query.data and len(service_query.data) > 0:
+                    duration_minutes = service_query.data[0].get('duration_minutes', 30)
                     logger.info(f"Using service duration: {duration_minutes} minutes for {appointment_type}")
                 else:
                     logger.info(f"No service found for '{appointment_type}', using default 30 minutes")
