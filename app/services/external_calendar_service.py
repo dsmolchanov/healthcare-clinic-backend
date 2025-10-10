@@ -1051,6 +1051,40 @@ class ExternalCalendarService:
             )
             return {'success': False, 'error': str(e)}
 
+    async def _delete_calendar_event(
+        self,
+        service,
+        calendar_id: str,
+        event_id: str,
+        doctor_id: str
+    ) -> bool:
+        """Delete a calendar event"""
+        try:
+            service.events().delete(
+                calendarId=calendar_id,
+                eventId=event_id
+            ).execute()
+
+            logger.info(f"Deleted Google Calendar event {event_id} from calendar {calendar_id}")
+
+            await self._log_calendar_operation(
+                doctor_id, 'google', 'delete_event',
+                external_event_id=event_id,
+                status='success'
+            )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to delete calendar event {event_id}: {e}")
+            await self._log_calendar_operation(
+                doctor_id, 'google', 'delete_event',
+                external_event_id=event_id,
+                status='failed',
+                error_message=str(e)
+            )
+            return False
+
     async def update_calendar_event(self, appointment_data: Dict) -> Dict[str, Any]:
         """
         Update an existing calendar event
@@ -1105,6 +1139,121 @@ class ExternalCalendarService:
             # Create Google Calendar service
             credentials = Credentials.from_authorized_user_info(calendar_credentials)
             service = build('calendar', 'v3', credentials=credentials)
+
+            # Check if doctor has changed - if so, delete old event and create new one
+            try:
+                # Get the existing event to check which calendar/doctor it belongs to
+                # We need to search across all potential calendars since we don't know which one
+                existing_event = None
+                old_calendar_id = None
+
+                # First, try to get from new doctor's calendar
+                new_target_calendar_id = await self._get_doctor_calendar(
+                    doctor_id=doctor_id,
+                    organization_id=calendar_integration.get('organization_id')
+                )
+
+                try:
+                    existing_event = service.events().get(
+                        calendarId=new_target_calendar_id,
+                        eventId=google_event_id
+                    ).execute()
+                    old_calendar_id = new_target_calendar_id
+                except:
+                    # Event not on new doctor's calendar, search other calendars
+                    # Get all doctors for this organization
+                    doctors_result = self.supabase.schema('healthcare').table('doctors').select(
+                        'id'
+                    ).eq('clinic_id', clinic_id).execute()
+
+                    for doc in doctors_result.data:
+                        other_doctor_id = doc['id']
+                        if other_doctor_id == doctor_id:
+                            continue  # Already tried this one
+
+                        other_calendar_id = await self._get_doctor_calendar(
+                            doctor_id=other_doctor_id,
+                            organization_id=calendar_integration.get('organization_id')
+                        )
+
+                        try:
+                            existing_event = service.events().get(
+                                calendarId=other_calendar_id,
+                                eventId=google_event_id
+                            ).execute()
+                            old_calendar_id = other_calendar_id
+                            logger.info(f"Found event on different doctor's calendar: {other_calendar_id}")
+                            break
+                        except:
+                            continue
+
+                # Check if we found the event and if doctor changed
+                if existing_event and old_calendar_id:
+                    old_doctor_id = existing_event.get('extendedProperties', {}).get('private', {}).get('doctor_id')
+
+                    if old_doctor_id and old_doctor_id != str(doctor_id):
+                        logger.info(f"Doctor changed from {old_doctor_id} to {doctor_id}, deleting old event and creating new")
+
+                        # Delete old event
+                        await self._delete_calendar_event(
+                            service=service,
+                            calendar_id=old_calendar_id,
+                            event_id=google_event_id,
+                            doctor_id=old_doctor_id
+                        )
+
+                        # Create new event on new doctor's calendar
+                        appointment_data['google_event_id'] = None  # Clear to force create
+                        result = await self.create_calendar_event(appointment_data)
+
+                        # Update the database to clear the old event ID and set the new one
+                        if result.get('success') and result.get('google_event_id'):
+                            try:
+                                self.supabase.schema('healthcare').table('appointments').update({
+                                    'google_event_id': result['google_event_id'],
+                                    'calendar_synced_at': datetime.utcnow().isoformat()
+                                }).eq('id', appointment_data.get('id')).execute()
+                            except:
+                                # Fallback to default schema
+                                self.supabase.table('appointments').update({
+                                    'google_event_id': result['google_event_id'],
+                                    'calendar_synced_at': datetime.utcnow().isoformat()
+                                }).eq('id', appointment_data.get('id')).execute()
+
+                        return result
+
+                    if old_calendar_id != new_target_calendar_id:
+                        # Event is on different calendar but doctor_id matches in metadata
+                        # This shouldn't happen but handle it: delete and recreate
+                        logger.warning(f"Event on wrong calendar, deleting and recreating")
+
+                        await self._delete_calendar_event(
+                            service=service,
+                            calendar_id=old_calendar_id,
+                            event_id=google_event_id,
+                            doctor_id=str(doctor_id)
+                        )
+
+                        appointment_data['google_event_id'] = None
+                        result = await self.create_calendar_event(appointment_data)
+
+                        # Update database with new event ID
+                        if result.get('success') and result.get('google_event_id'):
+                            try:
+                                self.supabase.schema('healthcare').table('appointments').update({
+                                    'google_event_id': result['google_event_id'],
+                                    'calendar_synced_at': datetime.utcnow().isoformat()
+                                }).eq('id', appointment_data.get('id')).execute()
+                            except:
+                                self.supabase.table('appointments').update({
+                                    'google_event_id': result['google_event_id'],
+                                    'calendar_synced_at': datetime.utcnow().isoformat()
+                                }).eq('id', appointment_data.get('id')).execute()
+
+                        return result
+
+            except Exception as check_error:
+                logger.warning(f"Error checking for doctor change: {check_error}, proceeding with update")
 
             # Prepare appointment times with Cancun timezone
             from dateutil import parser, tz
