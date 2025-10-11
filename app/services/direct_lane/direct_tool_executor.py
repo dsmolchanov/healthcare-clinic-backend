@@ -88,24 +88,30 @@ class DirectToolExecutor:
                 timeout=self.max_duration_ms / 1000  # Convert to seconds
             )
 
-            # Record success in circuit breaker
-            self.circuit_breaker.record_success(tool_match.intent.value)
-
             # Add metadata
-            latency_ms = int((time.time() - start_time) * 1000)
+            latency_ms = max(1, int((time.time() - start_time) * 1000))
             result["latency_ms"] = latency_ms
             result["tool_used"] = tool_match.intent.value
             result["routing_path"] = "direct_function_call"
-            result["fallback_triggered"] = False
+            if result.get("success"):
+                self.circuit_breaker.record_success(tool_match.intent.value)
+                result["fallback_triggered"] = False
 
-            # Warn if approaching budget
-            if latency_ms > self.max_duration_ms * 0.8:
+                # Warn if approaching budget
+                if latency_ms > self.max_duration_ms * 0.8:
+                    logger.warning(
+                        f"Direct lane approaching budget: {latency_ms}ms "
+                        f"(threshold: {self.max_duration_ms}ms)"
+                    )
+
+                logger.info(f"Direct tool execution: {tool_match.intent.value} in {latency_ms}ms")
+            else:
+                self.circuit_breaker.record_failure(tool_match.intent.value)
+                result["fallback_triggered"] = result.get("fallback_triggered", True)
                 logger.warning(
-                    f"Direct lane approaching budget: {latency_ms}ms "
-                    f"(threshold: {self.max_duration_ms}ms)"
+                    f"Direct tool execution failed for {tool_match.intent.value}: "
+                    f"{result.get('error', 'unknown error')}"
                 )
-
-            logger.info(f"Direct tool execution: {tool_match.intent.value} in {latency_ms}ms")
 
             return result
 
