@@ -19,15 +19,15 @@ logger = logging.getLogger(__name__)
 
 # Database connection pool
 _db_pool = None
-_supabase_client = None
+_supabase_clients: Dict[str, Client] = {}
 
 
-def create_supabase_client() -> Client:
+def create_supabase_client(schema: str = 'healthcare') -> Client:
     """Create a new Supabase client (sync version for compatibility)"""
-    global _supabase_client
+    global _supabase_clients
 
-    if _supabase_client is not None:
-        return _supabase_client
+    if schema in _supabase_clients:
+        return _supabase_clients[schema]
 
     # Get credentials
     supabase_url = os.getenv("SUPABASE_URL")
@@ -41,27 +41,29 @@ def create_supabase_client() -> Client:
 
         # Configure client to use healthcare schema
         options = ClientOptions(
-            schema='healthcare',
+            schema=schema,
             auto_refresh_token=True,
             persist_session=False
         )
 
-        _supabase_client = create_client(supabase_url, supabase_key, options=options)
-        logger.info(f"Connected to Supabase: {supabase_url} (using healthcare schema)")
+        client = create_client(supabase_url, supabase_key, options=options)
+        _supabase_clients[schema] = client
+        logger.info(f"Connected to Supabase: {supabase_url} (using {schema} schema)")
     except ImportError:
         # Fallback to regular client without options
-        _supabase_client = create_client(supabase_url, supabase_key)
+        client = create_client(supabase_url, supabase_key)
+        _supabase_clients[schema] = client
         logger.info(f"Connected to Supabase: {supabase_url} (using default schema)")
 
-    return _supabase_client
+    return _supabase_clients[schema]
 
 
-async def get_supabase() -> Client:
+async def get_supabase(schema: str = 'healthcare') -> Client:
     """Get or create Supabase client"""
-    global _supabase_client
+    global _supabase_clients
 
-    if _supabase_client is not None:
-        return _supabase_client
+    if schema in _supabase_clients:
+        return _supabase_clients[schema]
     
     # Get credentials
     supabase_url = os.getenv("SUPABASE_URL")
@@ -75,19 +77,20 @@ async def get_supabase() -> Client:
         
         # Configure client to use healthcare schema
         options = ClientOptions(
-            schema='healthcare',
+            schema=schema,
             auto_refresh_token=True,
             persist_session=False
         )
         
-        _supabase_client = create_client(supabase_url, supabase_key, options=options)
-        logger.info(f"Connected to Supabase: {supabase_url} (using healthcare schema)")
+        client = create_client(supabase_url, supabase_key, options=options)
+        _supabase_clients[schema] = client
+        logger.info(f"Connected to Supabase: {supabase_url} (using {schema} schema)")
         
     except Exception as e:
         logger.error(f"Failed to create Supabase client: {e}")
         raise
     
-    return _supabase_client
+    return _supabase_clients[schema]
 
 async def init_db_pool():
     """Initialize database connection pool"""

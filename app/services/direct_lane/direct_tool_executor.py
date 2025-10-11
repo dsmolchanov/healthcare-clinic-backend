@@ -10,6 +10,7 @@ import uuid
 
 from app.services.direct_lane.tool_intent_classifier import DirectToolIntent, ToolIntentMatch
 from app.services.direct_lane.circuit_breaker import CircuitBreaker
+from postgrest.exceptions import APIError
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +30,10 @@ class DirectToolExecutor:
     - Automatic fallback to LangGraph on timeout or circuit open
     """
 
-    def __init__(self, clinic_id: str, supabase_client):
+    def __init__(self, clinic_id: str, supabase_client, api_supabase_client=None):
         self.clinic_id = clinic_id
         self.supabase = supabase_client
+        self.api_supabase = api_supabase_client or supabase_client
 
         # Initialize circuit breaker (5 failures → open for 60s)
         self.circuit_breaker = CircuitBreaker(
@@ -418,18 +420,33 @@ class DirectToolExecutor:
                     # This is a simple heuristic - could be enhanced with LLM
                     break
 
+        used_legacy_rpc = False
+
         try:
             # Use resilient search RPC for multilingual support
-            response = self.supabase.rpc(
-                'search_services_resilient',
-                {
-                    'p_clinic_id': self.clinic_id,
-                    'p_query': query,
-                    'p_limit': 5,
-                    'p_min_score': 0.01,
-                    'p_session_id': context.get('session_id', str(uuid.uuid4())) if context else str(uuid.uuid4())
-                }
-            ).execute()
+            rpc_payload = {
+                'p_clinic_id': self.clinic_id,
+                'p_query': query,
+                'p_limit': 5,
+                'p_min_score': 0.01,
+                'p_session_id': context.get('session_id', str(uuid.uuid4())) if context else str(uuid.uuid4())
+            }
+
+            try:
+                response = self.api_supabase.rpc(
+                    'search_services_v1',
+                    rpc_payload
+                ).execute()
+            except APIError as api_err:
+                used_legacy_rpc = True
+                logger.warning(
+                    "Primary price search RPC failed (%s). Falling back to legacy resilient search.",
+                    getattr(api_err, 'message', api_err)
+                )
+                response = self.supabase.rpc(
+                    'search_services_resilient',
+                    rpc_payload
+                ).execute()
 
             if not response.data:
                 memory_hint = ""
@@ -438,7 +455,14 @@ class DirectToolExecutor:
 
                 return {
                     "success": True,
-                    "response": f"No services found matching '{query}'.{memory_hint} Please try a different search term."
+                    "response": f"No services found matching '{query}'.{memory_hint} Please try a different search term.",
+                    "metadata": {
+                        "services_found": 0,
+                        "query": query,
+                        "search_stage": "none",
+                        "used_memories": len(memories) if memories else 0,
+                        "legacy_rpc_fallback": used_legacy_rpc
+                    }
                 }
 
             # Format response
@@ -464,7 +488,8 @@ class DirectToolExecutor:
                     "services_found": len(response.data),
                     "query": query,
                     "search_stage": response.data[0].get('search_stage', 'unknown') if response.data else 'none',
-                    "used_memories": len(memories) if memories else 0
+                    "used_memories": len(memories) if memories else 0,
+                    "legacy_rpc_fallback": used_legacy_rpc
                 }
             }
 

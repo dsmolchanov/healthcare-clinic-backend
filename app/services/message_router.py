@@ -415,6 +415,7 @@ class MessageRouter:
                 # Get supabase client
                 try:
                     supabase_client = await get_supabase()
+                    supabase_api_client = await get_supabase(schema='api')
                     clinic_id = metadata.get("clinic_id")
 
                     if not clinic_id:
@@ -423,7 +424,8 @@ class MessageRouter:
                         # Execute tool directly
                         executor = DirectToolExecutor(
                             clinic_id=clinic_id,
-                            supabase_client=supabase_client
+                            supabase_client=supabase_client,
+                            api_supabase_client=supabase_api_client
                         )
 
                         result = await executor.execute_tool(tool_match, context=metadata)

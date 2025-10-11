@@ -22,6 +22,8 @@ import uuid
 import time
 from typing import Optional, List, Dict, Any
 from supabase import create_client, Client
+from supabase.client import ClientOptions
+from postgrest.exceptions import APIError
 from app.utils.text_normalization import (
     normalize_query,
     expand_synonyms,
@@ -56,7 +58,19 @@ class PriceQueryTool:
         if not supabase_url or not supabase_key:
             raise ValueError("Supabase credentials not configured")
 
-        self.client: Client = create_client(supabase_url, supabase_key)
+        api_options = ClientOptions(
+            schema='api',
+            auto_refresh_token=True,
+            persist_session=False
+        )
+        healthcare_options = ClientOptions(
+            schema='healthcare',
+            auto_refresh_token=True,
+            persist_session=False
+        )
+
+        self.api_client: Client = create_client(supabase_url, supabase_key, options=api_options)
+        self.healthcare_client: Client = create_client(supabase_url, supabase_key, options=healthcare_options)
 
         # Initialize cache manager if Redis available
         self.cache = None
@@ -80,7 +94,7 @@ class PriceQueryTool:
 
         try:
             # Get all services from cache
-            services = await self.cache.get_services(self.clinic_id, self.client)
+            services = await self.cache.get_services(self.clinic_id, self.healthcare_client)
             if not services:
                 return None
 
@@ -206,37 +220,46 @@ class PriceQueryTool:
                     logger.warning(f"⏱️ Search budget exceeded ({elapsed_ms:.0f}ms), stopping synonym expansion")
                     break
 
+                payload = {
+                    'p_clinic_id': self.clinic_id,
+                    'p_query': synonym,
+                    'p_limit': limit,
+                    'p_min_score': 0.01,
+                    'p_session_id': session_id
+                }
+
                 try:
-                    # Call multilingual search RPC
-                    response = self.client.rpc(
-                        'search_services_multilingual',
-                        {
-                            'p_clinic_id': self.clinic_id,
-                            'p_query': synonym,
-                            'p_limit': limit,
-                            'p_min_score': 0.01,
-                            'p_session_id': session_id
-                        }
+                    response = self.api_client.rpc(
+                        'search_services_v1',
+                        payload
                     ).execute()
-
-                    if response.data:
-                        for service in response.data:
-                            # De-duplicate by service ID
-                            if service["id"] not in all_results:
-                                all_results[service["id"]] = service
-
-                        logger.info(
-                            f"✅ Found {len(response.data)} results for synonym '{synonym}' "
-                            f"(stage: {response.data[0].get('search_stage', 'unknown')})"
-                        )
-                        # Stop after first successful match
-                        break
-                    else:
-                        logger.debug(f"❌ No results for synonym '{synonym}'")
-
+                except APIError as api_err:
+                    logger.warning(
+                        "Primary service search RPC failed for synonym '%s': %s. Falling back to legacy search.",
+                        synonym,
+                        getattr(api_err, 'message', api_err)
+                    )
+                    response = self.healthcare_client.rpc(
+                        'search_services_resilient',
+                        payload
+                    ).execute()
                 except Exception as syn_err:
                     logger.warning(f"Synonym search failed for '{synonym}': {syn_err}")
                     continue
+
+                if response.data:
+                    for service in response.data:
+                        if service["id"] not in all_results:
+                            all_results[service["id"]] = service
+
+                    logger.info(
+                        f"✅ Found {len(response.data)} results for synonym '{synonym}' "
+                        f"(stage: {response.data[0].get('search_stage', 'unknown')})"
+                    )
+                    # Stop after first successful match
+                    break
+                else:
+                    logger.debug(f"❌ No results for synonym '{synonym}'")
 
             # Convert to list and apply category filter
             services = []
@@ -281,7 +304,7 @@ class PriceQueryTool:
         """
         try:
             query_builder = (
-                self.client.schema('healthcare').table("services")
+                self.healthcare_client.table("services")
                 .select("id, name, description, base_price, category, duration_minutes, currency, code")
                 .eq("clinic_id", self.clinic_id)
                 .eq("is_active", True)
@@ -329,7 +352,7 @@ class PriceQueryTool:
         """
         try:
             query_builder = (
-                self.client.schema('healthcare').table("services")
+                self.healthcare_client.table("services")
                 .select("id, name, description, base_price, category, duration_minutes, currency, code")
                 .eq("clinic_id", self.clinic_id)
                 .eq("is_active", True)
@@ -348,7 +371,7 @@ class PriceQueryTool:
             # If no results with name search, try description
             if not response.data and query:
                 query_builder = (
-                    self.client.schema('healthcare').table("services")
+                    self.healthcare_client.table("services")
                     .select("id, name, description, base_price, category, duration_minutes, currency, code")
                     .eq("clinic_id", self.clinic_id)
                     .eq("is_active", True)
@@ -392,7 +415,7 @@ class PriceQueryTool:
         """
         try:
             response = (
-                self.client.schema('healthcare').table("services")
+                self.healthcare_client.table("services")
                 .select("category")
                 .eq("clinic_id", self.clinic_id)
                 .eq("active", True)
@@ -424,7 +447,7 @@ class PriceQueryTool:
         """
         try:
             response = (
-                self.client.schema('healthcare').table("services")
+                self.healthcare_client.table("services")
                 .select("id, name, description, base_price, category, duration_minutes, currency, code")
                 .eq("clinic_id", self.clinic_id)
                 .eq("active", True)
