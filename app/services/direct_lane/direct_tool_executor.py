@@ -446,11 +446,11 @@ class DirectToolExecutor:
             except APIError as api_err:
                 used_legacy_rpc = True
                 logger.warning(
-                    "Primary price search RPC failed (%s). Falling back to legacy resilient search.",
+                    "Primary price search RPC failed (%s). Falling back to legacy multilingual search.",
                     getattr(api_err, 'message', api_err)
                 )
                 response = self.supabase.rpc(
-                    'search_services_resilient',
+                    'search_services_multilingual',
                     rpc_payload
                 ).execute()
 

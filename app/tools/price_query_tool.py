@@ -59,7 +59,7 @@ class PriceQueryTool:
             raise ValueError("Supabase credentials not configured")
 
         api_options = ClientOptions(
-            schema='api',
+            schema='public',
             auto_refresh_token=True,
             persist_session=False
         )
@@ -235,12 +235,12 @@ class PriceQueryTool:
                     ).execute()
                 except APIError as api_err:
                     logger.warning(
-                        "Primary service search RPC failed for synonym '%s': %s. Falling back to legacy search.",
+                        "Primary service search RPC failed for synonym '%s': %s. Falling back to legacy multilingual search.",
                         synonym,
                         getattr(api_err, 'message', api_err)
                     )
                     response = self.healthcare_client.rpc(
-                        'search_services_resilient',
+                        'search_services_multilingual',
                         payload
                     ).execute()
                 except Exception as syn_err:

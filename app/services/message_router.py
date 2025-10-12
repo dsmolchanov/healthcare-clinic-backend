@@ -415,7 +415,7 @@ class MessageRouter:
                 # Get supabase client
                 try:
                     supabase_client = await get_supabase()
-                    supabase_api_client = await get_supabase(schema='api')
+                    supabase_api_client = await get_supabase(schema='public')
                     clinic_id = metadata.get("clinic_id")
 
                     if not clinic_id:
