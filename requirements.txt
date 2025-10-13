@@ -40,6 +40,9 @@ google-api-python-client==2.150.0
 google-auth==2.40.0
 google-auth-oauthlib==1.2.1
 google-auth-httplib2==0.2.0
+# Microsoft Graph SDK for Outlook Calendar
+msgraph-sdk==1.15.0
+azure-identity==1.19.0
 psutil==5.9.6
 apscheduler==3.10.4
 boto3==1.34.0

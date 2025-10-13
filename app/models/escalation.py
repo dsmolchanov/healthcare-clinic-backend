@@ -5,7 +5,7 @@ These models define the schema for API requests and responses
 related to the escalation system.
 """
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from uuid import UUID
@@ -33,7 +33,8 @@ class DateRange(BaseModel):
     start_date: str = Field(..., description="ISO 8601 date string (YYYY-MM-DD or full datetime)")
     end_date: str = Field(..., description="ISO 8601 date string (YYYY-MM-DD or full datetime)")
 
-    @validator('start_date', 'end_date')
+    @field_validator('start_date', 'end_date')
+    @classmethod
     def validate_date_format(cls, v):
         """Validate that date strings can be parsed."""
         try:
@@ -49,7 +50,8 @@ class HardConstraints(BaseModel):
     room_id: Optional[UUID] = Field(None, description="Required room UUID")
     time_of_day: Optional[str] = Field(None, description="Preferred time of day: 'morning', 'afternoon', 'evening'")
 
-    @validator('time_of_day')
+    @field_validator('time_of_day')
+    @classmethod
     def validate_time_of_day(cls, v):
         """Validate time_of_day is a valid option."""
         if v is not None and v not in ['morning', 'afternoon', 'evening']:
@@ -68,8 +70,8 @@ class EscalationRequestData(BaseModel):
     date_range: DateRange = Field(..., description="Desired date range for appointment")
     hard_constraints: Optional[HardConstraints] = Field(None, description="Hard constraints that must be satisfied")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "service_id": "123e4567-e89b-12d3-a456-426614174000",
                 "patient_id": "123e4567-e89b-12d3-a456-426614174001",
@@ -83,6 +85,7 @@ class EscalationRequestData(BaseModel):
                 }
             }
         }
+    )
 
 
 class EscalationSuggestion(BaseModel):
@@ -91,8 +94,8 @@ class EscalationSuggestion(BaseModel):
     request: Dict[str, Any] = Field(..., description="Modified request with relaxed constraints")
     description: str = Field(..., description="User-friendly explanation of the suggestion")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "strategy": "expanded_date_range_3d",
                 "request": {
@@ -106,6 +109,7 @@ class EscalationSuggestion(BaseModel):
                 "description": "Try dates 3 days later than your preferred range"
             }
         }
+    )
 
 
 class EscalationCreate(BaseModel):
@@ -126,7 +130,8 @@ class ManualSlot(BaseModel):
     doctor_id: UUID = Field(..., description="UUID of the doctor")
     room_id: Optional[UUID] = Field(None, description="Optional room UUID")
 
-    @validator('start_time', 'end_time')
+    @field_validator('start_time', 'end_time')
+    @classmethod
     def validate_datetime_format(cls, v):
         """Validate that datetime strings can be parsed."""
         try:
@@ -150,8 +155,8 @@ class EscalationResolution(BaseModel):
     note: Optional[str] = Field(None, description="Optional resolution notes")
     resolved_by: UUID = Field(..., description="UUID of staff member resolving the escalation")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example_suggestion": {
                 "selected_suggestion_index": 0,
                 "note": "Patient agreed to morning time",
@@ -167,6 +172,7 @@ class EscalationResolution(BaseModel):
                 "resolved_by": "123e4567-e89b-12d3-a456-426614174003"
             }
         }
+    )
 
 
 class EscalationAssignment(BaseModel):
@@ -194,9 +200,9 @@ class EscalationResponse(BaseModel):
     resolved_at: Optional[datetime] = Field(None, description="When escalation was resolved")
     resolution_note: Optional[str] = Field(None, description="Resolution notes")
 
-    class Config:
-        from_attributes = True
-        json_schema_extra = {
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
             "example": {
                 "id": "123e4567-e89b-12d3-a456-426614174010",
                 "clinic_id": "123e4567-e89b-12d3-a456-426614174011",
@@ -221,6 +227,7 @@ class EscalationResponse(BaseModel):
                 "created_at": "2025-10-10T12:00:00"
             }
         }
+    )
 
 
 class AppointmentResponse(BaseModel):
@@ -235,5 +242,4 @@ class AppointmentResponse(BaseModel):
     created_at: datetime = Field(..., description="When appointment was created")
     note: Optional[str] = Field(None, description="Additional notes")
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

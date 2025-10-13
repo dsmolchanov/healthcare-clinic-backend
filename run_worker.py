@@ -69,7 +69,7 @@ async def main():
         if not instance_name:
             logger.info("No INSTANCE_NAME set, attempting auto-detection from database...")
             try:
-                from app.database import get_supabase_client
+                from app.db.supabase_client import get_supabase_client
                 supabase = get_supabase_client()
 
                 # Get the most recent active Evolution instance
