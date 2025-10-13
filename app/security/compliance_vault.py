@@ -383,12 +383,12 @@ class ComplianceVault:
             'organization_id': organization_id,
             'event_type': f'secret_{action}',
             'event_category': 'security_event',
-            'actor_type': 'user' if user_id else 'system',
             'event_data': {
                 'secret_type': secret_type,
                 'action': action,
                 'timestamp': datetime.utcnow().isoformat(),
-                'user_id': user_id  # Store in event_data instead
+                'user_id': user_id,
+                'actor_type': 'user' if user_id else 'system'  # Move to event_data
             },
             'resource_type': 'secret',
             'resource_id': secret_type,

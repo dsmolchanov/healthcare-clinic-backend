@@ -126,9 +126,9 @@ class ExternalCalendarService:
                 if expires_at < (datetime.utcnow() + buffer_time):
                     logger.info(f"Token expired or expiring soon for clinic {clinic_id}, refreshing...")
 
-                    # Import OAuthManager to refresh token
-                    from app.calendar.oauth_manager import OAuthManager
-                    oauth = OAuthManager()
+                    # Import CalendarOAuthManager to refresh token
+                    from app.calendar.oauth_manager import CalendarOAuthManager
+                    oauth = CalendarOAuthManager()
 
                     # Refresh the token
                     if provider == 'google':
