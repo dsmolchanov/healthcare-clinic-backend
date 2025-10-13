@@ -393,11 +393,72 @@ class RuleEvaluator:
             has_buffer = await self._check_buffer_time(
                 slot.doctor_id, slot.start_time, slot.end_time, buffer_minutes
             )
-            
+
             if not has_buffer:
                 return False, f"{rule.get('name')}: Insufficient buffer time ({buffer_minutes} min required)"
             return True, f"{rule.get('name')}: Adequate buffer time"
-        
+
+        elif rule_type == "room_type_match":
+            # Validate that room type matches service requirements
+            required_types = conditions.get("required_room_types", [])
+
+            # Get room's type
+            room_type = await self._get_room_type(slot.room_id)
+
+            if room_type not in required_types:
+                return False, f"{rule.get('name')}: Service requires room type: {required_types}, got {room_type}"
+            return True, f"{rule.get('name')}: Room type {room_type} matches requirements"
+
+        elif rule_type == "cleaning_buffer":
+            # Enforce cleaning time between appointments in same room
+            # Get room's cleaning duration
+            cleaning_minutes = await self._get_room_cleaning_duration(slot.room_id)
+            buffer_minutes = conditions.get("buffer_minutes", cleaning_minutes)
+
+            # Check if there's adequate buffer time in the ROOM (not just doctor)
+            has_buffer = await self._check_room_buffer_time(
+                slot.room_id, slot.start_time, slot.end_time, buffer_minutes
+            )
+
+            if not has_buffer:
+                return False, f"{rule.get('name')}: Room needs {buffer_minutes} min cleaning buffer"
+            return True, f"{rule.get('name')}: Adequate cleaning buffer in room"
+
+        elif rule_type == "doctor_room_preference":
+            # Score rooms higher if doctor prefers them
+            # Get doctor's preferred rooms from metadata or database
+            preferred_rooms = conditions.get("preferred_rooms", [])
+
+            if slot.room_id in preferred_rooms:
+                modifier = conditions.get("score_modifier", 10)
+                return True, f"{rule.get('name')}: Doctor's preferred room (+{modifier} points)"
+            else:
+                penalty = conditions.get("penalty", 5)
+                return False, f"{rule.get('name')}: Not doctor's preferred room (-{penalty} points)"
+
+        elif rule_type == "utilization_balancing":
+            # Prefer less-utilized rooms for load balancing
+            # Get room's appointment count for today
+            daily_count = await self._get_room_appointment_count(
+                slot.room_id, slot.start_time.date()
+            )
+
+            # Score based on utilization (fewer appointments = higher score)
+            max_daily = conditions.get("max_daily_appointments", 20)
+            utilization_ratio = daily_count / max_daily if max_daily > 0 else 0
+
+            if utilization_ratio < 0.5:
+                # Room is underutilized (< 50% capacity)
+                modifier = conditions.get("underutilized_bonus", 10)
+                return True, f"{rule.get('name')}: Room underutilized ({daily_count}/{max_daily}) (+{modifier} points)"
+            elif utilization_ratio > 0.8:
+                # Room is heavily utilized (> 80% capacity)
+                penalty = conditions.get("overutilized_penalty", 10)
+                return False, f"{rule.get('name')}: Room heavily utilized ({daily_count}/{max_daily}) (-{penalty} points)"
+            else:
+                # Normal utilization
+                return True, f"{rule.get('name')}: Room utilization normal ({daily_count}/{max_daily})"
+
         # Default: rule passes if type not recognized
         logger.warning(f"Unknown rule type: {rule_type}")
         return True, f"{rule.get('name')}: Rule type '{rule_type}' not implemented"
@@ -453,11 +514,11 @@ class RuleEvaluator:
                 .eq("appointment_date", start_time.date().isoformat())\
                 .eq("status", "confirmed")\
                 .execute()
-            
+
             for appointment in response.data:
                 apt_start = datetime.fromisoformat(appointment["start_time"])
                 apt_end = datetime.fromisoformat(appointment["end_time"])
-                
+
                 # Check if appointments are too close
                 if apt_end <= start_time:
                     # Appointment before this slot
@@ -469,12 +530,90 @@ class RuleEvaluator:
                     buffer = (apt_start - end_time).total_seconds() / 60
                     if buffer < buffer_minutes:
                         return False
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Error checking buffer time: {e}")
             return True  # Default to allowing if check fails
+
+    async def _get_room_type(self, room_id: str) -> str:
+        """Get room type from database"""
+        try:
+            response = self.supabase.from_("rooms")\
+                .select("room_type")\
+                .eq("id", room_id)\
+                .single()\
+                .execute()
+            return response.data.get("room_type", "") if response.data else ""
+        except Exception as e:
+            logger.error(f"Error getting room type: {e}")
+            return ""
+
+    async def _get_room_cleaning_duration(self, room_id: str) -> int:
+        """Get room's cleaning duration from database"""
+        try:
+            response = self.supabase.from_("rooms")\
+                .select("cleaning_duration_minutes")\
+                .eq("id", room_id)\
+                .single()\
+                .execute()
+            return response.data.get("cleaning_duration_minutes", 15) if response.data else 15
+        except Exception as e:
+            logger.error(f"Error getting cleaning duration: {e}")
+            return 15
+
+    async def _check_room_buffer_time(
+        self,
+        room_id: str,
+        start_time: datetime,
+        end_time: datetime,
+        buffer_minutes: int
+    ) -> bool:
+        """Check if room has adequate buffer time (similar to _check_buffer_time but for rooms)"""
+        try:
+            response = self.supabase.from_("appointments")\
+                .select("start_time, end_time")\
+                .eq("room_id", room_id)\
+                .eq("appointment_date", start_time.date().isoformat())\
+                .eq("status", "confirmed")\
+                .execute()
+
+            for appointment in response.data:
+                apt_start = datetime.fromisoformat(appointment["start_time"])
+                apt_end = datetime.fromisoformat(appointment["end_time"])
+
+                if apt_end <= start_time:
+                    buffer = (start_time - apt_end).total_seconds() / 60
+                    if buffer < buffer_minutes:
+                        return False
+                elif apt_start >= end_time:
+                    buffer = (apt_start - end_time).total_seconds() / 60
+                    if buffer < buffer_minutes:
+                        return False
+
+            return True
+        except Exception as e:
+            logger.error(f"Error checking room buffer time: {e}")
+            return True
+
+    async def _get_room_appointment_count(
+        self,
+        room_id: str,
+        date: datetime.date
+    ) -> int:
+        """Get number of appointments for room on specific date"""
+        try:
+            response = self.supabase.from_("appointments")\
+                .select("id", count="exact")\
+                .eq("room_id", room_id)\
+                .eq("appointment_date", date.isoformat())\
+                .eq("status", "confirmed")\
+                .execute()
+            return response.count or 0
+        except Exception as e:
+            logger.error(f"Error getting room appointment count: {e}")
+            return 0
 
     async def _fast_evaluate(
         self,
