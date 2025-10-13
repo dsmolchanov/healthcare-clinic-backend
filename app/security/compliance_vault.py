@@ -388,18 +388,18 @@ class ComplianceVault:
                 'action': action,
                 'timestamp': datetime.utcnow().isoformat(),
                 'user_id': user_id,
-                'actor_type': 'user' if user_id else 'system'  # Move to event_data
+                'actor_type': 'user' if user_id else 'system',
+                'checksum': self._calculate_checksum({  # Move to event_data
+                    'organization_id': organization_id,
+                    'secret_type': secret_type,
+                    'action': action
+                })
             },
             'resource_type': 'secret',
             'resource_id': secret_type,
             'contains_phi': True,  # Calendar data may contain PHI
             'compliance_flags': compliance_flags or [],
-            'created_at': datetime.utcnow().isoformat(),
-            'checksum': self._calculate_checksum({
-                'organization_id': organization_id,
-                'secret_type': secret_type,
-                'action': action
-            })
+            'created_at': datetime.utcnow().isoformat()
         }
 
         # Only include actor_id if table supports it (optional field)

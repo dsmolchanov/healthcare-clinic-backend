@@ -561,7 +561,6 @@ class CalendarOAuthManager:
 
             # Retrieve current credentials from vault
             credentials = await self.vault.retrieve_calendar_credentials(
-                vault_ref=integration['credentials_vault_ref'],
                 organization_id=integration['organization_id'],
                 provider=provider
             )
