@@ -7,7 +7,7 @@ import os
 import json
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, TYPE_CHECKING
+from typing import Dict, Any, List, Optional, TYPE_CHECKING, Set
 from supabase import create_client, Client
 import logging
 import asyncio
@@ -64,6 +64,9 @@ class ConversationMemoryManager:
         self.memory = None
         self.mem0_available = False
         self._mem0_init_attempted = False
+        self._mem0_write_queue: Optional[asyncio.Queue] = None
+        self._mem0_worker_task: Optional[asyncio.Task] = None
+        self._mem0_warmup_clinics: Set[str] = set()
 
         if not MEM0_AVAILABLE:
             logger.info("mem0 not installed, using Supabase for memory storage")
@@ -174,11 +177,227 @@ class ConversationMemoryManager:
             if os.environ.get('MEM0_REQUIRED', 'false').lower() == 'true':
                 raise
 
+    def _build_mem0_user_key(self, phone: str, clinic_id: Optional[str]) -> str:
+        """Create a stable mem0 user key scoped by clinic for multi-tenant isolation."""
+        clinic_part = (clinic_id or "global").strip() or "global"
+        return f"{clinic_part}:{phone}"
+
+    def _candidate_mem0_user_ids(self, phone: str, clinic_id: Optional[str]) -> List[str]:
+        """Return legacy + scoped mem0 user IDs so we can read both new and old data."""
+        phone_clean = phone
+        candidates = []
+
+        if clinic_id:
+            candidates.append(self._build_mem0_user_key(phone_clean, clinic_id))
+
+        # Legacy identifiers (pre multi-tenant) - keep for backward compatibility
+        candidates.append(phone_clean)
+        candidates.append(self._build_mem0_user_key(phone_clean, None))
+
+        # Deduplicate while preserving order
+        deduped = []
+        seen = set()
+        for candidate in candidates:
+            if candidate not in seen:
+                deduped.append(candidate)
+                seen.add(candidate)
+        return deduped
+
+    def _get_mem0_queue(self) -> asyncio.Queue:
+        """Lazy create the mem0 write queue."""
+        if self._mem0_write_queue is None:
+            self._mem0_write_queue = asyncio.Queue(maxsize=512)
+        return self._mem0_write_queue
+
+    async def _ensure_mem0_worker(self):
+        """Make sure the background mem0 writer is running."""
+        if self._mem0_worker_task and not self._mem0_worker_task.done():
+            return
+
+        loop = asyncio.get_running_loop()
+        queue = self._get_mem0_queue()
+        self._mem0_worker_task = loop.create_task(self._mem0_writer_loop(queue))
+        logger.info("Started mem0 background writer task")
+
+    async def _mem0_writer_loop(self, queue: asyncio.Queue):
+        """Background worker that flushes mem0 operations off the critical path."""
+        while True:
+            job = await queue.get()
+            try:
+                job_type = job.get('type')
+                if job_type == 'message':
+                    await self._process_mem0_message_job(job)
+                elif job_type == 'turn':
+                    await self._process_mem0_turn_job(job)
+                elif job_type == 'warmup':
+                    await self._process_mem0_warmup_job(job)
+                else:
+                    logger.warning(f"Unknown mem0 job type: {job_type}")
+            except Exception as exc:
+                logger.error(f"mem0 worker job failed: {exc}", exc_info=True)
+            finally:
+                queue.task_done()
+
+    async def _process_mem0_message_job(self, job: Dict[str, Any]):
+        """Persist a single message to mem0 and backfill Supabase metadata."""
+        message_id = job.get('message_id')
+        phone_number = job.get('phone_number', '')
+        clinic_id = job.get('clinic_id')
+        content = job.get('content', '')
+        base_metadata = dict(job.get('metadata') or {})
+        session_uuid = job.get('session_uuid')
+        external_session_id = job.get('external_session_id')
+        role = job.get('role')
+
+        mem0_metadata = {
+            'role': role,
+            'session_id': session_uuid,
+            'external_session_id': external_session_id,
+            'timestamp': datetime.utcnow().isoformat(),
+            'clinic_id': clinic_id,
+            **base_metadata
+        }
+
+        result = await self.add_mem0_memory(
+            phone_number=phone_number,
+            content=content,
+            metadata=mem0_metadata,
+            clinic_id=clinic_id
+        )
+
+        if not message_id or not result or not result.get('summary'):
+            return
+
+        updated_metadata = dict(base_metadata)
+        updated_metadata['mem0_summary'] = result['summary']
+
+        if result.get('memory_id'):
+            updated_metadata['mem0_id'] = result['memory_id']
+
+        await self._update_message_metadata(message_id, updated_metadata)
+
+    async def _process_mem0_turn_job(self, job: Dict[str, Any]):
+        """Store aggregated conversation turn in mem0 without touching Supabase."""
+        phone_number = job.get('phone_number', '')
+        clinic_id = job.get('clinic_id')
+        content = job.get('content', '')
+        metadata = job.get('metadata') or {}
+
+        await self.add_mem0_memory(
+            phone_number=phone_number,
+            content=content,
+            metadata=metadata,
+            clinic_id=clinic_id
+        )
+
+    async def _process_mem0_warmup_job(self, job: Dict[str, Any]):
+        """Touch the vector index so mem0 is hot before real traffic arrives."""
+        clinic_id = job.get('clinic_id')
+        phone_number = job.get('phone_number', 'warmup')
+
+        if not self.mem0_available or not self.memory:
+            return
+
+        user_key = self._build_mem0_user_key(phone_number.replace("@s.whatsapp.net", ""), clinic_id)
+
+        try:
+            loop = asyncio.get_running_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self.memory.get_all(user_id=user_key, limit=1)
+                ),
+                timeout=MEM0_TIMEOUT_MS / 1000.0
+            )
+            logger.info(f"mem0 warmup complete for clinic {clinic_id or 'global'}")
+        except asyncio.TimeoutError:
+            logger.warning(f"mem0 warmup timed out for clinic {clinic_id}")
+        except Exception as exc:
+            logger.warning(f"mem0 warmup failed for clinic {clinic_id}: {exc}")
+
+    async def _update_message_metadata(self, message_id: str, metadata: Dict[str, Any]):
+        """Persist updated metadata back to Supabase in a worker thread."""
+
+        def _update():
+            return (
+                self.supabase
+                .table('conversation_messages')
+                .update({'metadata': metadata})
+                .eq('id', message_id)
+                .execute()
+            )
+
+        try:
+            await asyncio.to_thread(_update)
+            logger.debug(f"Updated metadata for message {message_id}")
+        except Exception as exc:
+            logger.warning(f"Failed to update metadata for message {message_id}: {exc}")
+
+    async def _enqueue_mem0_job(self, job: Dict[str, Any]):
+        """Submit a mem0 job to be processed asynchronously."""
+        self._ensure_mem0_initialized()
+
+        if not self.mem0_available or not self.memory:
+            return
+
+        queue = self._get_mem0_queue()
+        await self._ensure_mem0_worker()
+
+        try:
+            queue.put_nowait(job)
+        except asyncio.QueueFull:
+            logger.warning("mem0 write queue is full, dropping job")
+
+    async def _schedule_mem0_warmup(self, clinic_id: Optional[str], phone_number: str):
+        """Kick off a mem0 warmup for a clinic once per process."""
+        if not clinic_id or clinic_id in self._mem0_warmup_clinics:
+            return
+
+        self._mem0_warmup_clinics.add(clinic_id)
+
+        await self._enqueue_mem0_job({
+            'type': 'warmup',
+            'clinic_id': clinic_id,
+            'phone_number': phone_number
+        })
+
+    async def schedule_mem0_message_update(
+        self,
+        *,
+        message_id: Optional[str],
+        phone_number: str,
+        clinic_id: Optional[str],
+        content: str,
+        metadata: Dict[str, Any],
+        session_uuid: str,
+        role: str,
+        external_session_id: Optional[str] = None
+    ):
+        """Public helper to queue a mem0 add + metadata backfill for an existing message."""
+
+        if not message_id:
+            return
+
+        job = {
+            'type': 'message',
+            'clinic_id': clinic_id,
+            'phone_number': phone_number,
+            'content': content,
+            'metadata': dict(metadata or {}),
+            'message_id': message_id,
+            'session_uuid': session_uuid,
+            'external_session_id': external_session_id,
+            'role': role
+        }
+
+        await self._enqueue_mem0_job(job)
+
     async def add_mem0_memory(
         self,
         phone_number: str,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        clinic_id: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """Store a memory in mem0 and return summary metadata."""
 
@@ -188,7 +407,13 @@ class ConversationMemoryManager:
             return None
 
         clean_phone = phone_number.replace("@s.whatsapp.net", "")
+        resolved_clinic = clinic_id or (metadata or {}).get('clinic_id')
         metadata_payload = dict(metadata or {})
+        if resolved_clinic:
+            metadata_payload.setdefault('clinic_id', resolved_clinic)
+
+        user_candidates = self._candidate_mem0_user_ids(clean_phone, resolved_clinic)
+        target_user_id = user_candidates[0]
 
         try:
             loop = asyncio.get_event_loop()
@@ -197,7 +422,7 @@ class ConversationMemoryManager:
                     None,
                     lambda: self.memory.add(
                         content,
-                        user_id=clean_phone,
+                        user_id=target_user_id,
                         metadata=metadata_payload
                     )
                 ),
@@ -254,7 +479,8 @@ class ConversationMemoryManager:
                     'p_clinic': clinic_id,
                     'p_metadata': {
                         'phone_number': clean_phone,
-                        'source': 'whatsapp'
+                        'source': 'whatsapp',
+                        'clinic_id': clinic_id
                     }
                 }).execute()
 
@@ -322,12 +548,14 @@ class ConversationMemoryManager:
         import asyncio
 
         message_id_container = [None]  # Use list to capture ID from async function
+        clean_phone = phone_number.replace("@s.whatsapp.net", "")
 
         async def _store_with_timeout():
             """Internal helper with timeout protection"""
             try:
                 # Store the external key for debugging
                 external_session_id = session_id
+                session: Optional[Dict[str, Any]] = None
 
                 # Check if session_id is a UUID or external key
                 try:
@@ -360,24 +588,35 @@ class ConversationMemoryManager:
                 message_id_container[0] = msg_id  # Capture the ID
 
                 base_metadata = dict(metadata or {})
+                clinic_id = base_metadata.get('clinic_id')
 
-                mem0_result: Optional[Dict[str, Any]] = None
-                if self.mem0_available and self.memory:
-                    mem0_result = await self.add_mem0_memory(
-                        phone_number=phone_number,
-                        content=content,
-                        metadata={
-                            'role': role,
-                            'session_id': actual_session_uuid,
-                            'external_session_id': external_session_id,
-                            'timestamp': datetime.utcnow().isoformat()
-                        }
-                    )
+                if not clinic_id and session and isinstance(session, dict):
+                    session_meta = session.get('metadata') or {}
+                    clinic_id = session_meta.get('clinic_id') or session.get('clinic_id')
 
-                if mem0_result and mem0_result.get('summary'):
-                    base_metadata.setdefault('mem0_summary', mem0_result['summary'])
-                    if mem0_result.get('memory_id'):
-                        base_metadata.setdefault('mem0_id', mem0_result['memory_id'])
+                if not clinic_id:
+                    try:
+                        lookup = (
+                            self.supabase
+                            .table('conversation_sessions')
+                            .select('metadata')
+                            .eq('id', actual_session_uuid)
+                            .single()
+                            .execute()
+                        )
+                        if lookup.data:
+                            session_meta = lookup.data.get('metadata') or {}
+                            clinic_id = session_meta.get('clinic_id')
+                    except Exception as exc:
+                        logger.debug(f"Unable to resolve clinic_id for session {actual_session_uuid}: {exc}")
+
+                if clinic_id:
+                    base_metadata.setdefault('clinic_id', clinic_id)
+
+                base_metadata.setdefault('from_number', clean_phone)
+
+                # Warm vector index once per clinic to avoid cold-start latency
+                await self._schedule_mem0_warmup(clinic_id, clean_phone)
 
                 # Store using new RPC (writes to healthcare.conversation_logs)
                 result = self.supabase.rpc('log_message_with_metrics', {
@@ -394,6 +633,20 @@ class ConversationMemoryManager:
                     message_id_container[0] = msg_id
 
                 logger.debug(f"Stored {role} message for session UUID {actual_session_uuid} (external: {external_session_id})")
+
+                if message_id_container[0]:
+                    asyncio.create_task(
+                        self.schedule_mem0_message_update(
+                            message_id=message_id_container[0],
+                            phone_number=phone_number,
+                            clinic_id=clinic_id,
+                            content=content,
+                            metadata=dict(base_metadata),
+                            session_uuid=actual_session_uuid,
+                            role=role,
+                            external_session_id=external_session_id
+                        )
+                    )
 
             except Exception as e:
                 logger.error(f"Error storing message: {e}")
@@ -422,49 +675,22 @@ class ConversationMemoryManager:
         This provides better context than storing individual messages
         """
 
-        # Lazy initialize mem0 on first use
-        self._ensure_mem0_initialized()
-
-        if not self.mem0_available or not self.memory:
-            logger.warning("mem0 not available, skipping memory storage")
-            return
-
-        clean_phone = phone_number.replace("@s.whatsapp.net", "")
-
         # Combine user and assistant into conversational context
         conversation_turn = f"User: {user_message}\nAssistant: {assistant_response}"
+        clinic_id = (metadata or {}).get('clinic_id') if metadata else None
 
-        try:
-            logger.info(f"Storing conversation turn in mem0 for user: {clean_phone[:8]}***")
-
-            # Run with timeout
-            async def _add_turn():
-                loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(
-                    None,
-                    lambda: self.memory.add(
-                        conversation_turn,
-                        user_id=clean_phone,
-                        metadata={
-                            'session_id': session_id,
-                            'timestamp': datetime.utcnow().isoformat(),
-                            'turn_type': 'conversation',
-                            **(metadata or {})
-                        }
-                    )
-                )
-
-            result = await asyncio.wait_for(
-                _add_turn(),
-                timeout=MEM0_TIMEOUT_MS / 1000.0
-            )
-
-            logger.info(f"✅ Conversation turn stored in mem0: {result}")
-
-        except asyncio.TimeoutError:
-            logger.warning(f"⏱️ mem0 add conversation timed out after {MEM0_TIMEOUT_MS}ms (non-critical)")
-        except Exception as e:
-            logger.error(f"❌ Failed to store in mem0: {e}", exc_info=True)
+        await self._enqueue_mem0_job({
+            'type': 'turn',
+            'clinic_id': clinic_id,
+            'phone_number': phone_number,
+            'content': conversation_turn,
+            'metadata': {
+                'session_id': session_id,
+                'timestamp': datetime.utcnow().isoformat(),
+                'turn_type': 'conversation',
+                **(metadata or {})
+            }
+        })
 
     async def get_conversation_history(
         self,
@@ -474,9 +700,9 @@ class ConversationMemoryManager:
         include_all_sessions: bool = True
     ) -> List[Dict[str, Any]]:
         """Get conversation history for a phone number"""
-        
+
         clean_phone = phone_number.replace("@s.whatsapp.net", "")
-        
+
         try:
             if include_all_sessions:
                 # Get all messages from all sessions for this phone number
@@ -512,71 +738,138 @@ class ConversationMemoryManager:
         except Exception as e:
             logger.error(f"Error getting conversation history: {e}")
             return []
-    
+
+    async def _fetch_cached_mem0_summaries(
+        self,
+        phone_number: str,
+        clinic_id: Optional[str],
+        limit: int
+    ) -> List[str]:
+        """Fetch recent mem0 summaries from Supabase metadata cache."""
+
+        def _query():
+            query = self.supabase.table('conversation_messages').select('metadata, created_at')
+            query = query.eq('metadata->>from_number', phone_number)
+
+            if clinic_id:
+                query = query.eq('metadata->>clinic_id', clinic_id)
+
+            query = query.filter('metadata->>mem0_summary', 'not.is', 'null')
+            query = query.order('created_at', desc=True).limit(limit)
+            response = query.execute()
+            return response.data or []
+
+        try:
+            rows = await asyncio.to_thread(_query)
+            summaries: List[str] = []
+            for row in rows:
+                metadata = row.get('metadata') or {}
+                summary = metadata.get('mem0_summary')
+                if summary:
+                    summaries.append(summary)
+            return summaries
+        except Exception as exc:
+            logger.debug(f"Cached mem0 summary fetch failed: {exc}")
+            return []
+
     async def get_memory_context(
         self,
         phone_number: str,
+        clinic_id: Optional[str] = None,
         query: Optional[str] = None,
         limit: int = 5
     ) -> List[str]:
         """Get memory context for a phone number with detailed logging"""
 
-        # Lazy initialize mem0 on first use
+        clean_phone = phone_number.replace("@s.whatsapp.net", "")
+
+        cached_summaries = await self._fetch_cached_mem0_summaries(
+            phone_number=clean_phone,
+            clinic_id=clinic_id,
+            limit=limit * 3
+        )
+
+        if query:
+            lowered = query.lower()
+            cached_filtered = [item for item in cached_summaries if lowered in item.lower()]
+        else:
+            cached_filtered = cached_summaries
+
+        context: List[str] = []
+        for summary in cached_filtered:
+            context.append(summary)
+            if len(context) >= limit:
+                return context
+
+        # Lazy initialize mem0 only if we still need more context
         self._ensure_mem0_initialized()
 
         if not self.mem0_available or not self.memory:
-            logger.warning("mem0 not available, returning empty context")
-            return []
-
-        clean_phone = phone_number.replace("@s.whatsapp.net", "")
-
-        try:
-            logger.info(f"Querying mem0 for user: {clean_phone[:8]}*** (query: {query[:50] if query else 'None'})")
-
-            # Run with timeout
-            async def _search_mem0():
-                loop = asyncio.get_event_loop()
-                if query:
-                    return await loop.run_in_executor(
-                        None,
-                        lambda: self.memory.search(query, user_id=clean_phone, limit=limit)
-                    )
-                else:
-                    return await loop.run_in_executor(
-                        None,
-                        lambda: self.memory.get_all(user_id=clean_phone, limit=limit)
-                    )
-
-            memories = await asyncio.wait_for(
-                _search_mem0(),
-                timeout=MEM0_TIMEOUT_MS / 1000.0
-            )
-
-            if query:
-                logger.info(f"mem0 search returned {len(memories)} memories")
-            else:
-                logger.info(f"mem0 get_all returned {len(memories)} memories")
-
-            # Extract memory texts
-            context = []
-            for idx, memory in enumerate(memories):
-                if isinstance(memory, dict):
-                    memory_text = memory.get('memory', '')
-                    score = memory.get('score', 0)
-                    context.append(memory_text)
-                    logger.debug(f"  Memory {idx+1}: {memory_text[:100]}... (score: {score:.3f})")
-                else:
-                    context.append(str(memory))
-
-            logger.info(f"✅ Returning {len(context)} memory items")
             return context
 
-        except asyncio.TimeoutError:
-            logger.warning(f"⏱️ mem0 search timed out after {MEM0_TIMEOUT_MS}ms, returning empty context")
-            return []
-        except Exception as e:
-            logger.error(f"❌ Failed to get mem0 context: {e}", exc_info=True)
-            return []  # Return empty but log the error prominently
+        remaining = max(limit - len(context), 0)
+        if remaining == 0:
+            return context
+
+        try:
+            logger.info(
+                "Querying mem0 for user: %s (clinic: %s, query: %s)",
+                clean_phone[:8] + "***",
+                clinic_id or 'global',
+                (query[:50] if query else 'None')
+            )
+
+            loop = asyncio.get_event_loop()
+
+            for user_id in self._candidate_mem0_user_ids(clean_phone, clinic_id):
+                try:
+                    if query:
+                        memories = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                lambda: self.memory.search(query, user_id=user_id, limit=remaining)
+                            ),
+                            timeout=MEM0_TIMEOUT_MS / 1000.0
+                        )
+                    else:
+                        memories = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                lambda: self.memory.get_all(user_id=user_id, limit=remaining)
+                            ),
+                            timeout=MEM0_TIMEOUT_MS / 1000.0
+                        )
+                except asyncio.TimeoutError:
+                    logger.warning("mem0 search timed out for user %s", user_id)
+                    continue
+                except Exception as exc:
+                    logger.debug(f"mem0 search failed for user {user_id}: {exc}")
+                    continue
+
+                for memory in memories:
+                    if isinstance(memory, dict):
+                        memory_text = memory.get('memory') or memory.get('content') or ''
+                    else:
+                        memory_text = str(memory)
+
+                    if not memory_text:
+                        continue
+
+                    if memory_text in context:
+                        continue
+
+                    context.append(memory_text)
+                    if len(context) >= limit:
+                        break
+
+                if len(context) >= limit:
+                    break
+
+            return context
+
+        except Exception as exc:
+            logger.error(f"❌ Failed to get mem0 context: {exc}", exc_info=True)
+            return context
     
     async def summarize_conversation(
         self,
@@ -602,10 +895,11 @@ class ConversationMemoryManager:
     
     async def get_user_preferences(
         self,
-        phone_number: str
+        phone_number: str,
+        clinic_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Get user preferences and important information from history"""
-        
+
         clean_phone = phone_number.replace("@s.whatsapp.net", "")
         
         preferences = {
@@ -617,25 +911,45 @@ class ConversationMemoryManager:
         }
         
         try:
-            # Get mem0 memories about user preferences
+            # Get mem0 memories about user preferences (prefers cached ones when available)
+            memories: List[Any] = []
+            self._ensure_mem0_initialized()
+
             if self.mem0_available and self.memory:
-                memories = self.memory.get_all(user_id=clean_phone, limit=20)
-                
-                for memory in memories:
+                loop = asyncio.get_event_loop()
+
+                for user_id in self._candidate_mem0_user_ids(clean_phone, clinic_id):
+                    try:
+                        memories = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                lambda uid=user_id: self.memory.get_all(user_id=uid, limit=20)
+                            ),
+                            timeout=MEM0_TIMEOUT_MS / 1000.0
+                        )
+                    except (asyncio.TimeoutError, Exception):
+                        continue
+
+                    if memories:
+                        break
+
+                for memory in memories or []:
                     memory_text = memory.get('memory', '') if isinstance(memory, dict) else str(memory)
-                    
+
+                    lowered = memory_text.lower()
+
                     # Extract preferences from memories
-                    if 'prefers' in memory_text.lower() or 'likes' in memory_text.lower():
+                    if 'prefers' in lowered or 'likes' in lowered:
                         preferences['appointment_preferences'].append(memory_text)
-                    
-                    if 'language' in memory_text.lower() or 'speaks' in memory_text.lower():
+
+                    if 'language' in lowered or 'speaks' in lowered:
                         preferences['language'] = memory_text
-                    
-                    if 'name is' in memory_text.lower() or 'call me' in memory_text.lower():
+
+                    if 'name is' in lowered or 'call me' in lowered:
                         preferences['preferred_name'] = memory_text
-            
+
             # Also check recent messages for language detection
-            history = await self.get_conversation_history(phone_number, '', limit=5)
+            history = await self.get_conversation_history(phone_number, clinic_id or '', limit=5)
             if history:
                 # Simple language detection based on recent messages
                 for msg in history:

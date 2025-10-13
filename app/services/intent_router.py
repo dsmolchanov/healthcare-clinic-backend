@@ -262,6 +262,7 @@ class IntentRouter:
 
         session_id = context.get('session_id')
         user_phone = message.get('from_phone', 'unknown')
+        clinic_id = context.get('clinic_id')
 
         escalation_handler = EscalationHandler()
 
@@ -288,14 +289,14 @@ class IntentRouter:
                     role='user',
                     content=message.get('body', ''),
                     phone_number=user_phone,
-                    metadata={'intent': 'handoff_human'}
+                    metadata={'intent': 'handoff_human', 'clinic_id': clinic_id}
                 )
                 await manager.store_message(
                     session_id=session_id,
                     role='assistant',
                     content=result['holding_message'],
                     phone_number=user_phone,
-                    metadata={'escalated': True, 'fast_path': True}
+                    metadata={'escalated': True, 'fast_path': True, 'clinic_id': clinic_id}
                 )
             except Exception as e:
                 logger.error(f"Failed to store handoff messages: {e}")

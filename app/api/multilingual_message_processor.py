@@ -229,10 +229,14 @@ class MultilingualMessageProcessor:
             include_all_sessions=True
         )
 
-        prefs_task = self.memory_manager.get_user_preferences(request.from_phone)
+        prefs_task = self.memory_manager.get_user_preferences(
+            phone_number=request.from_phone,
+            clinic_id=request.clinic_id
+        )
 
         memory_task = self.memory_manager.get_memory_context(
             phone_number=request.from_phone,
+            clinic_id=request.clinic_id,
             query=request.body
         )
 
@@ -393,27 +397,6 @@ DO NOT attempt to answer complex questions yourself.
             'channel': request.channel
         }
 
-        # Capture mem0 summary before logging the message so metadata reflects it
-        assistant_mem0_result: Optional[Dict[str, Any]] = None
-        if self.memory_manager.mem0_available:
-            try:
-                assistant_mem0_result = await self.memory_manager.add_mem0_memory(
-                    phone_number=request.from_phone,
-                    content=ai_response,
-                    metadata={
-                        'role': 'assistant',
-                        'session_id': session_id,
-                        'timestamp': datetime.utcnow().isoformat()
-                    }
-                )
-
-                if assistant_mem0_result and assistant_mem0_result.get('summary'):
-                    response_metadata['mem0_summary'] = assistant_mem0_result['summary']
-                    if assistant_mem0_result.get('memory_id'):
-                        response_metadata['mem0_id'] = assistant_mem0_result['memory_id']
-            except Exception as e:
-                logger.warning(f"Failed to store assistant response in mem0: {e}")
-
         # Hybrid search metadata removed (no more RAG)
 
         # Log assistant message WITH metrics in ONE async call
@@ -452,6 +435,19 @@ DO NOT attempt to answer complex questions yourself.
         )
 
         assistant_message_id = result.get('message_id') if result.get('success') else None
+
+        if assistant_message_id:
+            asyncio.create_task(
+                self.memory_manager.schedule_mem0_message_update(
+                    message_id=assistant_message_id,
+                    phone_number=request.from_phone,
+                    clinic_id=request.clinic_id,
+                    content=ai_response,
+                    metadata=dict(response_metadata),
+                    session_uuid=session_id,
+                    role='assistant'
+                )
+            )
 
         # Analyze the response to determine turn status
         logger.info("Analyzing agent response to determine turn status...")

@@ -171,6 +171,7 @@ class DirectToolExecutor:
             memories = await asyncio.wait_for(
                 memory_manager.get_memory_context(
                     phone_number=phone_number,
+                    clinic_id=self.clinic_id,
                     query=query,
                     limit=limit
                 ),
