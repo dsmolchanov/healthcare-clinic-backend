@@ -243,15 +243,40 @@ class MessageRouter:
         """
         Direct message processing fallback when LangGraph is unavailable
         """
+        metadata = metadata or {}
+        if 'from_number' in metadata:
+            metadata.setdefault('phone_number', metadata['from_number'])
+            metadata.setdefault('from', metadata['from_number'])
         try:
             from app.api.multilingual_message_processor import handle_process_message, MessageRequest
 
             # Build request
+            from_phone = (
+                metadata.get("from_number")
+                or metadata.get("from")
+                or metadata.get("phone_number")
+                or (session_id.split("_", 2)[1] if session_id.startswith("whatsapp_") and len(session_id.split("_")) > 2 else None)
+            )
+
+            if not from_phone:
+                from_phone = "unknown"
+
+            metadata["from_number"] = from_phone
+            metadata.setdefault("phone_number", from_phone)
+            metadata.setdefault("from", from_phone)
+
+            message_sid = (
+                metadata.get("message_sid")
+                or metadata.get("whatsapp_message_id")
+                or session_id
+            )
+            metadata["message_sid"] = message_sid
+
             request = MessageRequest(
-                from_phone=metadata.get("from", "unknown"),
+                from_phone=from_phone,
                 to_phone=metadata.get("to", "clinic"),
                 body=message,
-                message_sid=session_id,
+                message_sid=message_sid,
                 clinic_id=metadata.get("clinic_id", "default"),
                 clinic_name=metadata.get("clinic_name", "Clinic"),
                 channel=metadata.get("channel", "whatsapp"),
@@ -361,6 +386,11 @@ class MessageRouter:
         Returns:
             Processed response with routing metadata
         """
+        metadata = metadata or {}
+        if 'from_number' in metadata:
+            metadata.setdefault('phone_number', metadata['from_number'])
+            metadata.setdefault('from', metadata['from_number'])
+
         # Track metrics
         if self.enable_metrics:
             self.metrics["total_messages"] += 1
@@ -376,7 +406,13 @@ class MessageRouter:
                 # Try fast-path handler
                 fast_response = await self.intent_router.route_to_handler(
                     intent,
-                    message={'body': message, 'from_phone': metadata.get('phone_number', 'unknown')},
+                    message={
+                        'body': message,
+                        'from_phone': metadata.get('from_number')
+                        or metadata.get('phone_number')
+                        or metadata.get('from')
+                        or 'unknown'
+                    },
                     context={'session_id': session_id, **(metadata or {})}
                 )
 

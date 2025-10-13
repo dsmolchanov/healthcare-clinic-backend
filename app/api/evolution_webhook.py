@@ -359,7 +359,9 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
                         "instance_name": actual_instance,
                         "clinic_id": clinic_id,
                         "user_name": push_name,
-                        "channel": "whatsapp"
+                        "channel": "whatsapp",
+                        "message_sid": key.get("id"),
+                        "whatsapp_message_id": key.get("id")
                     }
                 ),
                 timeout=30.0  # 30 second max for AI processing

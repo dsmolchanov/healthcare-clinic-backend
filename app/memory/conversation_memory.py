@@ -23,8 +23,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Mem0 operation timeout (300ms for embeddings)
-MEM0_TIMEOUT_MS = 300
+# Mem0 operation timeout (configurable via MEM0_TIMEOUT_MS, default 800ms)
+# Enforce a floor of 800ms to prevent overly aggressive timeouts.
+MEM0_TIMEOUT_MS = max(int(os.getenv("MEM0_TIMEOUT_MS", "800")), 800)
 
 # Module-global in-flight deduplication map
 _inflight: Dict[tuple, asyncio.Task] = {}
@@ -66,6 +67,36 @@ class ConversationMemoryManager:
 
         if not MEM0_AVAILABLE:
             logger.info("mem0 not installed, using Supabase for memory storage")
+
+    @staticmethod
+    def _extract_mem0_summary(mem0_result: Any) -> tuple[Optional[str], Optional[str]]:
+        """Extract summary text and id from mem0 add response."""
+        if mem0_result is None:
+            return None, None
+
+        if isinstance(mem0_result, dict):
+            summary = (
+                mem0_result.get('text')
+                or mem0_result.get('memory')
+                or mem0_result.get('summary')
+                or mem0_result.get('content')
+            )
+            memory_id = mem0_result.get('id') or mem0_result.get('memory_id')
+            return summary, memory_id
+
+        if isinstance(mem0_result, (list, tuple)):
+            for item in mem0_result:
+                summary, memory_id = ConversationMemoryManager._extract_mem0_summary(item)
+                if summary:
+                    return summary, memory_id
+            return None, None
+
+        # Unknown type – fallback to string conversion
+        try:
+            summary_str = str(mem0_result)
+            return summary_str, None
+        except Exception:
+            return None, None
 
     def _ensure_mem0_initialized(self):
         """Lazy initialization of mem0 - only init on first use"""
@@ -142,7 +173,54 @@ class ConversationMemoryManager:
             # Don't silently fail - raise if mem0 is critical
             if os.environ.get('MEM0_REQUIRED', 'false').lower() == 'true':
                 raise
-    
+
+    async def add_mem0_memory(
+        self,
+        phone_number: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Store a memory in mem0 and return summary metadata."""
+
+        self._ensure_mem0_initialized()
+
+        if not self.mem0_available or not self.memory:
+            return None
+
+        clean_phone = phone_number.replace("@s.whatsapp.net", "")
+        metadata_payload = dict(metadata or {})
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self.memory.add(
+                        content,
+                        user_id=clean_phone,
+                        metadata=metadata_payload
+                    )
+                ),
+                timeout=MEM0_TIMEOUT_MS / 1000.0
+            )
+
+            summary, memory_id = self._extract_mem0_summary(result)
+
+            return {
+                'summary': summary,
+                'memory_id': memory_id,
+                'raw': result
+            }
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"⏱️ mem0 add timed out after {MEM0_TIMEOUT_MS}ms (non-critical)"
+            )
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to store in mem0: {e}")
+            return None
+
     async def get_or_create_session(
         self,
         phone_number: str,
@@ -281,22 +359,32 @@ class ConversationMemoryManager:
                 msg_id = str(uuid.uuid4())
                 message_id_container[0] = msg_id  # Capture the ID
 
-                message = {
-                    'id': msg_id,
-                    'session_id': actual_session_uuid,  # Use the real UUID
-                    'external_session_id': external_session_id,  # Store external key for debugging
-                    'role': role,
-                    'content': content,
-                    'metadata': metadata or {},
-                    'created_at': datetime.utcnow().isoformat()
-                }
+                base_metadata = dict(metadata or {})
+
+                mem0_result: Optional[Dict[str, Any]] = None
+                if self.mem0_available and self.memory:
+                    mem0_result = await self.add_mem0_memory(
+                        phone_number=phone_number,
+                        content=content,
+                        metadata={
+                            'role': role,
+                            'session_id': actual_session_uuid,
+                            'external_session_id': external_session_id,
+                            'timestamp': datetime.utcnow().isoformat()
+                        }
+                    )
+
+                if mem0_result and mem0_result.get('summary'):
+                    base_metadata.setdefault('mem0_summary', mem0_result['summary'])
+                    if mem0_result.get('memory_id'):
+                        base_metadata.setdefault('mem0_id', mem0_result['memory_id'])
 
                 # Store using new RPC (writes to healthcare.conversation_logs)
                 result = self.supabase.rpc('log_message_with_metrics', {
                     'p_session_id': actual_session_uuid,
                     'p_role': role,
                     'p_content': content,
-                    'p_metadata': metadata or {},
+                    'p_metadata': base_metadata,
                     'p_log_platform_events': False  # No events for simple message store
                 }).execute()
 
@@ -304,38 +392,6 @@ class ConversationMemoryManager:
                 if result.data:
                     msg_id = result.data.get('message_id')
                     message_id_container[0] = msg_id
-
-                # Also store in mem0 if available (with timeout)
-                if self.mem0_available and self.memory:
-                    try:
-                        # Add to mem0 with user identifier
-                        clean_phone = phone_number.replace("@s.whatsapp.net", "")
-
-                        # Run with timeout to avoid blocking
-                        async def _add_to_mem0():
-                            loop = asyncio.get_event_loop()
-                            return await loop.run_in_executor(
-                                None,
-                                lambda: self.memory.add(
-                                    content,
-                                    user_id=clean_phone,
-                                    metadata={
-                                        'role': role,
-                                        'session_id': actual_session_uuid,
-                                        'external_session_id': external_session_id,
-                                        'timestamp': datetime.utcnow().isoformat()
-                                    }
-                                )
-                            )
-
-                        await asyncio.wait_for(
-                            _add_to_mem0(),
-                            timeout=MEM0_TIMEOUT_MS / 1000.0
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(f"⏱️ mem0 add timed out after {MEM0_TIMEOUT_MS}ms (non-critical)")
-                    except Exception as e:
-                        logger.warning(f"Failed to store in mem0: {e}")
 
                 logger.debug(f"Stored {role} message for session UUID {actual_session_uuid} (external: {external_session_id})")
 

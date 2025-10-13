@@ -157,6 +157,27 @@ class MultilingualMessageProcessor:
         # Track processing start time for metrics
         processing_start_time = time.time()
 
+        # Ensure we have a valid phone number for downstream systems
+        if not request.from_phone or request.from_phone.lower() == 'unknown':
+            fallback_phone = None
+            if isinstance(request.metadata, dict):
+                fallback_phone = (
+                    request.metadata.get('from_number')
+                    or request.metadata.get('phone_number')
+                    or request.metadata.get('from')
+                )
+            if not fallback_phone and request.message_sid and request.message_sid.startswith('whatsapp_'):
+                parts = request.message_sid.split('_', 2)
+                if len(parts) > 1 and parts[1]:
+                    fallback_phone = parts[1]
+
+            if fallback_phone:
+                request.from_phone = fallback_phone
+                if isinstance(request.metadata, dict):
+                    request.metadata.setdefault('from_number', fallback_phone)
+                    request.metadata.setdefault('phone_number', fallback_phone)
+                    request.metadata.setdefault('from', fallback_phone)
+
         # Store request data for logging
         self.current_from_phone = request.from_phone
         self.current_to_phone = request.to_phone
@@ -191,7 +212,11 @@ class MultilingualMessageProcessor:
                 phone_number=request.from_phone,
                 metadata={
                     'message_sid': request.message_sid,
-                    'profile_name': request.profile_name
+                    'profile_name': request.profile_name,
+                    'clinic_id': request.clinic_id,
+                    'from_number': request.from_phone,
+                    'channel': request.channel,
+                    'instance_name': request.metadata.get('instance_name') if isinstance(request.metadata, dict) else None
                 }
             )
         )
@@ -362,8 +387,32 @@ DO NOT attempt to answer complex questions yourself.
         # Store assistant response in persistent storage
         response_metadata = {
             'detected_language': detected_language,
-            'memory_context_used': len(memory_context)
+            'memory_context_used': len(memory_context),
+            'clinic_id': request.clinic_id,
+            'from_number': request.from_phone,
+            'channel': request.channel
         }
+
+        # Capture mem0 summary before logging the message so metadata reflects it
+        assistant_mem0_result: Optional[Dict[str, Any]] = None
+        if self.memory_manager.mem0_available:
+            try:
+                assistant_mem0_result = await self.memory_manager.add_mem0_memory(
+                    phone_number=request.from_phone,
+                    content=ai_response,
+                    metadata={
+                        'role': 'assistant',
+                        'session_id': session_id,
+                        'timestamp': datetime.utcnow().isoformat()
+                    }
+                )
+
+                if assistant_mem0_result and assistant_mem0_result.get('summary'):
+                    response_metadata['mem0_summary'] = assistant_mem0_result['summary']
+                    if assistant_mem0_result.get('memory_id'):
+                        response_metadata['mem0_id'] = assistant_mem0_result['memory_id']
+            except Exception as e:
+                logger.warning(f"Failed to store assistant response in mem0: {e}")
 
         # Hybrid search metadata removed (no more RAG)
 
@@ -403,22 +452,6 @@ DO NOT attempt to answer complex questions yourself.
         )
 
         assistant_message_id = result.get('message_id') if result.get('success') else None
-
-        # Store in mem0 memory (if available)
-        if assistant_message_id and self.memory_manager.mem0_available:
-            try:
-                clean_phone = request.from_phone.replace("@s.whatsapp.net", "")
-                self.memory_manager.memory.add(
-                    ai_response,
-                    user_id=clean_phone,
-                    metadata={
-                        'role': 'assistant',
-                        'session_id': session_id,
-                        'timestamp': datetime.utcnow().isoformat()
-                    }
-                )
-            except Exception as e:
-                logger.warning(f"Failed to store in mem0: {e}")
 
         # Analyze the response to determine turn status
         logger.info("Analyzing agent response to determine turn status...")
@@ -1322,10 +1355,13 @@ IMPORTANT BEHAVIORS:
                 'p_organization_id': None  # Optional, will be looked up from clinic_id
             }).execute()
 
-            if result.data and result.data.get('success'):
-                logger.info(f"Conversation logged successfully: session_id={result.data.get('session_id')}")
-            else:
-                logger.warning(f"Failed to log conversation: {result.data}")
+            if result.data:
+                if result.data.get('success'):
+                    logger.info(f"Conversation logged successfully: session_id={result.data.get('session_id')}")
+                elif result.data.get('error') and 'duplicate key value violates unique constraint' in result.data.get('error', '').lower():
+                    logger.debug("Skipping duplicate WhatsApp conversation log for message_sid=%s", getattr(self, 'current_message_sid', 'unknown'))
+                else:
+                    logger.warning(f"Failed to log conversation: {result.data}")
         except Exception as e:
             # If logging fails, just print error (non-critical for MVP)
             print(f"Could not log to database: {e}")
