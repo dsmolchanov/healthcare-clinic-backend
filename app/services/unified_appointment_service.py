@@ -15,6 +15,8 @@ from enum import Enum
 from supabase import create_client, Client
 from .external_calendar_service import ExternalCalendarService
 from .websocket_manager import websocket_manager, NotificationType
+from .rule_evaluator import RuleEvaluator, EvaluationContext, TimeSlot as RuleTimeSlot
+from .policy_cache import PolicyCache
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,10 @@ class UnifiedAppointmentService:
             )
         self.calendar_service = ExternalCalendarService(self.supabase)
         self.default_appointment_duration = timedelta(minutes=30)
+
+        # Initialize room assignment components
+        self.policy_cache = PolicyCache(self.supabase)
+        self.rule_evaluator = RuleEvaluator(self.supabase, self.policy_cache)
 
     async def get_available_slots(
         self,
@@ -167,7 +173,79 @@ class UnifiedAppointmentService:
                     conflicts=hold_result.get('conflicts', [])
                 )
 
-            # Phase 2: Create internal appointment record
+            # Phase 2: Room Auto-Assignment
+            room_id = None
+            try:
+                logger.info("Starting room auto-assignment")
+
+                # Get available rooms for the time slot
+                available_rooms = await self._get_available_rooms(
+                    request.doctor_id,
+                    request.clinic_id,
+                    request.start_time,
+                    request.end_time
+                )
+
+                if not available_rooms:
+                    logger.warning("No available rooms found")
+                    # Could either fail or allow booking without room
+                    # For now, we'll allow it but log a warning
+                else:
+                    # Create evaluation context
+                    context = EvaluationContext(
+                        clinic_id=request.clinic_id,
+                        patient_id=request.patient_id,
+                        requested_service=request.appointment_type.value
+                    )
+
+                    # Score each available room
+                    scored_slots = []
+                    for room in available_rooms:
+                        # Create a TimeSlot for rules evaluation
+                        slot = RuleTimeSlot(
+                            id=str(uuid.uuid4()),
+                            doctor_id=request.doctor_id,
+                            room_id=room['id'],
+                            service_id=request.appointment_type.value,
+                            start_time=request.start_time,
+                            end_time=request.end_time
+                        )
+
+                        # Evaluate the slot
+                        result = await self.rule_evaluator.evaluate_slot(context, slot)
+
+                        if result.is_valid:
+                            scored_slots.append((room, result.score))
+                            logger.debug(f"Room {room['id']} scored {result.score}")
+                        else:
+                            logger.debug(f"Room {room['id']} invalid: {result.explanations}")
+
+                    # Select the room with the highest score
+                    if scored_slots:
+                        best_room, best_score = max(scored_slots, key=lambda x: x[1])
+                        room_id = best_room['id']
+                        logger.info(f"Selected room {room_id} with score {best_score}")
+                    else:
+                        # Fallback to simple selection if rules engine didn't find valid rooms
+                        logger.warning("Rules engine found no valid rooms, using fallback")
+                        room_id = await self._simple_room_selection(
+                            request.doctor_id,
+                            request.clinic_id,
+                            request.start_time,
+                            request.end_time
+                        )
+
+            except Exception as e:
+                logger.error(f"Room assignment failed, using fallback: {e}")
+                # Fallback to simple room selection
+                room_id = await self._simple_room_selection(
+                    request.doctor_id,
+                    request.clinic_id,
+                    request.start_time,
+                    request.end_time
+                )
+
+            # Phase 3: Create internal appointment record
             appointment_id = str(uuid.uuid4())
 
             appointment_data = {
@@ -187,6 +265,13 @@ class UnifiedAppointmentService:
                 'updated_at': datetime.now().isoformat()
             }
 
+            # Add room_id if assigned
+            if room_id:
+                appointment_data['room_id'] = room_id
+                logger.info(f"Appointment will be assigned to room {room_id}")
+            else:
+                logger.warning("Appointment created without room assignment")
+
             # Insert appointment
             result = self.supabase.table('appointments').insert(appointment_data).execute()
 
@@ -198,7 +283,7 @@ class UnifiedAppointmentService:
                     error="Failed to create appointment record"
                 )
 
-            # Phase 3: Confirm calendar events
+            # Phase 4: Confirm calendar events
             await self._confirm_calendar_events(hold_result.get('reservation_id'))
 
             # Log the appointment creation
@@ -431,6 +516,99 @@ class UnifiedAppointmentService:
             return []
 
     # Private helper methods
+
+    async def _get_available_rooms(
+        self,
+        doctor_id: str,
+        clinic_id: str,
+        start_time: datetime,
+        end_time: datetime
+    ) -> List[Dict[str, Any]]:
+        """
+        Get rooms available for the given time slot
+        Checks that rooms are not already booked during this time
+        """
+        try:
+            logger.debug(f"Getting available rooms for doctor {doctor_id} from {start_time} to {end_time}")
+
+            # Get all rooms for the clinic
+            rooms_result = self.supabase.table('rooms')\
+                .select('*')\
+                .eq('clinic_id', clinic_id)\
+                .execute()
+
+            if not rooms_result.data:
+                logger.warning(f"No rooms found for clinic {clinic_id}")
+                return []
+
+            available_rooms = []
+
+            # Check each room for availability
+            for room in rooms_result.data:
+                room_id = room['id']
+
+                # Check if room is already booked during this time slot
+                conflicts_result = self.supabase.table('appointments')\
+                    .select('id, start_time, end_time')\
+                    .eq('room_id', room_id)\
+                    .eq('appointment_date', start_time.date().isoformat())\
+                    .in_('status', ['scheduled', 'confirmed'])\
+                    .execute()
+
+                has_conflict = False
+                if conflicts_result.data:
+                    # Check for time overlap
+                    for appointment in conflicts_result.data:
+                        apt_start = datetime.fromisoformat(f"{start_time.date().isoformat()}T{appointment['start_time']}")
+                        apt_end = datetime.fromisoformat(f"{start_time.date().isoformat()}T{appointment['end_time']}")
+
+                        # Check for overlap: (start1 < end2) and (start2 < end1)
+                        if start_time < apt_end and apt_start < end_time:
+                            has_conflict = True
+                            break
+
+                if not has_conflict:
+                    available_rooms.append(room)
+                    logger.debug(f"Room {room_id} is available")
+                else:
+                    logger.debug(f"Room {room_id} has conflicts")
+
+            logger.info(f"Found {len(available_rooms)} available rooms")
+            return available_rooms
+
+        except Exception as e:
+            logger.error(f"Error getting available rooms: {e}")
+            return []
+
+    async def _simple_room_selection(
+        self,
+        doctor_id: str,
+        clinic_id: str,
+        start_time: datetime,
+        end_time: datetime
+    ) -> Optional[str]:
+        """
+        Simple room selection fallback without rules engine
+        Just finds the first available room
+        """
+        try:
+            logger.info("Using simple room selection fallback")
+
+            available_rooms = await self._get_available_rooms(
+                doctor_id, clinic_id, start_time, end_time
+            )
+
+            if available_rooms:
+                selected_room = available_rooms[0]
+                logger.info(f"Selected room {selected_room['id']} via simple selection")
+                return selected_room['id']
+            else:
+                logger.warning("No rooms available for simple selection")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error in simple room selection: {e}")
+            return None
 
     async def _check_slot_availability(
         self,

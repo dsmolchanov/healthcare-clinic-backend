@@ -1014,11 +1014,17 @@ class ExternalCalendarService:
             patient_name = appointment_data.get('patient_name', 'Unknown Patient')
             doctor_name = appointment_data.get('doctor_name', 'Doctor')
             appointment_type = appointment_data.get('appointment_type', 'Appointment')
+            room_number = appointment_data.get('room_number')
+            room_name = appointment_data.get('room_name')
 
-            # Summary: "Root Canal - John Doe with Dr. Smith"
+            # Summary: "Root Canal - John Doe with Dr. Smith - Room 201"
             summary = f"{appointment_type} - {patient_name}"
             if doctor_name and doctor_name != 'Doctor':
                 summary += f" with {doctor_name}"
+
+            # Add room to title if available
+            if room_number:
+                summary += f" - Room {room_number}"
 
             # Description: Include patient phone and notes
             description_parts = []
@@ -1030,6 +1036,15 @@ class ExternalCalendarService:
             if doctor_name and doctor_name != 'Doctor':
                 description_parts.append(f"Doctor: {doctor_name}")
 
+            # Add room information to description
+            if room_number or room_name:
+                room_info = "Room: "
+                if room_number:
+                    room_info += f"{room_number}"
+                if room_name:
+                    room_info += f" ({room_name})" if room_number else room_name
+                description_parts.append(room_info)
+
             if appointment_data.get('notes'):
                 description_parts.append(f"\nNotes: {appointment_data['notes']}")
 
@@ -1037,6 +1052,15 @@ class ExternalCalendarService:
                 description_parts.append(f"Reason: {appointment_data['reason_for_visit']}")
 
             description = "\n".join(description_parts)
+
+            # Build location string with room information
+            location = None
+            if room_number or room_name:
+                location = "Room "
+                if room_number:
+                    location += room_number
+                if room_name:
+                    location += f" ({room_name})" if room_number else room_name
 
             # Create calendar event
             event = {
@@ -1061,6 +1085,10 @@ class ExternalCalendarService:
                     }
                 }
             }
+
+            # Add location if room is specified
+            if location:
+                event['location'] = location
 
             # Get doctor's calendar (either sub-calendar or primary)
             target_calendar_id = await self._get_doctor_calendar(
@@ -1358,11 +1386,17 @@ class ExternalCalendarService:
             patient_name = appointment_data.get('patient_name', 'Unknown Patient')
             doctor_name = appointment_data.get('doctor_name', 'Doctor')
             appointment_type = appointment_data.get('appointment_type', 'Appointment')
+            room_number = appointment_data.get('room_number')
+            room_name = appointment_data.get('room_name')
 
-            # Summary: "Root Canal - John Doe with Dr. Smith"
+            # Summary: "Root Canal - John Doe with Dr. Smith - Room 201"
             summary = f"{appointment_type} - {patient_name}"
             if doctor_name and doctor_name != 'Doctor':
                 summary += f" with {doctor_name}"
+
+            # Add room to title if available
+            if room_number:
+                summary += f" - Room {room_number}"
 
             # Description: Include patient phone and notes
             description_parts = []
@@ -1374,6 +1408,15 @@ class ExternalCalendarService:
             if doctor_name and doctor_name != 'Doctor':
                 description_parts.append(f"Doctor: {doctor_name}")
 
+            # Add room information to description
+            if room_number or room_name:
+                room_info = "Room: "
+                if room_number:
+                    room_info += f"{room_number}"
+                if room_name:
+                    room_info += f" ({room_name})" if room_number else room_name
+                description_parts.append(room_info)
+
             if appointment_data.get('notes'):
                 description_parts.append(f"\nNotes: {appointment_data['notes']}")
 
@@ -1381,6 +1424,15 @@ class ExternalCalendarService:
                 description_parts.append(f"Reason: {appointment_data['reason_for_visit']}")
 
             description = "\n".join(description_parts)
+
+            # Build location string with room information
+            location = None
+            if room_number or room_name:
+                location = "Room "
+                if room_number:
+                    location += room_number
+                if room_name:
+                    location += f" ({room_name})" if room_number else room_name
 
             # Update event data
             event_update = {
@@ -1405,6 +1457,10 @@ class ExternalCalendarService:
                     }
                 }
             }
+
+            # Add location if room is specified
+            if location:
+                event_update['location'] = location
 
             # Get doctor's calendar (either sub-calendar or primary)
             target_calendar_id = await self._get_doctor_calendar(
