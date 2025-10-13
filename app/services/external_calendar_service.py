@@ -91,6 +91,71 @@ class ExternalCalendarService:
         self.vault = ComplianceVault() if VAULT_AVAILABLE else None
         self.hold_duration = timedelta(minutes=5)  # Calendar hold duration
 
+    async def _ensure_fresh_credentials(
+        self,
+        clinic_id: str,
+        organization_id: str,
+        provider: str = 'google'
+    ) -> Dict[str, Any]:
+        """
+        Retrieve credentials from vault and refresh if expired
+
+        Args:
+            clinic_id: Clinic ID
+            organization_id: Organization ID
+            provider: Calendar provider ('google' or 'outlook')
+
+        Returns:
+            Fresh, valid credentials
+        """
+        # Get credentials from vault
+        credentials = await self.vault.retrieve_calendar_credentials(
+            organization_id=organization_id,
+            provider=provider
+        )
+
+        if not credentials:
+            raise ValueError(f"No credentials found for provider {provider}")
+
+        # Check if token is expired or will expire soon (within 5 minutes)
+        if 'expires_at' in credentials:
+            try:
+                expires_at = datetime.fromisoformat(credentials['expires_at'])
+                buffer_time = timedelta(minutes=5)
+
+                if expires_at < (datetime.utcnow() + buffer_time):
+                    logger.info(f"Token expired or expiring soon for clinic {clinic_id}, refreshing...")
+
+                    # Import OAuthManager to refresh token
+                    from app.calendar.oauth_manager import OAuthManager
+                    oauth = OAuthManager()
+
+                    # Refresh the token
+                    if provider == 'google':
+                        refresh_success = await oauth.refresh_google_token(clinic_id, provider)
+                    elif provider == 'outlook':
+                        refresh_success = await oauth.refresh_outlook_token(clinic_id)
+                    else:
+                        logger.warning(f"Unknown provider {provider}, cannot refresh token")
+                        refresh_success = False
+
+                    if refresh_success:
+                        # Re-fetch the refreshed credentials
+                        credentials = await self.vault.retrieve_calendar_credentials(
+                            organization_id=organization_id,
+                            provider=provider
+                        )
+                        logger.info(f"Successfully refreshed token for clinic {clinic_id}")
+                    else:
+                        logger.error(f"Failed to refresh token for clinic {clinic_id}")
+                        raise ValueError(f"Token refresh failed for provider {provider}")
+
+            except Exception as e:
+                logger.warning(f"Error checking token expiration: {e}")
+                # Continue with existing credentials if expiration check fails
+
+        return credentials
+
     async def ask_hold_reserve(
         self,
         doctor_id: str,
@@ -895,8 +960,9 @@ class ExternalCalendarService:
                 logger.error(f"No vault reference found for clinic {clinic_id}")
                 return {'success': False, 'error': 'Missing credentials vault reference'}
 
-            # Get credentials from vault
-            calendar_credentials = await self.vault.retrieve_calendar_credentials(
+            # Get credentials from vault (with automatic refresh if expired)
+            calendar_credentials = await self._ensure_fresh_credentials(
+                clinic_id=clinic_id,
                 organization_id=calendar_integration.get('organization_id'),
                 provider='google'
             )
@@ -1124,8 +1190,9 @@ class ExternalCalendarService:
                 logger.error(f"No vault reference found for clinic {clinic_id}")
                 return {'success': False, 'error': 'Missing credentials vault reference'}
 
-            # Get credentials from vault
-            calendar_credentials = await self.vault.retrieve_calendar_credentials(
+            # Get credentials from vault (with automatic refresh if expired)
+            calendar_credentials = await self._ensure_fresh_credentials(
+                clinic_id=clinic_id,
                 organization_id=calendar_integration.get('organization_id'),
                 provider='google'
             )
@@ -1477,8 +1544,9 @@ class ExternalCalendarService:
 
             integration = integration_result.data[0]
 
-            # Get credentials from vault
-            credentials_data = await self.vault.retrieve_calendar_credentials(
+            # Get credentials from vault (with automatic refresh if expired)
+            credentials_data = await self._ensure_fresh_credentials(
+                clinic_id=clinic_id,
                 organization_id=integration['organization_id'],
                 provider='google'
             )

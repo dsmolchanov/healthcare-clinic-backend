@@ -383,12 +383,12 @@ class ComplianceVault:
             'organization_id': organization_id,
             'event_type': f'secret_{action}',
             'event_category': 'security_event',
-            'actor_id': user_id,
             'actor_type': 'user' if user_id else 'system',
             'event_data': {
                 'secret_type': secret_type,
                 'action': action,
-                'timestamp': datetime.utcnow().isoformat()
+                'timestamp': datetime.utcnow().isoformat(),
+                'user_id': user_id  # Store in event_data instead
             },
             'resource_type': 'secret',
             'resource_id': secret_type,
@@ -401,6 +401,9 @@ class ComplianceVault:
                 'action': action
             })
         }
+
+        # Only include actor_id if table supports it (optional field)
+        # Removed from top-level to avoid schema mismatch - stored in event_data instead
 
         self.supabase.table('audit_logs').insert(audit_entry).execute()
 

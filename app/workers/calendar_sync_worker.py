@@ -20,12 +20,13 @@ class CalendarSyncWorker:
     Runs periodically to catch any appointments that failed to sync
     """
 
-    def __init__(self, interval_minutes: int = 15):
+    def __init__(self, interval_minutes: int = 60):
         """
         Initialize calendar sync worker
 
         Args:
-            interval_minutes: How often to run sync (default 15 minutes)
+            interval_minutes: How often to run sync (default 60 minutes)
+                             Reduced from 15 since webhooks handle real-time sync
         """
         self.supabase = get_supabase_client()
         self.calendar_service = ExternalCalendarService()
