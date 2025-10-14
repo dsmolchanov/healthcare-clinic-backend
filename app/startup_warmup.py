@@ -11,7 +11,7 @@ This ensures the first user request gets cached data, not DB queries.
 
 import logging
 import asyncio
-from typing import List
+from typing import List, Optional, Dict, Any
 from app.db.supabase_client import get_supabase_client
 from app.config import get_redis_client
 from app.services.clinic_data_cache import ClinicDataCache
@@ -120,6 +120,83 @@ async def warmup_organization_data(organization_id: str):
 
     except Exception as e:
         logger.error(f"Failed to warm organization {organization_id}: {e}")
+
+
+async def warmup_mem0_vector_indices(
+    clinic_ids: Optional[List[str]] = None,
+    *,
+    force: bool = False,
+    throttle_ms: int = 50
+) -> Dict[str, Any]:
+    """Enqueue mem0 warmups for active clinics to avoid cold starts."""
+
+    summary: Dict[str, Any] = {
+        "scheduled": 0,
+        "total": 0,
+        "available": False,
+        "results": {},
+        "force": force,
+    }
+
+    try:
+        from app.memory.conversation_memory import get_memory_manager
+        mem_manager = get_memory_manager()
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.warning(f"mem0 warmup unavailable (manager init failed): {exc}")
+        summary["error"] = str(exc)
+        return summary
+
+    # Attempt to initialize mem0 once before scheduling jobs
+    try:
+        mem_manager._ensure_mem0_initialized()
+    except Exception as exc:  # pragma: no cover - safety against unexpected failure
+        logger.warning(f"mem0 initialization during warmup failed: {exc}")
+
+    if clinic_ids is None:
+        try:
+            supabase = get_supabase_client()
+            result = supabase.table('clinics').select('id').eq('is_active', True).execute()
+            clinic_ids = [row['id'] for row in (result.data or []) if row.get('id')]
+        except Exception as exc:
+            logger.warning(f"Unable to fetch clinics for mem0 warmup: {exc}")
+            summary["error"] = f"clinic_lookup_failed: {exc}"
+            clinic_ids = []
+
+    clinic_ids = clinic_ids or []
+    summary["total"] = len(clinic_ids)
+
+    if not mem_manager.mem0_available or not mem_manager.memory:
+        logger.info("Skipping mem0 warmup scheduler: mem0 not available")
+        summary["available"] = False
+        return summary
+
+    if not clinic_ids:
+        logger.info("No clinics available for mem0 warmup")
+        summary["available"] = mem_manager.mem0_available
+        return summary
+
+    results = await mem_manager.warmup_multiple_clinics(
+        clinic_ids,
+        force=force,
+        throttle_ms=throttle_ms
+    )
+
+    scheduled = sum(1 for ok in results.values() if ok)
+
+    summary.update({
+        "scheduled": scheduled,
+        "available": mem_manager.mem0_available,
+        "results": results,
+    })
+
+    logger.info(
+        "mem0 warmup scheduled for %s/%s clinics (force=%s)",
+        scheduled,
+        len(clinic_ids),
+        force,
+    )
+
+    return summary
 
 
 def warmup_all_clinics_sync():

@@ -183,6 +183,25 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Failed to warm up Redis cache: {e}")
         # Don't fail startup, caching will happen on first request
 
+    try:
+        from app.startup_warmup import warmup_mem0_vector_indices
+        mem0_timeout = float(os.getenv("MEM0_WARMUP_TIMEOUT_SECONDS", "6"))
+        summary = await asyncio.wait_for(
+            warmup_mem0_vector_indices(throttle_ms=75),
+            timeout=mem0_timeout
+        )
+        app.state.mem0_warmup_summary = summary
+        logger.info(
+            "✅ mem0 warmup scheduled %s/%s clinics (force=%s)",
+            summary.get("scheduled"),
+            summary.get("total"),
+            summary.get("force"),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("mem0 warmup scheduling timed out after %.1fs; continuing startup", mem0_timeout)
+    except Exception as e:
+        logger.warning(f"Failed to warm up mem0 indices: {e}")
+
     yield
 
     # Shutdown

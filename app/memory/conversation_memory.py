@@ -7,7 +7,7 @@ import os
 import json
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, TYPE_CHECKING, Set
+from typing import Dict, Any, List, Optional, TYPE_CHECKING, Set, Iterable
 from supabase import create_client, Client
 import logging
 import asyncio
@@ -346,12 +346,12 @@ class ConversationMemoryManager:
         except Exception as exc:
             logger.warning(f"Failed to update metadata for message {message_id}: {exc}")
 
-    async def _enqueue_mem0_job(self, job: Dict[str, Any]):
+    async def _enqueue_mem0_job(self, job: Dict[str, Any]) -> bool:
         """Submit a mem0 job to be processed asynchronously."""
         self._ensure_mem0_initialized()
 
         if not self.mem0_available or not self.memory:
-            return
+            return False
 
         queue = self._get_mem0_queue()
         await self._ensure_mem0_worker()
@@ -359,22 +359,62 @@ class ConversationMemoryManager:
         try:
             queue.put_nowait(job)
             await self.mem0_metrics.record_enqueue(queue.qsize())
+            return True
         except asyncio.QueueFull:
             logger.warning("mem0 write queue is full, dropping job")
             await self.mem0_metrics.record_enqueue(queue.qsize())
+            return False
 
-    async def _schedule_mem0_warmup(self, clinic_id: Optional[str], phone_number: str):
+    async def _schedule_mem0_warmup(self, clinic_id: Optional[str], phone_number: str, *, force: bool = False) -> bool:
         """Kick off a mem0 warmup for a clinic once per process."""
-        if not clinic_id or clinic_id in self._mem0_warmup_clinics:
-            return
+        if not clinic_id:
+            return False
 
-        self._mem0_warmup_clinics.add(clinic_id)
+        if force:
+            self._mem0_warmup_clinics.discard(clinic_id)
 
-        await self._enqueue_mem0_job({
+        if clinic_id in self._mem0_warmup_clinics:
+            return False
+
+        enqueued = await self._enqueue_mem0_job({
             'type': 'warmup',
             'clinic_id': clinic_id,
             'phone_number': phone_number
         })
+
+        if enqueued:
+            self._mem0_warmup_clinics.add(clinic_id)
+            logger.info(f"Scheduled mem0 warmup for clinic {clinic_id}")
+            return True
+
+        logger.debug(f"Skipped mem0 warmup for clinic {clinic_id} (mem0 unavailable or queue full)")
+        return False
+
+    async def warmup_clinic_memory(self, clinic_id: str, *, force: bool = False, synthetic_phone: str = "warmup_probe") -> bool:
+        """Public helper to enqueue a synthetic warmup for a clinic."""
+        synthetic = synthetic_phone or "warmup_probe"
+        return await self._schedule_mem0_warmup(clinic_id, synthetic, force=force)
+
+    async def warmup_multiple_clinics(
+        self,
+        clinic_ids: Iterable[str],
+        *,
+        force: bool = False,
+        throttle_ms: int = 0
+    ) -> Dict[str, bool]:
+        """Schedule warmups for many clinics, optionally forcing re-run."""
+
+        results: Dict[str, bool] = {}
+        delay = max(throttle_ms, 0) / 1000.0
+
+        for clinic_id in clinic_ids:
+            success = await self.warmup_clinic_memory(clinic_id, force=force)
+            results[clinic_id] = success
+
+            if delay and success:
+                await asyncio.sleep(delay)
+
+        return results
 
     async def schedule_mem0_message_update(
         self,
