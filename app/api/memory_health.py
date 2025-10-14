@@ -40,6 +40,12 @@ async def memory_health_check() -> Dict[str, Any]:
             health["mem0"]["error"] = str(e)
             logger.error(f"mem0 health check failed: {e}")
 
+        # Include queue metrics snapshot
+        try:
+            health["mem0"]["queue_metrics"] = await manager.get_mem0_metrics_snapshot()
+        except Exception as e:
+            logger.warning(f"Failed to fetch mem0 metrics: {e}")
+
     # Test Supabase connectivity
     try:
         # Simple query to test connection
@@ -101,3 +107,14 @@ async def get_memory_stats(phone_number: str) -> Dict[str, Any]:
         stats["supabase_error"] = str(e)
 
     return stats
+
+
+@router.get("/metrics/queue")
+async def get_mem0_queue_metrics() -> Dict[str, Any]:
+    """Expose mem0 queue metrics for dashboards."""
+
+    manager = get_memory_manager()
+    if not manager.mem0_available:
+        raise HTTPException(status_code=503, detail="mem0 not available")
+
+    return await manager.get_mem0_metrics_snapshot()

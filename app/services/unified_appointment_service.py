@@ -17,6 +17,8 @@ from .external_calendar_service import ExternalCalendarService
 from .websocket_manager import websocket_manager, NotificationType
 from .rule_evaluator import RuleEvaluator, EvaluationContext, TimeSlot as RuleTimeSlot
 from .policy_cache import PolicyCache
+from ..database import get_db_connection
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
@@ -173,114 +175,190 @@ class UnifiedAppointmentService:
                     conflicts=hold_result.get('conflicts', [])
                 )
 
-            # Phase 2: Room Auto-Assignment
-            room_id = None
-            try:
-                logger.info("Starting room auto-assignment")
-
-                # Get available rooms for the time slot
-                available_rooms = await self._get_available_rooms(
-                    request.doctor_id,
-                    request.clinic_id,
-                    request.start_time,
-                    request.end_time
-                )
-
-                if not available_rooms:
-                    logger.warning("No available rooms found")
-                    # Could either fail or allow booking without room
-                    # For now, we'll allow it but log a warning
-                else:
-                    # Create evaluation context
-                    context = EvaluationContext(
-                        clinic_id=request.clinic_id,
-                        patient_id=request.patient_id,
-                        requested_service=request.appointment_type.value
-                    )
-
-                    # Score each available room
-                    scored_slots = []
-                    for room in available_rooms:
-                        # Create a TimeSlot for rules evaluation
-                        slot = RuleTimeSlot(
-                            id=str(uuid.uuid4()),
-                            doctor_id=request.doctor_id,
-                            room_id=room['id'],
-                            service_id=request.appointment_type.value,
-                            start_time=request.start_time,
-                            end_time=request.end_time
-                        )
-
-                        # Evaluate the slot
-                        result = await self.rule_evaluator.evaluate_slot(context, slot)
-
-                        if result.is_valid:
-                            scored_slots.append((room, result.score))
-                            logger.debug(f"Room {room['id']} scored {result.score}")
-                        else:
-                            logger.debug(f"Room {room['id']} invalid: {result.explanations}")
-
-                    # Select the room with the highest score
-                    if scored_slots:
-                        best_room, best_score = max(scored_slots, key=lambda x: x[1])
-                        room_id = best_room['id']
-                        logger.info(f"Selected room {room_id} with score {best_score}")
-                    else:
-                        # Fallback to simple selection if rules engine didn't find valid rooms
-                        logger.warning("Rules engine found no valid rooms, using fallback")
-                        room_id = await self._simple_room_selection(
-                            request.doctor_id,
-                            request.clinic_id,
-                            request.start_time,
-                            request.end_time
-                        )
-
-            except Exception as e:
-                logger.error(f"Room assignment failed, using fallback: {e}")
-                # Fallback to simple room selection
-                room_id = await self._simple_room_selection(
-                    request.doctor_id,
-                    request.clinic_id,
-                    request.start_time,
-                    request.end_time
-                )
-
-            # Phase 3: Create internal appointment record
+            # Phase 2 & 3: Room assignment + Create appointment (wrapped in transaction)
             appointment_id = str(uuid.uuid4())
+            room_id = None
 
-            appointment_data = {
-                'id': appointment_id,
-                'clinic_id': request.clinic_id,
-                'patient_id': request.patient_id,
-                'doctor_id': request.doctor_id,
-                'appointment_date': request.start_time.date().isoformat(),
-                'start_time': request.start_time.time().isoformat(),
-                'end_time': request.end_time.time().isoformat(),
-                'status': AppointmentStatus.SCHEDULED.value,
-                'appointment_type': request.appointment_type.value,
-                'reason': request.reason or '',
-                'notes': request.notes or '',
-                'reservation_id': hold_result.get('reservation_id'),
-                'created_at': datetime.now().isoformat(),
-                'updated_at': datetime.now().isoformat()
-            }
+            try:
+                # Use database transaction with row-level locking to prevent race conditions
+                async with get_db_connection() as conn:
+                    if conn is None:
+                        # Fallback to non-transactional mode if no connection pool
+                        logger.warning("No database connection pool available, using non-transactional mode")
+                        raise Exception("Database connection unavailable")
 
-            # Add room_id if assigned
-            if room_id:
-                appointment_data['room_id'] = room_id
-                logger.info(f"Appointment will be assigned to room {room_id}")
-            else:
-                logger.warning("Appointment created without room assignment")
+                    async with conn.transaction():
+                        # Lock doctor row to prevent double-booking (RC1 fix)
+                        doctor_lock = await conn.fetchrow(
+                            """
+                            SELECT id FROM healthcare.doctors
+                            WHERE id = $1
+                            FOR UPDATE
+                            """,
+                            uuid.UUID(request.doctor_id)
+                        )
 
-            # Insert appointment
-            result = self.supabase.table('appointments').insert(appointment_data).execute()
+                        if not doctor_lock:
+                            raise Exception(f"Doctor {request.doctor_id} not found")
 
-            if not result.data:
+                        logger.debug(f"Acquired lock on doctor {request.doctor_id}")
+
+                        # Check for conflicting appointments (even with constraint, we check for better error messages)
+                        conflict_check = await conn.fetchrow(
+                            """
+                            SELECT id FROM healthcare.appointments
+                            WHERE doctor_id = $1
+                            AND appointment_date = $2
+                            AND status NOT IN ('cancelled')
+                            AND (
+                                (start_time, end_time) OVERLAPS ($3::time, $4::time)
+                            )
+                            LIMIT 1
+                            """,
+                            uuid.UUID(request.doctor_id),
+                            request.start_time.date(),
+                            request.start_time.time(),
+                            request.end_time.time()
+                        )
+
+                        if conflict_check:
+                            raise Exception(f"Doctor is already booked during this time slot")
+
+                        # Phase 2: Room Auto-Assignment with locking
+                        logger.info("Starting room auto-assignment within transaction")
+
+                        # Get available rooms with locking
+                        available_rooms_rows = await conn.fetch(
+                            """
+                            SELECT r.id, r.room_number, r.room_name, r.room_type,
+                                   r.equipment, r.capacity, r.is_available
+                            FROM healthcare.rooms r
+                            WHERE r.clinic_id = $1
+                            AND r.is_available = true
+                            AND NOT EXISTS (
+                                SELECT 1 FROM healthcare.appointments a
+                                WHERE a.room_id = r.id
+                                AND a.appointment_date = $2
+                                AND a.status NOT IN ('cancelled')
+                                AND (a.start_time, a.end_time) OVERLAPS ($3::time, $4::time)
+                            )
+                            FOR UPDATE OF r
+                            """,
+                            uuid.UUID(request.clinic_id),
+                            request.start_time.date(),
+                            request.start_time.time(),
+                            request.end_time.time()
+                        )
+
+                        if not available_rooms_rows:
+                            logger.warning("No available rooms found")
+                        else:
+                            # Convert rows to dict for compatibility with scoring logic
+                            available_rooms = [dict(row) for row in available_rooms_rows]
+
+                            # Create evaluation context
+                            context = EvaluationContext(
+                                clinic_id=request.clinic_id,
+                                patient_id=request.patient_id,
+                                requested_service=request.appointment_type.value
+                            )
+
+                            # Score each available room
+                            scored_slots = []
+                            for room in available_rooms:
+                                # Create a TimeSlot for rules evaluation
+                                slot = RuleTimeSlot(
+                                    id=str(uuid.uuid4()),
+                                    doctor_id=request.doctor_id,
+                                    room_id=str(room['id']),
+                                    service_id=request.appointment_type.value,
+                                    start_time=request.start_time,
+                                    end_time=request.end_time
+                                )
+
+                                # Evaluate the slot
+                                result = await self.rule_evaluator.evaluate_slot(context, slot)
+
+                                if result.is_valid:
+                                    scored_slots.append((room, result.score))
+                                    logger.debug(f"Room {room['id']} scored {result.score}")
+                                else:
+                                    logger.debug(f"Room {room['id']} invalid: {result.explanations}")
+
+                            # Select the room with the highest score
+                            if scored_slots:
+                                best_room, best_score = max(scored_slots, key=lambda x: x[1])
+                                room_id = str(best_room['id'])
+                                logger.info(f"Selected room {room_id} with score {best_score}")
+                            else:
+                                logger.warning("Rules engine found no valid rooms")
+
+                        # Phase 3: Insert appointment within transaction
+                        appointment_insert = await conn.execute(
+                            """
+                            INSERT INTO healthcare.appointments (
+                                id, clinic_id, patient_id, doctor_id,
+                                appointment_date, start_time, end_time,
+                                status, appointment_type, reason, notes,
+                                reservation_id, room_id, created_at, updated_at
+                            )
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                            """,
+                            uuid.UUID(appointment_id),
+                            uuid.UUID(request.clinic_id),
+                            uuid.UUID(request.patient_id),
+                            uuid.UUID(request.doctor_id),
+                            request.start_time.date(),
+                            request.start_time.time(),
+                            request.end_time.time(),
+                            AppointmentStatus.SCHEDULED.value,
+                            request.appointment_type.value,
+                            request.reason or '',
+                            request.notes or '',
+                            hold_result.get('reservation_id'),
+                            uuid.UUID(room_id) if room_id else None,
+                            datetime.now(),
+                            datetime.now()
+                        )
+
+                        logger.info(f"Appointment {appointment_id} created successfully in transaction")
+                        if room_id:
+                            logger.info(f"Appointment assigned to room {room_id}")
+
+                # Transaction committed successfully
+                # Build appointment data for response and WebSocket broadcast
+                appointment_data = {
+                    'id': appointment_id,
+                    'clinic_id': request.clinic_id,
+                    'patient_id': request.patient_id,
+                    'doctor_id': request.doctor_id,
+                    'appointment_date': request.start_time.date().isoformat(),
+                    'start_time': request.start_time.time().isoformat(),
+                    'end_time': request.end_time.time().isoformat(),
+                    'status': AppointmentStatus.SCHEDULED.value,
+                    'appointment_type': request.appointment_type.value,
+                    'reason': request.reason or '',
+                    'notes': request.notes or '',
+                    'reservation_id': hold_result.get('reservation_id'),
+                    'room_id': room_id,
+                    'created_at': datetime.now().isoformat(),
+                    'updated_at': datetime.now().isoformat()
+                }
+
+            except asyncpg.UniqueViolationError as e:
+                logger.error(f"Unique constraint violation (double-booking prevented): {e}")
+                await self._rollback_calendar_hold(hold_result.get('reservation_id'))
+                return AppointmentResult(
+                    success=False,
+                    error="This time slot is no longer available (double-booking prevented)"
+                )
+            except Exception as e:
+                logger.error(f"Failed to create appointment in transaction: {e}")
                 # Rollback the calendar hold
                 await self._rollback_calendar_hold(hold_result.get('reservation_id'))
                 return AppointmentResult(
                     success=False,
-                    error="Failed to create appointment record"
+                    error=f"Failed to create appointment: {str(e)}"
                 )
 
             # Phase 4: Confirm calendar events

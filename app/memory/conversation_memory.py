@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional, TYPE_CHECKING, Set
 from supabase import create_client, Client
 import logging
 import asyncio
+from time import perf_counter
 
 if TYPE_CHECKING:
     import asyncio
@@ -20,6 +21,8 @@ try:
 except ImportError:
     MEM0_AVAILABLE = False
     Memory = None
+
+from app.memory.mem0_metrics import get_mem0_metrics_recorder
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,8 @@ class ConversationMemoryManager:
         self._mem0_write_queue: Optional[asyncio.Queue] = None
         self._mem0_worker_task: Optional[asyncio.Task] = None
         self._mem0_warmup_clinics: Set[str] = set()
+        self.mem0_metrics = get_mem0_metrics_recorder()
+        self._last_metrics_snapshot: float = 0.0
 
         if not MEM0_AVAILABLE:
             logger.info("mem0 not installed, using Supabase for memory storage")
@@ -223,8 +228,9 @@ class ConversationMemoryManager:
         """Background worker that flushes mem0 operations off the critical path."""
         while True:
             job = await queue.get()
+            job_type = job.get('type', 'unknown')
+            start = perf_counter()
             try:
-                job_type = job.get('type')
                 if job_type == 'message':
                     await self._process_mem0_message_job(job)
                 elif job_type == 'turn':
@@ -237,6 +243,13 @@ class ConversationMemoryManager:
                 logger.error(f"mem0 worker job failed: {exc}", exc_info=True)
             finally:
                 queue.task_done()
+                latency_ms = (perf_counter() - start) * 1000.0
+                await self.mem0_metrics.record_job_complete(
+                    job_type=job_type,
+                    queue_size=queue.qsize(),
+                    latency_ms=latency_ms,
+                )
+                await self._persist_mem0_metrics_snapshot_if_needed()
 
     async def _process_mem0_message_job(self, job: Dict[str, Any]):
         """Persist a single message to mem0 and backfill Supabase metadata."""
@@ -345,8 +358,10 @@ class ConversationMemoryManager:
 
         try:
             queue.put_nowait(job)
+            await self.mem0_metrics.record_enqueue(queue.qsize())
         except asyncio.QueueFull:
             logger.warning("mem0 write queue is full, dropping job")
+            await self.mem0_metrics.record_enqueue(queue.qsize())
 
     async def _schedule_mem0_warmup(self, clinic_id: Optional[str], phone_number: str):
         """Kick off a mem0 warmup for a clinic once per process."""
@@ -963,8 +978,47 @@ class ConversationMemoryManager:
             
         except Exception as e:
             logger.warning(f"Error getting user preferences: {e}")
-        
+
         return preferences
+
+    async def _persist_mem0_metrics_snapshot_if_needed(self) -> None:
+        """Persist queue metrics to Supabase at most once per minute."""
+
+        # Avoid blocking the worker if Supabase is unavailable
+        try:
+            now = perf_counter()
+            if now - self._last_metrics_snapshot < 60:
+                return
+
+            snapshot = await self.mem0_metrics.snapshot()
+
+            payload = {
+                'current_queue_size': snapshot.get('current_queue_size'),
+                'max_queue_size': snapshot.get('max_queue_size'),
+                'processed_jobs_total': snapshot.get('processed_jobs_total'),
+                'job_type_counts': snapshot.get('job_type_counts', {}),
+                'average_latency_ms': snapshot.get('average_latency_ms'),
+                'last_job_latency_ms': snapshot.get('last_job_latency_ms'),
+                'latency_breach_count': snapshot.get('latency_breach_count'),
+            }
+
+            def _insert_snapshot():
+                return (
+                    self.supabase
+                    .table('mem0_metrics_snapshots')
+                    .insert(payload)
+                    .execute()
+                )
+
+            await asyncio.to_thread(_insert_snapshot)
+            self._last_metrics_snapshot = now
+        except Exception as exc:
+            logger.debug(f"Skipping metrics snapshot persistence: {exc}")
+
+    async def get_mem0_metrics_snapshot(self) -> Dict[str, Any]:
+        """Return current mem0 queue metrics snapshot."""
+
+        return await self.mem0_metrics.snapshot()
 
 # Singleton instance
 _memory_manager = None

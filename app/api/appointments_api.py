@@ -85,7 +85,7 @@ async def sync_appointment_to_google(appointment_id: str):
         logger.error(f"Instant sync error for {appointment_id}: {e}")
 
 # Create router
-router = APIRouter(prefix="/api/appointments", tags=["Appointments"])
+router = APIRouter(prefix="/api/v1/appointments", tags=["Appointments"])
 
 # Pydantic models for request/response
 
@@ -233,6 +233,7 @@ async def get_available_slots(
         logger.error(f"Failed to get available slots: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve available slots")
 
+@router.post("/", response_model=AppointmentResponse)
 @router.post("/book", response_model=AppointmentResponse)
 async def book_appointment(
     request: BookAppointmentRequest,
@@ -242,8 +243,8 @@ async def book_appointment(
     """
     Book a new appointment using the unified calendar-aware system
 
-    This endpoint replaces the existing /api/appointments/book endpoint
-    and integrates with external calendar coordination.
+    Available at both POST /api/v1/appointments and POST /api/v1/appointments/book
+    for backward compatibility.
     """
     try:
         # Convert request to internal format
@@ -555,7 +556,7 @@ class BatchAvailabilityResponse(BaseModel):
     date_range: Dict[str, str]
     cache_hit: bool = False
 
-@router.post("/api/v1/appointments/available-slots", response_model=BatchAvailabilityResponse)
+@router.post("/available-slots", response_model=BatchAvailabilityResponse)
 async def get_batch_availability_with_rooms(
     request: BatchAvailabilityRequest,
     service: UnifiedAppointmentService = Depends(get_appointment_service)
@@ -1007,51 +1008,95 @@ async def override_appointment_room(
         start_time = appointment.get('start_time')
         end_time = appointment.get('end_time')
 
-        # Query for conflicting appointments in the same room
-        conflicts = db.table("appointments") \
-            .select("id") \
-            .eq("room_id", request.room_id) \
-            .eq("appointment_date", appointment_date) \
-            .neq("id", appointment_id) \
-            .in_("status", ["scheduled", "confirmed", "checked_in", "in_progress"]) \
-            .execute()
+        # Store old room_id for audit log
+        old_room_id = appointment.get('room_id')
 
-        # Check for time overlaps
-        if conflicts.data:
-            for conflict in conflicts.data:
-                conflict_detail = db.table("appointments") \
-                    .select("start_time, end_time") \
-                    .eq("id", conflict['id']) \
-                    .single() \
-                    .execute()
+        # Use transaction with locking to prevent race conditions (RC4 fix)
+        from ..database import get_db_connection
+        import asyncpg as pg
 
-                if conflict_detail.data:
-                    conflict_start = conflict_detail.data['start_time']
-                    conflict_end = conflict_detail.data['end_time']
+        try:
+            async with get_db_connection() as conn:
+                if conn is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Database connection unavailable"
+                    )
 
-                    # Check for overlap
-                    if (start_time < conflict_end and end_time > conflict_start):
+                async with conn.transaction():
+                    # Lock the room row to prevent concurrent modifications
+                    room_lock = await conn.fetchrow(
+                        """
+                        SELECT id FROM healthcare.rooms
+                        WHERE id = $1
+                        FOR UPDATE
+                        """,
+                        UUID(request.room_id)
+                    )
+
+                    if not room_lock:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Room {request.room_id} not found during lock"
+                        )
+
+                    # Check for conflicting appointments with locking
+                    conflict_check = await conn.fetchrow(
+                        """
+                        SELECT id FROM healthcare.appointments
+                        WHERE room_id = $1
+                        AND appointment_date = $2
+                        AND id != $3
+                        AND status IN ('scheduled', 'confirmed', 'checked_in', 'in_progress')
+                        AND (start_time, end_time) OVERLAPS ($4::time, $5::time)
+                        LIMIT 1
+                        """,
+                        UUID(request.room_id),
+                        appointment_date,
+                        UUID(appointment_id),
+                        start_time,
+                        end_time
+                    )
+
+                    if conflict_check:
                         raise HTTPException(
                             status_code=409,
                             detail=f"Room {room.get('room_name', request.room_id)} is not available during the appointment time slot"
                         )
 
-        # Store old room_id for audit log
-        old_room_id = appointment.get('room_id')
+                    # Update appointment with new room within transaction
+                    update_result = await conn.execute(
+                        """
+                        UPDATE healthcare.appointments
+                        SET room_id = $1, updated_at = $2
+                        WHERE id = $3
+                        """,
+                        UUID(request.room_id),
+                        datetime.utcnow(),
+                        UUID(appointment_id)
+                    )
 
-        # Update appointment with new room
-        update_result = db.table("appointments") \
-            .update({
-                "room_id": request.room_id,
-                "updated_at": datetime.utcnow().isoformat()
-            }) \
-            .eq("id", appointment_id) \
-            .execute()
+                    if update_result != "UPDATE 1":
+                        raise HTTPException(
+                            status_code=500,
+                            detail="Failed to update appointment"
+                        )
 
-        if not update_result.data:
+                    # Transaction will commit here
+
+        except pg.UniqueViolationError as e:
+            logger.error(f"Unique constraint violation during room override: {e}")
+            raise HTTPException(
+                status_code=409,
+                detail="Room assignment conflict detected (prevented by database constraint)"
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Transaction failed during room override: {e}")
             raise HTTPException(
                 status_code=500,
-                detail="Failed to update appointment"
+                detail=f"Failed to update room assignment: {str(e)}"
             )
 
         updated_at = datetime.utcnow()
