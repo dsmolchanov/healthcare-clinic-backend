@@ -146,15 +146,85 @@ class ExternalCalendarService:
                             provider=provider
                         )
                         logger.info(f"Successfully refreshed token for clinic {clinic_id}")
+
+                        # Mark integration as active again
+                        await self._update_integration_status(clinic_id, provider, 'active')
                     else:
                         logger.error(f"Failed to refresh token for clinic {clinic_id}")
-                        raise ValueError(f"Token refresh failed for provider {provider}")
 
+                        # Check if this is a token revocation (vs temporary failure)
+                        # Token revocation requires user re-authorization
+                        error_msg = f"Token refresh failed for provider {provider}"
+                        await self._update_integration_status(
+                            clinic_id,
+                            provider,
+                            'token_revoked',
+                            error_msg
+                        )
+                        raise ValueError(error_msg)
+
+            except ValueError as e:
+                # ValueError is raised when refresh explicitly fails - propagate it
+                raise
             except Exception as e:
-                logger.warning(f"Error checking token expiration: {e}")
-                # Continue with existing credentials if expiration check fails
+                error_msg = str(e)
+                logger.warning(f"Error checking token expiration: {error_msg}")
+
+                # Check if this is a token revocation error
+                if 'invalid_grant' in error_msg.lower() or 'revoked' in error_msg.lower():
+                    logger.error(f"Token revoked for clinic {clinic_id}, marking for re-authorization")
+                    await self._update_integration_status(
+                        clinic_id,
+                        provider,
+                        'token_revoked',
+                        error_msg
+                    )
+                    raise ValueError(f"Calendar integration requires re-authorization: {error_msg}")
+
+                # For other errors, mark as token_expired and continue with existing credentials
+                # This allows the sync to proceed with potentially valid credentials
+                await self._update_integration_status(
+                    clinic_id,
+                    provider,
+                    'token_expired',
+                    error_msg
+                )
 
         return credentials
+
+    async def _update_integration_status(
+        self,
+        clinic_id: str,
+        provider: str,
+        status: str,
+        error_message: Optional[str] = None
+    ):
+        """
+        Update integration status in database
+
+        Args:
+            clinic_id: Clinic ID
+            provider: Calendar provider
+            status: New status ('active', 'token_expired', 'token_revoked', 'disconnected')
+            error_message: Optional error message
+        """
+        try:
+            update_data = {
+                'integration_status': status,
+                'last_error': error_message,
+                'last_error_at': datetime.utcnow().isoformat() if error_message else None
+            }
+
+            # Update calendar_integrations table
+            self.supabase.table('calendar_integrations').update(update_data).eq(
+                'clinic_id', clinic_id
+            ).eq('provider', provider).execute()
+
+            logger.info(f"Updated integration status for clinic {clinic_id} ({provider}): {status}")
+
+        except Exception as e:
+            logger.error(f"Failed to update integration status: {e}")
+            # Don't fail the main operation if status update fails
 
     async def ask_hold_reserve(
         self,

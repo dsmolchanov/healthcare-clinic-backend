@@ -73,6 +73,25 @@ async def _bulk_sync_task(
     try:
         calendar_service = ExternalCalendarService()
 
+        # Check integration status first - skip if token is revoked
+        try:
+            integration_result = calendar_service.supabase.table('calendar_integrations').select(
+                'integration_status, last_error, provider'
+            ).eq('clinic_id', clinic_id).execute()
+
+            if integration_result.data:
+                integration = integration_result.data[0]
+                if integration.get('integration_status') == 'token_revoked':
+                    logger.warning(
+                        f"Skipping bulk sync for clinic {clinic_id}: "
+                        f"Calendar integration requires re-authorization. "
+                        f"Error: {integration.get('last_error')}"
+                    )
+                    return
+        except Exception as e:
+            logger.warning(f"Could not check integration status: {e}")
+            # Continue with sync attempt
+
         # Get unsynced appointments
         result = calendar_service.supabase.rpc('get_unsynced_appointments', {
             'p_clinic_id': clinic_id,
@@ -95,6 +114,19 @@ async def _bulk_sync_task(
                 if sync_result.get('success'):
                     synced_count += 1
                 else:
+                    failed_count += 1
+            except ValueError as e:
+                error_msg = str(e).lower()
+                # Check if this is a token revocation error
+                if 're-authorization' in error_msg or 'token_revoked' in error_msg:
+                    logger.error(
+                        f"Token revoked during bulk sync for clinic {clinic_id}. "
+                        f"Stopping sync. {failed_count + 1} appointments failed, {synced_count} succeeded."
+                    )
+                    failed_count += 1
+                    break  # Stop syncing remaining appointments
+                else:
+                    logger.error(f"Failed to sync appointment {appointment['id']}: {e}")
                     failed_count += 1
             except Exception as e:
                 logger.error(f"Failed to sync appointment {appointment['id']}: {e}")
