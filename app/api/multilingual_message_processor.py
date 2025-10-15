@@ -118,7 +118,8 @@ class MultilingualMessageProcessor:
 
         # Initialize async message logger (combined RPC for conversation + metrics)
         from app.api.async_message_logger import AsyncMessageLogger
-        self.message_logger = AsyncMessageLogger(get_supabase_client())
+        strict_logging = os.getenv("CONVERSATION_LOG_FAIL_FAST", "false").lower() == "true"
+        self.message_logger = AsyncMessageLogger(get_supabase_client(), strict=strict_logging)
 
         # Initialize response analyzer for conversation turn tracking
         from app.services.response_analyzer import ResponseAnalyzer

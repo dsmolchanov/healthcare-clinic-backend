@@ -4,6 +4,7 @@ Replaces multiple database calls with one optimized transaction
 """
 
 import logging
+import os
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from supabase import Client
@@ -21,8 +22,13 @@ class AsyncMessageLogger:
     Performance: ~10ms (vs ~55ms for 3 separate calls)
     """
 
-    def __init__(self, supabase: Client):
+    def __init__(self, supabase: Client, strict: Optional[bool] = None):
         self.supabase = supabase
+        self.strict_logging = (
+            strict
+            if strict is not None
+            else os.getenv("CONVERSATION_LOG_FAIL_FAST", "false").lower() == "true"
+        )
 
     async def log_message_with_metrics(
         self,
@@ -149,21 +155,37 @@ class AsyncMessageLogger:
 
             # Single RPC call - writes to all 3 tables in one transaction
             response = self.supabase.rpc('log_message_with_metrics', params).execute()
+            rpc_payload = getattr(response, "data", None)
 
-            if response.data:
-                result = response.data
-                logger.info(
-                    "✅ Message logged successfully (id: %s) in %dms",
-                    result.get('message_id'),
-                    result.get('processing_time_ms', 0)
-                )
-                return result
-            else:
-                logger.error("❌ Failed to log message: No data returned")
-                return {'success': False, 'error': 'No data returned'}
+            if not isinstance(rpc_payload, dict):
+                logger.error("❌ Failed to log message: Unexpected response payload %s", rpc_payload)
+                failure = {
+                    'success': False,
+                    'error': 'Unexpected response payload',
+                    'payload': rpc_payload
+                }
+                if self.strict_logging:
+                    raise RuntimeError("log_message_with_metrics returned unexpected payload")
+                return failure
+
+            if not rpc_payload.get('success', False):
+                error_message = rpc_payload.get('error') or 'Unknown failure from log_message_with_metrics'
+                logger.error("❌ Failed to log message: %s", error_message)
+                if self.strict_logging:
+                    raise RuntimeError(f"log_message_with_metrics failed: {error_message}")
+                return rpc_payload
+
+            logger.info(
+                "✅ Message logged successfully (id: %s) in %dms",
+                rpc_payload.get('message_id'),
+                rpc_payload.get('processing_time_ms', 0)
+            )
+            return rpc_payload
 
         except Exception as e:
             logger.error("❌ Error logging message: %s", e, exc_info=True)
+            if self.strict_logging:
+                raise
             return {'success': False, 'error': str(e)}
 
     async def get_conversation_messages(
@@ -239,7 +261,7 @@ AFTER (single combined RPC - fast):
 
 from app.api.async_message_logger import AsyncMessageLogger
 
-logger = AsyncMessageLogger(supabase)
+logger = AsyncMessageLogger(supabase, strict=False)
 
 # 1. Log user message
 await logger.log_message_with_metrics(
@@ -297,7 +319,7 @@ class MultilingualMessageProcessor:
 
     def __init__(self, supabase: Client):
         self.supabase = supabase
-        self.message_logger = AsyncMessageLogger(supabase)
+        self.message_logger = AsyncMessageLogger(supabase, strict=False)
 
     async def process_message(
         self,

@@ -74,6 +74,7 @@ class ConversationMemoryManager:
         self._last_metrics_snapshot: float = 0.0
         self._mem0_lookup_cache: Dict[tuple[str, str], tuple[float, List[str]]] = {}
         self._mem0_lookup_cache_ttl = max(int(os.getenv("MEM0_LOOKUP_CACHE_TTL_SECONDS", "75")), 0)
+        self.strict_logging = os.getenv("CONVERSATION_LOG_FAIL_FAST", "false").lower() == "true"
 
         if not MEM0_AVAILABLE:
             logger.info("mem0 not installed, using Supabase for memory storage")
@@ -736,10 +737,23 @@ class ConversationMemoryManager:
                     'p_log_platform_events': False  # No events for simple message store
                 }).execute()
 
-                # Extract message_id from RPC response
-                if result.data:
-                    msg_id = result.data.get('message_id')
-                    message_id_container[0] = msg_id
+                rpc_payload = getattr(result, "data", None)
+                if isinstance(rpc_payload, dict):
+                    if not rpc_payload.get('success', False):
+                        logger.error(
+                            "❌ log_message_with_metrics failed for session %s: %s",
+                            actual_session_uuid,
+                            rpc_payload.get('error') or rpc_payload
+                        )
+                        if self.strict_logging:
+                            raise RuntimeError(
+                                f"log_message_with_metrics failed: {rpc_payload.get('error') or 'unknown error'}"
+                            )
+                    msg_id = rpc_payload.get('message_id')
+                    if msg_id:
+                        message_id_container[0] = msg_id
+                elif rpc_payload:
+                    message_id_container[0] = rpc_payload  # Backward compatibility fallback
 
                 logger.debug(f"Stored {role} message for session UUID {actual_session_uuid} (external: {external_session_id})")
 
@@ -759,6 +773,8 @@ class ConversationMemoryManager:
 
             except Exception as e:
                 logger.error(f"Error storing message: {e}")
+                if self.strict_logging:
+                    raise
 
         # Fire-and-forget with timeout protection
         try:
@@ -769,6 +785,8 @@ class ConversationMemoryManager:
             return message_id_container[0]  # Return ID even if timed out (message might still get stored)
         except Exception as e:
             logger.warning(f"Memory write failed: {e}, continuing without blocking")
+            if self.strict_logging:
+                raise
             return None
 
     async def store_conversation_turn(
