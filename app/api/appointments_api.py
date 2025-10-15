@@ -233,8 +233,9 @@ async def get_available_slots(
         logger.error(f"Failed to get available slots: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve available slots")
 
-@router.post("/", response_model=AppointmentResponse)
-@router.post("/book", response_model=AppointmentResponse)
+@router.post("", response_model=AppointmentResponse)  # No trailing slash
+@router.post("/", response_model=AppointmentResponse)  # With trailing slash
+@router.post("/book", response_model=AppointmentResponse)  # Alternative endpoint
 async def book_appointment(
     request: BookAppointmentRequest,
     background_tasks: BackgroundTasks,
