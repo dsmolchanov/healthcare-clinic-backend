@@ -91,6 +91,11 @@ class ExternalCalendarService:
         self.vault = ComplianceVault() if VAULT_AVAILABLE else None
         self.hold_duration = timedelta(minutes=5)  # Calendar hold duration
 
+        # Instance-level caching to reduce redundant database calls during sync
+        self._credentials_cache: Dict[tuple, tuple] = {}  # (org_id, provider) -> (credentials, timestamp)
+        self._integration_cache: Dict[str, tuple] = {}  # clinic_id -> (integration_data, timestamp)
+        self._cache_ttl = 300  # 5 minutes cache TTL
+
     async def _ensure_fresh_credentials(
         self,
         clinic_id: str,
@@ -99,6 +104,7 @@ class ExternalCalendarService:
     ) -> Dict[str, Any]:
         """
         Retrieve credentials from vault and refresh if expired
+        Uses instance-level caching to reduce redundant vault lookups
 
         Args:
             clinic_id: Clinic ID
@@ -108,6 +114,16 @@ class ExternalCalendarService:
         Returns:
             Fresh, valid credentials
         """
+        cache_key = (organization_id, provider)
+        now = datetime.utcnow().timestamp()
+
+        # Check cache first
+        if cache_key in self._credentials_cache:
+            cached_creds, cached_time = self._credentials_cache[cache_key]
+            if (now - cached_time) < self._cache_ttl:
+                logger.debug(f"Using cached credentials for {provider} (age: {now - cached_time:.1f}s)")
+                return cached_creds
+
         # Get credentials from vault
         credentials = await self.vault.retrieve_calendar_credentials(
             organization_id=organization_id,
@@ -189,6 +205,9 @@ class ExternalCalendarService:
                     'token_expired',
                     error_msg
                 )
+
+        # Update cache with fresh credentials
+        self._credentials_cache[cache_key] = (credentials, now)
 
         return credentials
 

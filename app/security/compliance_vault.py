@@ -106,18 +106,7 @@ class ComplianceVault:
                     organization_id, provider, app_encrypted
                 )
 
-            # Store reference in organization_secrets table (optional - mainly for audit)
-            try:
-                await self._store_secret_reference(
-                    organization_id=organization_id,
-                    secret_type=f'calendar_{provider}',
-                    secret_ref=secret_ref,
-                    created_by=user_id
-                )
-            except Exception as ref_error:
-                # Don't fail if organization_secrets table doesn't exist
-                # The vault_storage already has the encrypted credentials
-                logger.warning(f"Could not store secret reference (non-critical): {ref_error}")
+            # Note: organization_secrets table is deprecated - vault_storage is the source of truth
 
             # Audit log for compliance (optional)
             try:
@@ -340,35 +329,22 @@ class ComplianceVault:
         organization_id: str,
         secret_type: str
     ) -> Optional[str]:
-        """Get secret reference from organization_secrets table, or fallback to vault_storage"""
+        """Get secret reference from vault_storage (organization_secrets table deprecated)"""
         try:
-            result = self.supabase.table('organization_secrets').select(
-                'encrypted_value'
-            ).eq(
+            vault_key = secret_type  # e.g., 'calendar_google'
+            vault_result = self.supabase.table('vault_storage').select('id').eq(
                 'organization_id', organization_id
             ).eq(
-                'secret_type', secret_type
-            ).single().execute()
+                'vault_key', vault_key
+            ).order('created_at', desc=True).limit(1).execute()
 
-            return result.data['encrypted_value'] if result.data else None
-        except Exception as e:
-            # Fallback: search vault_storage directly
-            logger.info(f"organization_secrets not available, searching vault_storage directly: {e}")
-            try:
-                vault_key = secret_type  # e.g., 'calendar_google'
-                vault_result = self.supabase.table('vault_storage').select('id').eq(
-                    'organization_id', organization_id
-                ).eq(
-                    'vault_key', vault_key
-                ).order('created_at', desc=True).limit(1).execute()
-
-                if vault_result.data and len(vault_result.data) > 0:
-                    vault_id = vault_result.data[0]['id']
-                    return f"vault:{vault_id}"
-                return None
-            except Exception as vault_error:
-                logger.error(f"Could not retrieve from vault_storage: {vault_error}")
-                return None
+            if vault_result.data and len(vault_result.data) > 0:
+                vault_id = vault_result.data[0]['id']
+                return f"vault:{vault_id}"
+            return None
+        except Exception as vault_error:
+            logger.error(f"Could not retrieve from vault_storage: {vault_error}")
+            return None
 
     async def _audit_secret_operation(
         self,
@@ -443,17 +419,8 @@ class ComplianceVault:
             organization_id, provider, new_credentials, user_id
         )
 
-        # Update rotation timestamp (optional)
-        try:
-            self.supabase.table('organization_secrets').update({
-                'last_rotated_at': datetime.utcnow().isoformat()
-            }).eq(
-                'organization_id', organization_id
-            ).eq(
-                'secret_type', f'calendar_{provider}'
-            ).execute()
-        except Exception as update_error:
-            logger.warning(f"Could not update rotation timestamp (non-critical): {update_error}")
+        # Note: organization_secrets table is deprecated - vault_storage is the source of truth
+        # Rotation tracking is implicit via created_at in vault_storage
 
         # Audit the rotation (optional)
         try:

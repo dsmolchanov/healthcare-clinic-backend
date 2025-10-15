@@ -50,11 +50,11 @@ class CalendarSyncWorker:
                 max_instances=1  # Only one instance at a time
             )
 
-            # Run once on startup (with 30 second delay)
+            # Run once on startup (with 60 second delay to allow health checks to pass)
             self.scheduler.add_job(
                 self.sync_all_unsynced_appointments,
                 trigger='date',
-                run_date=datetime.now() + timedelta(seconds=30),
+                run_date=datetime.now() + timedelta(seconds=60),
                 id='calendar_sync_startup',
                 name='Calendar Sync Worker (Startup)'
             )
