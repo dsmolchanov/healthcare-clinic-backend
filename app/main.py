@@ -386,6 +386,19 @@ async def root():
         "version": "1.0.0"
     }
 
+
+@app.api_route("/apps/voice-api/{deprecated_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"], include_in_schema=False)
+async def deprecated_voice_api_routes(deprecated_path: str):
+    """Return a clear error for legacy /apps/voice-api/* routes."""
+    logger.warning(
+        "Legacy /apps/voice-api/%s route called. Inform the client to migrate to /api/*.",
+        deprecated_path,
+    )
+    raise HTTPException(
+        status_code=410,
+        detail="The /apps/voice-api/* endpoints have been retired. Please use the /api/* routes instead.",
+    )
+
 @app.get("/health")
 async def health_check():
     """Instant health check endpoint - NO external calls to prevent blocking"""
