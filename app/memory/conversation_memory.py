@@ -26,9 +26,9 @@ from app.memory.mem0_metrics import get_mem0_metrics_recorder
 
 logger = logging.getLogger(__name__)
 
-# Mem0 operation timeout (configurable via MEM0_TIMEOUT_MS, default 800ms)
+# Mem0 operation timeout (configurable via MEM0_TIMEOUT_MS, default 1100ms)
 # Enforce a floor of 800ms to prevent overly aggressive timeouts.
-MEM0_TIMEOUT_MS = max(int(os.getenv("MEM0_TIMEOUT_MS", "800")), 800)
+MEM0_TIMEOUT_MS = max(int(os.getenv("MEM0_TIMEOUT_MS", "1100")), 800)
 
 # Module-global in-flight deduplication map
 _inflight: Dict[tuple, asyncio.Task] = {}
@@ -73,7 +73,7 @@ class ConversationMemoryManager:
         self.mem0_metrics = get_mem0_metrics_recorder()
         self._last_metrics_snapshot: float = 0.0
         self._mem0_lookup_cache: Dict[tuple[str, str], tuple[float, List[str]]] = {}
-        self._mem0_lookup_cache_ttl = max(int(os.getenv("MEM0_LOOKUP_CACHE_TTL_SECONDS", "30")), 0)
+        self._mem0_lookup_cache_ttl = max(int(os.getenv("MEM0_LOOKUP_CACHE_TTL_SECONDS", "75")), 0)
 
         if not MEM0_AVAILABLE:
             logger.info("mem0 not installed, using Supabase for memory storage")
@@ -646,6 +646,7 @@ class ConversationMemoryManager:
 
         async def _store_with_timeout():
             """Internal helper with timeout protection"""
+            resolved_phone = clean_phone
             try:
                 # Store the external key for debugging
                 external_session_id = session_id
@@ -678,7 +679,7 @@ class ConversationMemoryManager:
                         logger.error(f"Failed to get/create session for {session_id}")
                         return
 
-                    clean_phone = phone_without_suffix
+                    resolved_phone = phone_without_suffix
 
                 msg_id = str(uuid.uuid4())
                 message_id_container[0] = msg_id  # Capture the ID
@@ -709,10 +710,10 @@ class ConversationMemoryManager:
                 if clinic_id:
                     base_metadata.setdefault('clinic_id', clinic_id)
 
-                base_metadata.setdefault('from_number', clean_phone)
+                base_metadata.setdefault('from_number', resolved_phone)
 
                 # Warm vector index once per clinic to avoid cold-start latency
-                await self._schedule_mem0_warmup(clinic_id, clean_phone)
+                await self._schedule_mem0_warmup(clinic_id, resolved_phone)
 
                 # Store using new RPC (writes to healthcare.conversation_logs)
                 result = self.supabase.rpc('log_message_with_metrics', {

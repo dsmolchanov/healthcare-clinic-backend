@@ -152,6 +152,9 @@ class MultilingualMessageProcessor:
         self._known_clinic_ids: Set[str] = set()
         self._patient_upsert_cache: Dict[Tuple[str, str], float] = {}
         self._patient_upsert_cache_ttl = max(int(os.getenv("PATIENT_UPSERT_CACHE_SECONDS", "120")), 0)
+        self._clinic_cache_warm_timestamps: Dict[str, float] = {}
+        self._clinic_cache_inflight: Set[str] = set()
+        self._clinic_cache_warm_ttl = int(os.getenv("CLINIC_CACHE_WARM_TTL_SECONDS", "900"))
 
     async def process_message(self, request: MessageRequest) -> MessageResponse:
         """Process incoming WhatsApp message with AI, RAG, and persistent memory"""
@@ -189,27 +192,36 @@ class MultilingualMessageProcessor:
         self.current_to_phone = request.to_phone
         self.current_message_sid = request.message_sid
 
+        resolved_request_clinic_id = self._get_clinic_id_from_organization(request.clinic_id)
+
         # Get or create persistent session (needs to run first)
         session = await self.memory_manager.get_or_create_session(
             phone_number=request.from_phone,
-            clinic_id=request.clinic_id,
+            clinic_id=resolved_request_clinic_id or request.clinic_id,
             channel=request.channel
         )
 
         session_id = session['id']
 
-        session_clinic_id = (
+        raw_clinic_identifier = (
             (session.get('metadata') or {}).get('clinic_id')
             or session.get('clinic_id')
+            or resolved_request_clinic_id
             or request.clinic_id
         )
 
-        if session_clinic_id:
-            self._known_clinic_ids.add(session_clinic_id)
+        effective_clinic_id = self._get_clinic_id_from_organization(raw_clinic_identifier)
+
+        if effective_clinic_id:
+            self._known_clinic_ids.add(effective_clinic_id)
+
+        if self._should_warm_clinic_cache(effective_clinic_id):
+            self._clinic_cache_inflight.add(effective_clinic_id)
+            asyncio.create_task(self._warm_clinic_cache(effective_clinic_id))
 
         # Create or update patient record from WhatsApp contact
         await self._upsert_patient_from_whatsapp(
-            clinic_id=session_clinic_id or request.clinic_id,
+            clinic_id=effective_clinic_id or request.clinic_id,
             phone=request.from_phone,
             profile_name=request.profile_name,
             detected_language=None  # Will be detected later
@@ -228,7 +240,7 @@ class MultilingualMessageProcessor:
                 metadata={
                     'message_sid': request.message_sid,
                     'profile_name': request.profile_name,
-                    'clinic_id': request.clinic_id,
+                    'clinic_id': effective_clinic_id,
                     'from_number': request.from_phone,
                     'channel': request.channel,
                     'instance_name': request.metadata.get('instance_name') if isinstance(request.metadata, dict) else None
@@ -239,19 +251,19 @@ class MultilingualMessageProcessor:
         # Fan out all other queries in parallel
         history_task = self.memory_manager.get_conversation_history(
             phone_number=request.from_phone,
-            clinic_id=request.clinic_id,
+            clinic_id=effective_clinic_id,
             limit=20,
             include_all_sessions=True
         )
 
         prefs_task = self.memory_manager.get_user_preferences(
             phone_number=request.from_phone,
-            clinic_id=request.clinic_id
+            clinic_id=effective_clinic_id
         )
 
         memory_task = self.memory_manager.get_memory_context(
             phone_number=request.from_phone,
-            clinic_id=request.clinic_id,
+            clinic_id=effective_clinic_id,
             query=request.body
         )
 
@@ -267,6 +279,30 @@ class MultilingualMessageProcessor:
         conversation_history = results[0] if not isinstance(results[0], Exception) else []
         user_preferences = results[1] if not isinstance(results[1], Exception) else {}
         memory_context = results[2] if not isinstance(results[2], Exception) else []
+
+        user_preferences = user_preferences or {}
+        is_new_conversation = len(conversation_history) == 0
+
+        patient_profile = await self._fetch_patient_profile(effective_clinic_id, request.from_phone)
+        patient_name = None
+        patient_id = None
+
+        if patient_profile:
+            patient_id = patient_profile.get('id')
+            first_name = (patient_profile.get('first_name') or '').strip()
+            last_name = (patient_profile.get('last_name') or '').strip()
+
+            generic_names = {'whatsapp', 'unknown', 'user'}
+            first_is_generic = first_name.lower() in generic_names
+            last_is_generic = last_name.lower() in generic_names or not last_name
+
+            if first_name and not first_is_generic:
+                patient_name = first_name
+                if last_name and not last_is_generic:
+                    patient_name = f"{first_name} {last_name}".strip()
+
+            if patient_name and not user_preferences.get('preferred_name'):
+                user_preferences['preferred_name'] = patient_name
 
         # Log any errors
         for i, result in enumerate(results):
@@ -321,6 +357,17 @@ This conversation has been escalated to a human agent.
 Provide a brief acknowledgment that their request is being handled by the team.
 DO NOT attempt to answer complex questions yourself.
 """
+
+        conversation_state_context = (
+            "This is the first turn with this user. Provide a warm introduction, confirm clinic details, and collect any necessary intake information before addressing their request."
+            if is_new_conversation else
+            "The user has chatted with the clinic before. Maintain continuity, reference any relevant prior context, and move quickly to the substance of their request."
+        )
+
+        if additional_context:
+            additional_context += f"\n\n{conversation_state_context}"
+        else:
+            additional_context = conversation_state_context
 
         # FAQ/Price queries now handled by direct lane (Phase 1)
         # No need for FAQ FTS here - it's done in direct_tool_executor with Redis cache
@@ -384,7 +431,7 @@ DO NOT attempt to answer complex questions yourself.
         ai_response, detected_language = await self._generate_response(
             user_message=request.body,
             clinic_name=request.clinic_name,
-            clinic_id=request.clinic_id,
+            clinic_id=effective_clinic_id or resolved_request_clinic_id or request.clinic_id,
             session_history=session_messages,
             knowledge_context=[],  # No RAG - knowledge via tools only
             memory_context=memory_context,
@@ -395,7 +442,7 @@ DO NOT attempt to answer complex questions yourself.
         # Update patient with extracted name and detected language
         if extracted_first or detected_language:
             await self._upsert_patient_from_whatsapp(
-                clinic_id=request.clinic_id,
+                clinic_id=effective_clinic_id or request.clinic_id,
                 phone=request.from_phone,
                 profile_name=request.profile_name,
                 detected_language=detected_language,
@@ -407,7 +454,7 @@ DO NOT attempt to answer complex questions yourself.
         response_metadata = {
             'detected_language': detected_language,
             'memory_context_used': len(memory_context),
-            'clinic_id': request.clinic_id,
+            'clinic_id': effective_clinic_id or resolved_request_clinic_id or request.clinic_id,
             'from_number': request.from_phone,
             'channel': request.channel
         }
@@ -456,7 +503,7 @@ DO NOT attempt to answer complex questions yourself.
                 self.memory_manager.schedule_mem0_message_update(
                     message_id=assistant_message_id,
                     phone_number=request.from_phone,
-                    clinic_id=request.clinic_id,
+                    clinic_id=effective_clinic_id or resolved_request_clinic_id or request.clinic_id,
                     content=ai_response,
                     metadata=dict(response_metadata),
                     session_uuid=session_id,
@@ -536,7 +583,7 @@ DO NOT attempt to answer complex questions yourself.
             try:
                 await self._log_conversation(
                     session_id=session_id,
-                    clinic_id=request.clinic_id,
+                    clinic_id=effective_clinic_id or resolved_request_clinic_id or request.clinic_id,
                     user_message=request.body,
                     ai_response=ai_response,
                     language=detected_language
@@ -551,8 +598,16 @@ DO NOT attempt to answer complex questions yourself.
         response_info = {
             "message_count": len(session_messages) + 2,  # Including current exchange
             "memory_context_used": len(memory_context),
-            "has_history": len(conversation_history) > 0
+            "has_history": not is_new_conversation,
+            "is_new_conversation": is_new_conversation,
+            "conversation_stage": "new" if is_new_conversation else "continuation",
+            "clinic_id": effective_clinic_id or resolved_request_clinic_id or request.clinic_id
         }
+
+        if patient_id:
+            response_info["patient_id"] = patient_id
+        if patient_name:
+            response_info["patient_name"] = patient_name
 
         # Hybrid search removed - no longer tracking search metadata
 
@@ -1270,6 +1325,91 @@ IMPORTANT BEHAVIORS:
         except Exception as e:
             logger.error(f"Error mapping organization to clinic: {e}")
             return organization_id
+
+    def _should_warm_clinic_cache(self, clinic_id: Optional[str]) -> bool:
+        """Determine if clinic cache warming should be triggered."""
+        if not clinic_id:
+            return False
+
+        if self._clinic_cache_warm_ttl < 0:
+            return False  # Explicitly disabled
+
+        if clinic_id in self._clinic_cache_inflight:
+            return False  # Already warming
+
+        last_warm = self._clinic_cache_warm_timestamps.get(clinic_id)
+        if last_warm is None:
+            return True
+
+        if self._clinic_cache_warm_ttl == 0:
+            return False  # Warm once per process
+
+        return (perf_counter() - last_warm) > self._clinic_cache_warm_ttl
+
+    async def _warm_clinic_cache(self, clinic_id: str):
+        """Warm clinic doctors/services/FAQs into Redis asynchronously."""
+        if not clinic_id:
+            return
+
+        try:
+            from app.startup_warmup import warmup_clinic_data
+
+            logger.info("🚀 Warming clinic cache for %s", clinic_id[:8] + "..." if len(clinic_id) > 8 else clinic_id)
+            success = await warmup_clinic_data([clinic_id])
+
+            if success:
+                self._clinic_cache_warm_timestamps[clinic_id] = perf_counter()
+                logger.info("✅ Clinic cache warmed for %s", clinic_id[:8] + "..." if len(clinic_id) > 8 else clinic_id)
+            else:
+                logger.warning("Clinic cache warmup returned falsy result for %s", clinic_id)
+                self._clinic_cache_warm_timestamps.pop(clinic_id, None)
+        except Exception as exc:
+            logger.warning("Clinic cache warmup failed for %s: %s", clinic_id, exc)
+            self._clinic_cache_warm_timestamps.pop(clinic_id, None)
+        finally:
+            self._clinic_cache_inflight.discard(clinic_id)
+
+    async def _fetch_patient_profile(
+        self,
+        clinic_id: Optional[str],
+        phone: str
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch patient profile data for personalization."""
+        if not phone:
+            return None
+
+        client = get_supabase_client()
+        if not client:
+            return None
+
+        resolved_clinic_id = self._get_clinic_id_from_organization(clinic_id) if clinic_id else clinic_id
+        clean_phone = phone.replace("@s.whatsapp.net", "")
+
+        def _query():
+            return (
+                client
+                .schema('healthcare')
+                .table('patients')
+                .select('id, first_name, last_name, preferred_language')
+                .eq('clinic_id', resolved_clinic_id or clinic_id)
+                .eq('phone', clean_phone)
+                .limit(1)
+                .execute()
+            )
+
+        try:
+            import asyncio
+            response = await asyncio.to_thread(_query)
+        except Exception as exc:
+            logger.debug("Patient profile lookup failed for %s/%s: %s", clinic_id, clean_phone, exc)
+            return None
+
+        if response and getattr(response, "data", None):
+            data = response.data
+            if isinstance(data, list) and data:
+                return data[0]
+
+        return None
 
     async def _upsert_patient_from_whatsapp(
         self,

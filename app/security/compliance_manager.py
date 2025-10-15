@@ -158,8 +158,28 @@ class ComplianceManager:
             'checksum': checksum
         }
 
-        # Store in audit log
-        self.supabase.table('audit_logs').insert(audit_entry).execute()
+        # Store in audit log, handling legacy schemas missing contains_phi
+        try:
+            self.supabase.table('audit_logs').insert(audit_entry).execute()
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if 'contains_phi' in error_text:
+                fallback_entry = dict(audit_entry)
+                fallback_entry.pop('contains_phi', None)
+                # Ensure compliance flags remain valid even without PHI marker
+                if not fallback_entry.get('compliance_flags'):
+                    fallback_entry['compliance_flags'] = ['SOC2']
+
+                logger.warning(
+                    "Audit log schema missing contains_phi column; retrying insert without it"
+                )
+                try:
+                    self.supabase.table('audit_logs').insert(fallback_entry).execute()
+                except Exception as retry_exc:
+                    logger.error(f"Failed to insert audit log without contains_phi: {retry_exc}")
+            else:
+                logger.error(f"Failed to insert audit log: {exc}")
+                raise
 
         # Send to SIEM if critical operation
         if self._is_critical_operation(operation):
