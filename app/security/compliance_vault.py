@@ -146,20 +146,18 @@ class ComplianceVault:
             Decrypted credentials dictionary
         """
         try:
-            # Get secret reference from database
-            secret_ref = await self._get_secret_reference(
-                organization_id=organization_id,
-                secret_type=f'calendar_{provider}'
-            )
+            # Get vault entry directly with encrypted data (optimized single query)
+            vault_key = f'calendar_{provider}'
+            vault_result = self.supabase.table('vault_storage').select('id, encrypted_value').eq(
+                'organization_id', organization_id
+            ).eq(
+                'vault_key', vault_key
+            ).order('created_at', desc=True).limit(1).execute()
 
-            if not secret_ref:
+            if not vault_result.data or len(vault_result.data) == 0:
                 raise ValueError(f"No credentials found for {provider}")
 
-            # Retrieve encrypted data
-            if self.use_aws and secret_ref.startswith('arn:'):
-                encrypted_data = await self._retrieve_from_aws(secret_ref)
-            else:
-                encrypted_data = await self._retrieve_from_supabase(secret_ref)
+            encrypted_data = vault_result.data[0]['encrypted_value']
 
             # Decrypt
             credentials = self._app_decrypt(encrypted_data)

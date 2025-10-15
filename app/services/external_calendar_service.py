@@ -94,6 +94,7 @@ class ExternalCalendarService:
         # Instance-level caching to reduce redundant database calls during sync
         self._credentials_cache: Dict[tuple, tuple] = {}  # (org_id, provider) -> (credentials, timestamp)
         self._integration_cache: Dict[str, tuple] = {}  # clinic_id -> (integration_data, timestamp)
+        self._doctor_calendar_cache: Dict[str, str] = {}  # doctor_id -> calendar_id (no expiry, per-instance)
         self._cache_ttl = 300  # 5 minutes cache TTL
 
     async def _ensure_fresh_credentials(
@@ -210,6 +211,42 @@ class ExternalCalendarService:
         self._credentials_cache[cache_key] = (credentials, now)
 
         return credentials
+
+    async def _get_calendar_integration(self, clinic_id: str, provider: str = 'google') -> Optional[Dict]:
+        """
+        Get calendar integration with caching
+
+        Args:
+            clinic_id: Clinic UUID
+            provider: Calendar provider (default: google)
+
+        Returns:
+            Integration data or None if not found
+        """
+        now = datetime.utcnow().timestamp()
+
+        # Check cache first
+        if clinic_id in self._integration_cache:
+            cached_integration, cached_time = self._integration_cache[clinic_id]
+            if (now - cached_time) < self._cache_ttl:
+                logger.debug(f"Using cached integration for clinic {clinic_id}")
+                return cached_integration
+
+        # Fetch from database
+        integration_result = self.supabase.rpc('get_calendar_integration_by_clinic', {
+            'p_clinic_id': clinic_id,
+            'p_provider': provider
+        }).execute()
+
+        if not integration_result.data or len(integration_result.data) == 0:
+            return None
+
+        integration = integration_result.data[0]
+
+        # Cache the result
+        self._integration_cache[clinic_id] = (integration, now)
+
+        return integration
 
     async def _update_integration_status(
         self,
@@ -1026,17 +1063,12 @@ class ExternalCalendarService:
 
             logger.info(f"Looking for calendar integration for clinic {clinic_id}")
 
-            # Query healthcare.calendar_integrations using RPC
-            integration_result = self.supabase.rpc('get_calendar_integration_by_clinic', {
-                'p_clinic_id': clinic_id,
-                'p_provider': 'google'
-            }).execute()
+            # Get integration (with caching)
+            calendar_integration = await self._get_calendar_integration(clinic_id, 'google')
 
-            if not integration_result.data or len(integration_result.data) == 0:
+            if not calendar_integration:
                 logger.info(f"No Google Calendar integration found for clinic {clinic_id}")
                 return {'success': True, 'note': 'Google Calendar not configured'}
-
-            calendar_integration = integration_result.data[0]
 
             # Check if enabled and active
             if not calendar_integration.get('sync_enabled'):
@@ -1284,17 +1316,12 @@ class ExternalCalendarService:
 
             logger.info(f"Updating Google Calendar event {google_event_id} for appointment {appointment_data.get('id')}")
 
-            # Query healthcare.calendar_integrations using RPC
-            integration_result = self.supabase.rpc('get_calendar_integration_by_clinic', {
-                'p_clinic_id': clinic_id,
-                'p_provider': 'google'
-            }).execute()
+            # Get integration (with caching)
+            calendar_integration = await self._get_calendar_integration(clinic_id, 'google')
 
-            if not integration_result.data or len(integration_result.data) == 0:
+            if not calendar_integration:
                 logger.info(f"No Google Calendar integration found for clinic {clinic_id}")
                 return {'success': True, 'note': 'Google Calendar not configured'}
-
-            calendar_integration = integration_result.data[0]
 
             # Check if enabled and active
             if not calendar_integration.get('sync_enabled'):
@@ -1677,17 +1704,12 @@ class ExternalCalendarService:
         try:
             logger.info(f"Starting inbound sync from Google Calendar for clinic {clinic_id}")
 
-            # Get calendar integration
-            integration_result = self.supabase.rpc('get_calendar_integration_by_clinic', {
-                'p_clinic_id': clinic_id,
-                'p_provider': 'google'
-            }).execute()
+            # Get calendar integration (with caching)
+            integration = await self._get_calendar_integration(clinic_id, 'google')
 
-            if not integration_result.data or len(integration_result.data) == 0:
+            if not integration:
                 logger.error(f"No calendar integration found for clinic {clinic_id}")
                 return {'success': False, 'error': 'No calendar integration'}
-
-            integration = integration_result.data[0]
 
             # Get credentials from vault (with automatic refresh if expired)
             credentials_data = await self._ensure_fresh_credentials(
@@ -1806,6 +1828,7 @@ class ExternalCalendarService:
     async def _get_doctor_calendar(self, doctor_id: str, organization_id: str) -> str:
         """
         Get the target calendar ID for a doctor (either sub-calendar or primary)
+        Cached per-instance to eliminate redundant lookups
 
         Args:
             doctor_id: Doctor UUID
@@ -1814,6 +1837,11 @@ class ExternalCalendarService:
         Returns:
             Calendar ID string (either doctor's sub-calendar or 'primary')
         """
+        # Check cache first
+        if doctor_id in self._doctor_calendar_cache:
+            logger.debug(f"Using cached calendar ID for doctor {doctor_id}")
+            return self._doctor_calendar_cache[doctor_id]
+
         try:
             # Call RPC to determine which calendar to use
             result = self.supabase.rpc('get_doctor_calendar_id', {
@@ -1822,9 +1850,15 @@ class ExternalCalendarService:
             }).execute()
 
             calendar_id = result.data if result.data else 'primary'
+
+            # Cache the result
+            self._doctor_calendar_cache[doctor_id] = calendar_id
+
             logger.debug(f"Using calendar {calendar_id} for doctor {doctor_id}")
             return calendar_id
 
         except Exception as e:
             logger.warning(f"Error getting doctor calendar, falling back to primary: {e}")
+            # Cache the fallback too
+            self._doctor_calendar_cache[doctor_id] = 'primary'
             return 'primary'
