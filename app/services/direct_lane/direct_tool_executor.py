@@ -322,7 +322,27 @@ class DirectToolExecutor:
             FAQ query result
         """
         query = args.get("query", "")
-        language = args.get("language", "en")
+
+        raw_language = args.get("language", "en")
+        language_code = raw_language.lower() if isinstance(raw_language, str) else "en"
+        # Normalize common full-language strings back to ISO codes
+        full_to_code = {
+            "english": "en",
+            "spanish": "es",
+            "russian": "ru",
+            "portuguese": "pt",
+            "hebrew": "he"
+        }
+        language_code = full_to_code.get(language_code, language_code)
+
+        language_filter_map = {
+            "en": "english",
+            "es": "spanish",
+            "ru": "russian",
+            "pt": "portuguese",
+            "he": "english",  # Hebrew not supported by Postgres FTS config – fallback to English
+        }
+        language = language_filter_map.get(language_code, "english")
 
         try:
             # Get FAQs from Redis cache (fast!)
@@ -332,10 +352,14 @@ class DirectToolExecutor:
             redis = get_redis_client()
             cache = ClinicDataCache(redis, default_ttl=3600)
             faqs = await cache.get_faqs(self.clinic_id, self.supabase)
+            result_source = "faq_cache"
 
             # Filter by language if specified
             if language:
-                faqs = [faq for faq in faqs if faq.get('language') == language]
+                faqs = [
+                    faq for faq in faqs
+                    if (faq.get('language') or '').lower() == language
+                ]
 
             # Simple substring matching (fast and good enough for direct lane)
             query_lower = query.lower()
@@ -346,9 +370,48 @@ class DirectToolExecutor:
                 or any(query_lower in tag.lower() for tag in faq.get('tags', []))
             ]
 
+            if not matches:
+                # Cache might be stale – refresh once before falling back
+                logger.info("FAQ cache miss for query '%s'; refreshing cache", query)
+                cache.invalidate_faqs(self.clinic_id)
+                faqs = await cache.get_faqs(self.clinic_id, self.supabase)
+
+                if language:
+                    faqs = [
+                        faq for faq in faqs
+                        if (faq.get('language') or '').lower() == language
+                    ]
+
+                matches = [
+                    faq for faq in faqs
+                    if query_lower in faq.get('question', '').lower()
+                    or query_lower in faq.get('answer', '').lower()
+                    or any(query_lower in tag.lower() for tag in faq.get('tags', []))
+                ]
+                result_source = "faq_cache_refreshed"
+
             # Sort by priority and take top 3
             matches.sort(key=lambda x: x.get('priority', 0), reverse=True)
             matches = matches[:3]
+
+            if not matches:
+                # Final fallback: run FTS RPC so we never return empty when data exists
+                from app.tools.faq_query_tool import FAQQueryTool
+
+                try:
+                    faq_tool = FAQQueryTool(self.clinic_id)
+                    fts_results = await faq_tool.search_faqs(
+                        query=query,
+                        language=language_code or "en",
+                        limit=3
+                    )
+                except Exception as fts_error:
+                    logger.warning("FAQ FTS fallback failed: %s", fts_error)
+                    fts_results = []
+
+                if fts_results:
+                    matches = fts_results[:3]
+                    result_source = "faq_fts_fallback"
 
             if not matches:
                 # Use memory context to provide more helpful response
@@ -383,9 +446,10 @@ class DirectToolExecutor:
                 "response": "\n".join(lines),
                 "faqs": matches,
                 "metadata": {
-                    "source": "faq_cache",
+                    "source": result_source,
                     "query": query,
                     "language": language,
+                    "language_code": language_code,
                     "results_count": len(matches),
                     "used_memories": len(memories) if memories else 0
                 }
