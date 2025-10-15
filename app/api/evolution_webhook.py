@@ -52,27 +52,30 @@ async def evolution_webhook(
     # Check if webhook secret is configured
     evolution_webhook_secret = os.getenv("EVOLUTION_WEBHOOK_SECRET", "")
 
-    if evolution_webhook_secret:
-        # Signature verification is ENABLED - require signature
-        signature = request.headers.get("X-Webhook-Signature")
-        if not signature:
-            print(f"[Evolution Webhook] ❌ No signature header - rejecting request (verification enabled)")
-            raise HTTPException(
-                status_code=401,
-                detail="Webhook signature required (X-Webhook-Signature header missing)"
-            )
+    if not evolution_webhook_secret:
+        logger.error("EVOLUTION_WEBHOOK_SECRET not configured - rejecting Evolution webhook request")
+        raise HTTPException(
+            status_code=503,
+            detail="Evolution webhook secret not configured"
+        )
 
-        print(f"[Evolution Webhook] Signature header present: {signature[:20]}...")
-        # Convert dict back to bytes for signature verification
-        body_bytes = json.dumps(body).encode('utf-8')
-        if not verify_webhook_signature('evolution', body=body_bytes, signature=signature):
-            print(f"[Evolution Webhook] ❌ Invalid signature - rejecting request")
-            raise HTTPException(status_code=401, detail="Invalid webhook signature")
-        print(f"[Evolution Webhook] ✅ Signature verified")
-    else:
-        # Signature verification is DISABLED - allow all requests
-        print(f"[Evolution Webhook] ⚠️ Signature verification disabled (EVOLUTION_WEBHOOK_SECRET not set)")
-        print(f"[Evolution Webhook] ✅ Request accepted (verification disabled)")
+    # Signature verification is ENABLED - require signature
+    signature = request.headers.get("X-Webhook-Signature")
+    if not signature:
+        print(f"[Evolution Webhook] ❌ No signature header - rejecting request (verification enabled)")
+        raise HTTPException(
+            status_code=401,
+            detail="Webhook signature required (X-Webhook-Signature header missing)"
+        )
+
+    print(f"[Evolution Webhook] Signature header present: {signature[:20]}...")
+    # Convert dict back to bytes for signature verification.
+    # Match JSON.stringify output (no spaces, UTF-8) so HMAC lines up with Evolution API.
+    body_bytes = json.dumps(body, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+    if not verify_webhook_signature('evolution', body=body_bytes, signature=signature):
+        print(f"[Evolution Webhook] ❌ Invalid signature - rejecting request")
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    print(f"[Evolution Webhook] ✅ Signature verified")
 
     print(f"{'='*80}\n")
 

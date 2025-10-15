@@ -44,18 +44,17 @@ class ClinicInfoTool:
                 doctors = await self.cache.get_doctors(self.clinic_id, supabase_client)
                 logger.debug(f"✅ Using cached doctors for clinic {self.clinic_id}")
             else:
-                # Fallback to direct query (try active first, then is_active for backwards compat)
+                # Fallback to direct query (prefer is_active, fall back to legacy active)
                 try:
                     result = supabase_client.table('doctors').select(
                         'id,first_name,last_name,specialization'
-                    ).eq('clinic_id', self.clinic_id).eq('active', True).execute()
+                    ).eq('clinic_id', self.clinic_id).eq('is_active', True).execute()
                     doctors = result.data
                 except Exception as e:
-                    # Try is_active for backwards compatibility
-                    if 'active does not exist' in str(e):
+                    if 'is_active' in str(e):
                         result = supabase_client.table('doctors').select(
                             'id,first_name,last_name,specialization'
-                        ).eq('clinic_id', self.clinic_id).eq('is_active', True).execute()
+                        ).eq('clinic_id', self.clinic_id).eq('active', True).execute()
                         doctors = result.data
                     else:
                         raise

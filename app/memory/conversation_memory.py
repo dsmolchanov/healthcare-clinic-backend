@@ -7,7 +7,7 @@ import os
 import json
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, TYPE_CHECKING, Set, Iterable
+from typing import Dict, Any, List, Optional, TYPE_CHECKING, Set, Iterable, Tuple
 from supabase import create_client, Client
 import logging
 import asyncio
@@ -72,6 +72,8 @@ class ConversationMemoryManager:
         self._mem0_warmup_clinics: Set[str] = set()
         self.mem0_metrics = get_mem0_metrics_recorder()
         self._last_metrics_snapshot: float = 0.0
+        self._mem0_lookup_cache: Dict[tuple[str, str], tuple[float, List[str]]] = {}
+        self._mem0_lookup_cache_ttl = max(int(os.getenv("MEM0_LOOKUP_CACHE_TTL_SECONDS", "30")), 0)
 
         if not MEM0_AVAILABLE:
             logger.info("mem0 not installed, using Supabase for memory storage")
@@ -224,6 +226,37 @@ class ConversationMemoryManager:
         self._mem0_worker_task = loop.create_task(self._mem0_writer_loop(queue))
         logger.info("Started mem0 background writer task")
 
+    def _mem0_cache_key(self, user_id: str, query: Optional[str]) -> Tuple[str, str]:
+        return (user_id, (query or "__all__").strip().lower())
+
+    def _purge_mem0_lookup_cache(self) -> None:
+        if not self._mem0_lookup_cache:
+            return
+
+        if self._mem0_lookup_cache_ttl <= 0:
+            self._mem0_lookup_cache.clear()
+            return
+
+        now = perf_counter()
+        ttl = float(self._mem0_lookup_cache_ttl)
+        expired = [
+            key for key, (ts, _values) in self._mem0_lookup_cache.items()
+            if now - ts > ttl
+        ]
+
+        for key in expired:
+            self._mem0_lookup_cache.pop(key, None)
+
+    def _invalidate_mem0_lookup_cache(self, phone_number: str, clinic_id: Optional[str]) -> None:
+        if not self._mem0_lookup_cache:
+            return
+
+        clean_phone = phone_number.replace("@s.whatsapp.net", "")
+        user_ids = self._candidate_mem0_user_ids(clean_phone, clinic_id)
+        for key in list(self._mem0_lookup_cache.keys()):
+            if key[0] in user_ids:
+                self._mem0_lookup_cache.pop(key, None)
+
     async def _mem0_writer_loop(self, queue: asyncio.Queue):
         """Background worker that flushes mem0 operations off the critical path."""
         while True:
@@ -271,6 +304,8 @@ class ConversationMemoryManager:
             **base_metadata
         }
 
+        self._invalidate_mem0_lookup_cache(phone_number, clinic_id)
+
         result = await self.add_mem0_memory(
             phone_number=phone_number,
             content=content,
@@ -295,6 +330,8 @@ class ConversationMemoryManager:
         clinic_id = job.get('clinic_id')
         content = job.get('content', '')
         metadata = job.get('metadata') or {}
+
+        self._invalidate_mem0_lookup_cache(phone_number, clinic_id)
 
         await self.add_mem0_memory(
             phone_number=phone_number,
@@ -467,6 +504,8 @@ class ConversationMemoryManager:
         if resolved_clinic:
             metadata_payload.setdefault('clinic_id', resolved_clinic)
 
+        self._invalidate_mem0_lookup_cache(phone_number, resolved_clinic)
+
         user_candidates = self._candidate_mem0_user_ids(clean_phone, resolved_clinic)
         target_user_id = user_candidates[0]
 
@@ -622,12 +661,12 @@ class ConversationMemoryManager:
                     logger.debug(f"Converting external session key to UUID: {session_id}")
 
                     # Extract info from external key (format: whatsapp_PHONE_INSTANCE)
-                    clean_phone = phone_number.replace("@s.whatsapp.net", "")
+                    phone_without_suffix = phone_number.replace("@s.whatsapp.net", "")
 
                     # Get or create session using the phone number
                     clinic_id = metadata.get('clinic_id') if metadata else ''
                     session = await self.get_or_create_session(
-                        phone_number=clean_phone,
+                        phone_number=phone_without_suffix,
                         clinic_id=clinic_id,
                         channel='whatsapp'
                     )
@@ -638,6 +677,8 @@ class ConversationMemoryManager:
                     else:
                         logger.error(f"Failed to get/create session for {session_id}")
                         return
+
+                    clean_phone = phone_without_suffix
 
                 msg_id = str(uuid.uuid4())
                 message_id_container[0] = msg_id  # Capture the ID
@@ -867,6 +908,8 @@ class ConversationMemoryManager:
             return context
 
         try:
+            self._purge_mem0_lookup_cache()
+
             logger.info(
                 "Querying mem0 for user: %s (clinic: %s, query: %s)",
                 clean_phone[:8] + "***",
@@ -874,42 +917,79 @@ class ConversationMemoryManager:
                 (query[:50] if query else 'None')
             )
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
+            candidates = self._candidate_mem0_user_ids(clean_phone, clinic_id)
 
-            for user_id in self._candidate_mem0_user_ids(clean_phone, clinic_id):
-                try:
-                    if query:
-                        memories = await asyncio.wait_for(
-                            loop.run_in_executor(
-                                None,
-                                lambda: self.memory.search(query, user_id=user_id, limit=remaining)
-                            ),
-                            timeout=MEM0_TIMEOUT_MS / 1000.0
-                        )
-                    else:
-                        memories = await asyncio.wait_for(
-                            loop.run_in_executor(
-                                None,
-                                lambda: self.memory.get_all(user_id=user_id, limit=remaining)
-                            ),
-                            timeout=MEM0_TIMEOUT_MS / 1000.0
-                        )
-                except asyncio.TimeoutError:
-                    logger.warning("mem0 search timed out for user %s", user_id)
-                    continue
-                except Exception as exc:
-                    logger.debug(f"mem0 search failed for user {user_id}: {exc}")
-                    continue
+            for user_id in candidates:
+                cache_key = self._mem0_cache_key(user_id, query)
+                memory_strings: Optional[List[str]] = None
+                used_cache = False
 
-                for memory in memories:
-                    if isinstance(memory, dict):
-                        memory_text = memory.get('memory') or memory.get('content') or ''
-                    else:
-                        memory_text = str(memory)
+                if self._mem0_lookup_cache_ttl > 0:
+                    cached = self._mem0_lookup_cache.get(cache_key)
+                    if cached:
+                        cached_age = perf_counter() - cached[0]
+                        if cached_age <= self._mem0_lookup_cache_ttl:
+                            memory_strings = list(cached[1])
+                            used_cache = True
+                        else:
+                            self._mem0_lookup_cache.pop(cache_key, None)
 
-                    if not memory_text:
+                if memory_strings is None:
+                    lookup_start = perf_counter()
+                    try:
+                        if query:
+                            raw_memories = await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    None,
+                                    lambda: self.memory.search(query, user_id=user_id, limit=remaining)
+                                ),
+                                timeout=MEM0_TIMEOUT_MS / 1000.0
+                            )
+                        else:
+                            raw_memories = await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    None,
+                                    lambda: self.memory.get_all(user_id=user_id, limit=remaining)
+                                ),
+                                timeout=MEM0_TIMEOUT_MS / 1000.0
+                            )
+                    except asyncio.TimeoutError:
+                        logger.warning("mem0 search timed out for user %s", user_id)
+                        await self.mem0_metrics.record_lookup(False, float(MEM0_TIMEOUT_MS))
+                        continue
+                    except Exception as exc:
+                        logger.debug(f"mem0 search failed for user {user_id}: {exc}")
+                        await self.mem0_metrics.record_lookup(False, 0.0)
                         continue
 
+                    memory_strings = []
+                    for memory in raw_memories:
+                        if isinstance(memory, dict):
+                            memory_text = memory.get('memory') or memory.get('content') or ''
+                        else:
+                            memory_text = str(memory)
+
+                        if memory_text:
+                            memory_strings.append(memory_text)
+
+                    lookup_latency_ms = (perf_counter() - lookup_start) * 1000.0
+
+                    if memory_strings and self._mem0_lookup_cache_ttl > 0:
+                        self._mem0_lookup_cache[cache_key] = (perf_counter(), list(memory_strings))
+                    elif not memory_strings and self._mem0_lookup_cache_ttl > 0:
+                        # Cache empty results briefly to avoid hammering mem0 when no data exists
+                        self._mem0_lookup_cache[cache_key] = (perf_counter(), [])
+
+                    await self.mem0_metrics.record_lookup(True, lookup_latency_ms)
+
+                if not memory_strings:
+                    continue
+
+                if used_cache:
+                    await self.mem0_metrics.record_lookup(True, 0.0)
+
+                for memory_text in memory_strings:
                     if memory_text in context:
                         continue
 

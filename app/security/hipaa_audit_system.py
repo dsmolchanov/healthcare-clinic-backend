@@ -128,13 +128,16 @@ class HIPAAAuditSystem:
     def _get_or_create_audit_key(self) -> bytes:
         """Get or create encryption key for audit data"""
         key_env = os.getenv("HIPAA_AUDIT_KEY")
-        if key_env:
-            return key_env.encode()
-        else:
-            # Generate new key - in production, this should be stored securely
-            new_key = Fernet.generate_key()
-            logger.warning("Generated new HIPAA audit key. Store securely: HIPAA_AUDIT_KEY environment variable")
-            return new_key
+        if not key_env:
+            raise RuntimeError("HIPAA_AUDIT_KEY not configured. Set the environment variable before starting the service.")
+
+        try:
+            # Validate that the key is a valid Fernet key
+            Fernet(key_env.encode())
+        except Exception as exc:  # pragma: no cover - defensive guard
+            raise RuntimeError("Invalid HIPAA_AUDIT_KEY; expected base64-encoded Fernet key") from exc
+
+        return key_env.encode()
 
     def _start_audit_processor(self):
         """Start background task for audit processing"""

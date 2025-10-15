@@ -19,11 +19,19 @@ class _Mem0QueueMetrics:
     last_job_latency_ms: float = 0.0
     last_updated_at: float = 0.0
     latency_breach_count: int = 0
+    lookup_requests: int = 0
+    lookup_hits: int = 0
+    lookup_timeouts: int = 0
+    lookup_total_latency_ms: float = 0.0
 
     def snapshot(self) -> Dict[str, Any]:
         avg_latency = 0.0
         if self.processed_jobs_total:
             avg_latency = self.total_latency_ms / self.processed_jobs_total
+
+        avg_lookup_latency = 0.0
+        if self.lookup_hits:
+            avg_lookup_latency = self.lookup_total_latency_ms / self.lookup_hits
 
         return {
             "current_queue_size": self.current_queue_size,
@@ -34,6 +42,10 @@ class _Mem0QueueMetrics:
             "last_job_latency_ms": round(self.last_job_latency_ms, 2),
             "last_updated_at": self.last_updated_at,
             "latency_breach_count": self.latency_breach_count,
+            "lookup_requests": self.lookup_requests,
+            "lookup_hits": self.lookup_hits,
+            "lookup_timeouts": self.lookup_timeouts,
+            "lookup_average_latency_ms": round(avg_lookup_latency, 2),
         }
 
 
@@ -65,6 +77,16 @@ class Mem0MetricsRecorder:
                 metrics.max_queue_size = queue_size
             if latency_ms > self._latency_warn_ms:
                 metrics.latency_breach_count += 1
+
+    async def record_lookup(self, success: bool, latency_ms: float) -> None:
+        async with self._lock:
+            metrics = self._metrics
+            metrics.lookup_requests += 1
+            if success:
+                metrics.lookup_hits += 1
+                metrics.lookup_total_latency_ms += latency_ms
+            else:
+                metrics.lookup_timeouts += 1
 
     async def snapshot(self) -> Dict[str, Any]:
         async with self._lock:

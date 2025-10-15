@@ -189,7 +189,32 @@ fly secrets set EVOLUTION_WEBHOOK_SECRET="your-secret-here" --app healthcare-cli
 
 ---
 
-## 8. ✅ Updated Supabase Client to HTTP/1.1
+## 8. ✅ Persist HIPAA/PHI Encryption Keys
+
+**Status:** Service now refuses to boot without explicit key material.
+
+**Issue:** `PHI_MASTER_KEY`, `PHI_RSA_PRIVATE_KEY`, and `HIPAA_AUDIT_KEY` were regenerated on every deploy, wiping audit logs and breaking encryption continuity.
+
+**Fix:**
+
+1. Export prod keys from secure vault (one-time) and set them as Fly secrets:
+   ```bash
+   fly secrets set \
+     PHI_MASTER_KEY="$(cat phi_master_key.txt)" \
+     PHI_RSA_PRIVATE_KEY="$(base64 < phi_rsa_private_key.pem)" \
+     HIPAA_AUDIT_KEY="$(cat hipaa_audit_key.txt)" \
+     --app healthcare-clinic-backend
+   ```
+2. Added startup guards so the backend raises if any key is missing or malformed (base64 validation included).
+
+**Impact:**
+- Eliminates per-boot key churn and the associated audit log resets.
+- Keeps PHI encryption stable across deployments.
+- Restores HIPAA audit logging (no more silent failures in `HIPAA_AUDIT_KEY`).
+
+---
+
+## 9. ✅ Updated Supabase Client to HTTP/1.1
 
 **File:** `clinics/backend/app/db/supabase_client.py`
 

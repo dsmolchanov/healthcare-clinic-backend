@@ -55,19 +55,18 @@ class ClinicDataCache:
             # Cache miss - fetch from database
             logger.debug(f"❌ Cache MISS: fetching doctors for clinic {clinic_id}")
 
-            # Try 'active' column first (newer schema)
+            doctors = []
             try:
                 result = supabase_client.table('doctors').select(
                     'id,first_name,last_name,specialization,phone,email'
-                ).eq('clinic_id', clinic_id).eq('active', True).execute()
+                ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
                 doctors = result.data if result.data else []
             except Exception as e:
-                # Fallback to 'is_active' for backwards compatibility
-                if 'active does not exist' in str(e):
-                    logger.debug(f"Trying is_active column instead of active")
+                if 'is_active' in str(e):
+                    logger.debug("Falling back to legacy 'active' column for doctors")
                     result = supabase_client.table('doctors').select(
                         'id,first_name,last_name,specialization,phone,email'
-                    ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
+                    ).eq('clinic_id', clinic_id).eq('active', True).execute()
                     doctors = result.data if result.data else []
                 else:
                     raise
@@ -102,11 +101,21 @@ class ClinicDataCache:
                 return json.loads(cached_data)
 
             logger.debug(f"❌ Cache MISS: fetching services for clinic {clinic_id}")
-            result = supabase_client.schema('healthcare').table('services').select(
-                'id,name,description,base_price,category,duration_minutes,currency,code'
-            ).eq('clinic_id', clinic_id).eq('active', True).execute()
-
-            services = result.data if result.data else []
+            services = []
+            try:
+                result = supabase_client.schema('healthcare').table('services').select(
+                    'id,name,description,base_price,category,duration_minutes,currency,code'
+                ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
+                services = result.data if result.data else []
+            except Exception as e:
+                if 'is_active' in str(e):
+                    logger.debug("Falling back to legacy 'active' column for services")
+                    result = supabase_client.schema('healthcare').table('services').select(
+                        'id,name,description,base_price,category,duration_minutes,currency,code'
+                    ).eq('clinic_id', clinic_id).eq('active', True).execute()
+                    services = result.data if result.data else []
+                else:
+                    raise
             self.redis.setex(cache_key, self.default_ttl, json.dumps(services))
             logger.info(f"✅ Cached {len(services)} services for clinic {clinic_id}")
 

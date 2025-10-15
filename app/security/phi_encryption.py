@@ -109,48 +109,36 @@ class PHIEncryptionSystem:
     def _get_or_create_master_key(self) -> bytes:
         """Get or create master encryption key"""
         key_env = os.getenv("PHI_MASTER_KEY")
-        if key_env:
-            return base64.b64decode(key_env.encode())
-        else:
-            # Generate new master key
-            new_key = Fernet.generate_key()
-            if os.getenv("DEBUG_SECRETS") == "1":
-                logger.warning(f"PHI_MASTER_KEY={base64.b64encode(new_key).decode()}")
-            else:
-                logger.warning("Generated new PHI master key. Store in PHI_MASTER_KEY environment variable (value not logged for security)")
-            return new_key
+        if not key_env:
+            raise RuntimeError("PHI_MASTER_KEY not configured. Set the environment variable before starting the service.")
+
+        try:
+            key_bytes = base64.b64decode(key_env.encode())
+        except Exception as exc:  # pragma: no cover - defensive guard
+            raise RuntimeError("Invalid PHI_MASTER_KEY value; expected base64 encoded key") from exc
+
+        if len(key_bytes) != 32:
+            raise RuntimeError("Invalid PHI_MASTER_KEY length; expected 32 decoded bytes")
+
+        return key_bytes
 
     def _get_or_create_rsa_keys(self) -> Tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey]:
         """Get or create RSA key pair for maximum security encryption"""
         private_key_env = os.getenv("PHI_RSA_PRIVATE_KEY")
 
-        if private_key_env:
-            # Load existing key
+        if not private_key_env:
+            raise RuntimeError("PHI_RSA_PRIVATE_KEY not configured. Set the environment variable before starting the service.")
+
+        try:
             private_key_bytes = base64.b64decode(private_key_env.encode())
             private_key = serialization.load_pem_private_key(
                 private_key_bytes,
                 password=None
             )
-            public_key = private_key.public_key()
-        else:
-            # Generate new RSA key pair
-            private_key = rsa.generate_private_key(
-                public_exponent=65537,
-                key_size=2048
-            )
-            public_key = private_key.public_key()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            raise RuntimeError("Invalid PHI_RSA_PRIVATE_KEY; expected base64-encoded PKCS8 PEM") from exc
 
-            # Serialize for storage
-            private_pem = private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
-            )
-
-            if os.getenv("DEBUG_SECRETS") == "1":
-                logger.warning(f"PHI_RSA_PRIVATE_KEY={base64.b64encode(private_pem).decode()}")
-            else:
-                logger.warning("Generated new RSA private key. Store in PHI_RSA_PRIVATE_KEY environment variable (value not logged for security)")
+        public_key = private_key.public_key()
 
         return private_key, public_key
 

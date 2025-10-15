@@ -9,7 +9,8 @@ import uuid
 import time
 import asyncio
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from time import perf_counter
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import logging
 from pydantic import BaseModel, Field
@@ -147,6 +148,11 @@ class MultilingualMessageProcessor:
             'location': 'Mexico City'
         }
 
+        self._org_to_clinic_cache: Dict[str, str] = {}
+        self._known_clinic_ids: Set[str] = set()
+        self._patient_upsert_cache: Dict[Tuple[str, str], float] = {}
+        self._patient_upsert_cache_ttl = max(int(os.getenv("PATIENT_UPSERT_CACHE_SECONDS", "120")), 0)
+
     async def process_message(self, request: MessageRequest) -> MessageResponse:
         """Process incoming WhatsApp message with AI, RAG, and persistent memory"""
 
@@ -192,9 +198,18 @@ class MultilingualMessageProcessor:
 
         session_id = session['id']
 
+        session_clinic_id = (
+            (session.get('metadata') or {}).get('clinic_id')
+            or session.get('clinic_id')
+            or request.clinic_id
+        )
+
+        if session_clinic_id:
+            self._known_clinic_ids.add(session_clinic_id)
+
         # Create or update patient record from WhatsApp contact
         await self._upsert_patient_from_whatsapp(
-            clinic_id=request.clinic_id,
+            clinic_id=session_clinic_id or request.clinic_id,
             phone=request.from_phone,
             profile_name=request.profile_name,
             detected_language=None  # Will be detected later
@@ -1195,19 +1210,37 @@ IMPORTANT BEHAVIORS:
         Since request.clinic_id actually contains organization_id,
         we need to look up the real clinic_id from the clinics table.
         """
+        if not organization_id:
+            return organization_id
+
+        if organization_id in self._known_clinic_ids:
+            return organization_id
+
         try:
             client = get_supabase_client()
             if not client:
                 logger.warning("Supabase client unavailable; cannot map clinic_id")
                 return organization_id
 
-            # Check if we have a cached mapping
-            if not hasattr(self, '_org_to_clinic_cache'):
-                self._org_to_clinic_cache = {}
-
             # Return cached mapping if available
             if organization_id in self._org_to_clinic_cache:
                 return self._org_to_clinic_cache[organization_id]
+
+            # If value already matches a known clinic id, short-circuit
+            if organization_id in self._org_to_clinic_cache.values():
+                self._known_clinic_ids.add(organization_id)
+                return organization_id
+
+            # First try to treat the value as a clinic_id
+            try:
+                by_id = client.table('clinics').select('id').eq('id', organization_id).limit(1).execute()
+                if by_id.data:
+                    clinic_id = by_id.data[0]['id']
+                    self._org_to_clinic_cache[organization_id] = clinic_id
+                    self._known_clinic_ids.add(clinic_id)
+                    return clinic_id
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(f"Clinic lookup by id failed for {organization_id}: {exc}")
 
             # Look up clinic by organization_id
             result = client.table('clinics').select('id, organization_id').eq(
@@ -1218,6 +1251,7 @@ IMPORTANT BEHAVIORS:
                 clinic_id = result.data[0]['id']
                 # Cache the mapping
                 self._org_to_clinic_cache[organization_id] = clinic_id
+                self._known_clinic_ids.add(clinic_id)
                 logger.debug(f"Mapped org {organization_id[:8]}... to clinic {clinic_id[:8]}...")
                 return clinic_id
             else:
@@ -1227,6 +1261,7 @@ IMPORTANT BEHAVIORS:
                 if all_clinics.data:
                     clinic_id = all_clinics.data[0]['id']
                     self._org_to_clinic_cache[organization_id] = clinic_id
+                    self._known_clinic_ids.add(clinic_id)
                     return clinic_id
                 else:
                     logger.error("No clinics found in database!")
@@ -1254,6 +1289,19 @@ IMPORTANT BEHAVIORS:
 
             # Map organization_id to actual clinic_id
             actual_clinic_id = self._get_clinic_id_from_organization(clinic_id)
+            self._known_clinic_ids.add(actual_clinic_id)
+
+            if self._patient_upsert_cache_ttl > 0:
+                cache_key = (actual_clinic_id, phone)
+                cached_at = self._patient_upsert_cache.get(cache_key)
+                if cached_at and (perf_counter() - cached_at) < self._patient_upsert_cache_ttl:
+                    logger.debug(
+                        "Skipping patient upsert (cached %.2fs) clinic=%s phone=%s",
+                        perf_counter() - cached_at,
+                        actual_clinic_id,
+                        phone
+                    )
+                    return
 
             # Use extracted names if available, otherwise use profile name
             result = client.rpc('upsert_patient_from_whatsapp', {
@@ -1275,6 +1323,9 @@ IMPORTANT BEHAVIORS:
                         logger.info(f"✅ Updated patient from WhatsApp: {phone} (fields: {', '.join(updated)})")
             else:
                 logger.warning(f"Patient upsert returned no data for {phone}")
+
+            if self._patient_upsert_cache_ttl > 0:
+                self._patient_upsert_cache[(actual_clinic_id, phone)] = perf_counter()
 
         except Exception as e:
             logger.error(f"Failed to upsert patient from WhatsApp: {e}")
