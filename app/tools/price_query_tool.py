@@ -201,6 +201,12 @@ class PriceQueryTool:
             # Generate session ID if not provided
             if not session_id:
                 session_id = str(uuid.uuid4())
+            else:
+                # Ensure session_id is a valid UUID for RPC payloads
+                try:
+                    session_id = str(uuid.UUID(str(session_id)))
+                except ValueError:
+                    session_id = str(uuid.uuid4())
 
             # Normalize and expand query
             normalized = normalize_query(query)

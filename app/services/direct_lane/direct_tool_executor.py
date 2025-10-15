@@ -1,12 +1,13 @@
 # File: clinics/backend/app/services/direct_lane/direct_tool_executor.py
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import asyncio
 from datetime import datetime
 import logging
 import time
 import hashlib
 import uuid
+import os
 
 from app.services.direct_lane.tool_intent_classifier import DirectToolIntent, ToolIntentMatch
 from app.services.direct_lane.circuit_breaker import CircuitBreaker
@@ -45,7 +46,12 @@ class DirectToolExecutor:
         self.max_duration_ms = 800
 
         # Memory retrieval budget (50ms for mem0 context)
-        self.memory_budget_ms = 50
+        self.memory_budget_ms = max(
+            50,
+            int(os.getenv("DIRECT_LANE_MEMORY_BUDGET_MS", "250"))
+        )
+        self._price_tool = None
+        self._redis_client = None
 
     async def execute_tool(
         self,
@@ -419,43 +425,19 @@ class DirectToolExecutor:
 
         # Check if query references previous context ("that service", "same one", etc.)
         if memories and any(ref in query.lower() for ref in ['that', 'same', 'previous', 'last']):
-            # Try to extract service name from memories
             for memory in memories:
                 if 'service' in memory.lower() or 'price' in memory.lower():
                     logger.info(f"Using memory context to resolve query: {query}")
-                    # Memory might contain the actual service name
-                    # This is a simple heuristic - could be enhanced with LLM
                     break
 
-        used_legacy_rpc = False
-
         try:
-            # Use resilient search RPC for multilingual support
-            rpc_payload = {
-                'p_clinic_id': self.clinic_id,
-                'p_query': query,
-                'p_limit': 5,
-                'p_min_score': 0.01,
-                'p_session_id': context.get('session_id', str(uuid.uuid4())) if context else str(uuid.uuid4())
-            }
+            services, used_legacy_rpc = await self._price_search_with_cache(
+                query=query,
+                limit=5,
+                session_id=context.get('session_id') if context else None
+            )
 
-            try:
-                response = self.api_supabase.rpc(
-                    'search_services_v1',
-                    rpc_payload
-                ).execute()
-            except APIError as api_err:
-                used_legacy_rpc = True
-                logger.warning(
-                    "Primary price search RPC failed (%s). Falling back to legacy multilingual search.",
-                    getattr(api_err, 'message', api_err)
-                )
-                response = self.supabase.rpc(
-                    'search_services_multilingual',
-                    rpc_payload
-                ).execute()
-
-            if not response.data:
+            if not services:
                 memory_hint = ""
                 if memories:
                     memory_hint = " You previously asked about some services - would you like me to recall those?"
@@ -472,19 +454,19 @@ class DirectToolExecutor:
                     }
                 }
 
-            # Format response
-            lines = [f"Found {len(response.data)} service(s):\n"]
-            for i, svc in enumerate(response.data, 1):
-                price_str = f"${svc.get('base_price', 0):.2f}" if svc.get('base_price') else "Contact us"
+            lines = [f"Found {len(services)} service(s):\n"]
+            for i, svc in enumerate(services, 1):
+                price_value = svc.get('base_price')
+                if price_value is None:
+                    price_value = svc.get('price')
+                price_str = f"${price_value:.2f}" if price_value else "Contact us"
                 lines.append(f"{i}. **{svc['name']}** - {price_str}")
                 if svc.get('description'):
                     lines.append(f"   {svc['description'][:80]}...")
 
-            # Add memory-based personalization
-            if memories and len(memories) > 0:
-                # Check if user previously asked about similar services
+            if memories:
                 for memory in memories:
-                    if any(svc['name'].lower() in memory.lower() for svc in response.data):
+                    if any(svc['name'].lower() in memory.lower() for svc in services):
                         lines.append("\n_I remember you were interested in this before!_")
                         break
 
@@ -492,9 +474,9 @@ class DirectToolExecutor:
                 "success": True,
                 "response": "\n".join(lines),
                 "metadata": {
-                    "services_found": len(response.data),
+                    "services_found": len(services),
                     "query": query,
-                    "search_stage": response.data[0].get('search_stage', 'unknown') if response.data else 'none',
+                    "search_stage": services[0].get('search_stage', 'unknown') if services else 'none',
                     "used_memories": len(memories) if memories else 0,
                     "legacy_rpc_fallback": used_legacy_rpc
                 }
@@ -506,6 +488,98 @@ class DirectToolExecutor:
                 "success": False,
                 "error": str(e)
             }
+
+    async def _price_search_with_cache(
+        self,
+        query: str,
+        limit: int,
+        session_id: Optional[str]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        Run price search using cached services first, falling back to RPC if needed.
+
+        Returns:
+            (services, used_legacy_rpc)
+        """
+        try:
+            price_tool = self._get_price_tool()
+            results = await price_tool.get_services_by_query(
+                query=query,
+                limit=limit,
+                session_id=session_id
+            )
+
+            deduped: Dict[str, Dict[str, Any]] = {}
+            for service in results:
+                service_id = service.get("id")
+                if not service_id:
+                    continue
+                deduped.setdefault(service_id, service)
+
+            return list(deduped.values()), False
+        except Exception as tool_exc:
+            logger.warning(f"PriceQueryTool failed ({tool_exc}); falling back to RPC search")
+            services, used_legacy = self._price_search_via_rpc(query, limit, session_id)
+            return services, used_legacy
+
+    def _get_price_tool(self):
+        """
+        Lazily instantiate PriceQueryTool with Redis caching.
+        """
+        if self._price_tool is not None:
+            return self._price_tool
+
+        from app.tools.price_query_tool import PriceQueryTool
+        from app.config import get_redis_client
+
+        if self._redis_client is None:
+            self._redis_client = get_redis_client()
+
+        self._price_tool = PriceQueryTool(
+            clinic_id=self.clinic_id,
+            redis_client=self._redis_client
+        )
+        return self._price_tool
+
+    def _price_search_via_rpc(
+        self,
+        query: str,
+        limit: int,
+        session_id: Optional[str]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        Legacy fallback using direct RPC calls (no cache). Returns services and
+        whether we fell back to the legacy multilingual RPC.
+        """
+        payload = {
+            'p_clinic_id': self.clinic_id,
+            'p_query': query,
+            'p_limit': limit,
+            'p_min_score': 0.01,
+            'p_session_id': session_id or str(uuid.uuid4())
+        }
+
+        used_legacy_rpc = False
+
+        try:
+            response = self.api_supabase.rpc('search_services_v1', payload).execute()
+        except APIError as api_err:
+            used_legacy_rpc = True
+            logger.warning(
+                "Primary price search RPC failed (%s). Falling back to legacy multilingual search.",
+                getattr(api_err, 'message', api_err)
+            )
+            response = self.supabase.rpc('search_services_multilingual', payload).execute()
+
+        services = response.data or []
+        deduped: Dict[str, Dict[str, Any]] = {}
+        for service in services:
+            service_id = service.get("id")
+            if not service_id:
+                continue
+            deduped.setdefault(service_id, service)
+
+        return list(deduped.values()), used_legacy_rpc
 
     async def _execute_availability_check(
         self,

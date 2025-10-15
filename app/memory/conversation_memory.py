@@ -26,9 +26,9 @@ from app.memory.mem0_metrics import get_mem0_metrics_recorder
 
 logger = logging.getLogger(__name__)
 
-# Mem0 operation timeout (configurable via MEM0_TIMEOUT_MS, default 1100ms)
+# Mem0 operation timeout (configurable via MEM0_TIMEOUT_MS, default 2500ms)
 # Enforce a floor of 800ms to prevent overly aggressive timeouts.
-MEM0_TIMEOUT_MS = max(int(os.getenv("MEM0_TIMEOUT_MS", "1100")), 800)
+MEM0_TIMEOUT_MS = max(int(os.getenv("MEM0_TIMEOUT_MS", "2500")), 800)
 
 # Module-global in-flight deduplication map
 _inflight: Dict[tuple, asyncio.Task] = {}
@@ -868,6 +868,43 @@ class ConversationMemoryManager:
         except Exception as exc:
             logger.debug(f"Cached mem0 summary fetch failed: {exc}")
             return []
+
+    async def debug_list_mem0_memories(
+        self,
+        phone_number: str,
+        clinic_id: Optional[str] = None,
+        limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        Diagnostic helper to inspect mem0/Qdrant contents for a given user.
+        Bypasses the standard lookup cache and uses longer-running mem0 calls.
+        """
+        self._ensure_mem0_initialized()
+
+        if not self.mem0_available or not self.memory:
+            logger.info("mem0 unavailable; debug listing skipped")
+            return []
+
+        clean_phone = phone_number.replace("@s.whatsapp.net", "")
+        candidates = self._candidate_mem0_user_ids(clean_phone, clinic_id)
+
+        results: List[Dict[str, Any]] = []
+        loop = asyncio.get_running_loop()
+
+        for user_id in candidates:
+            try:
+                memories = await loop.run_in_executor(
+                    None,
+                    lambda uid=user_id: self.memory.get_all(user_id=uid, limit=limit)
+                )
+                results.append({
+                    "user_id": user_id,
+                    "memories": memories or []
+                })
+            except Exception as exc:
+                logger.debug("Failed to dump mem0 memories for %s: %s", user_id, exc)
+
+        return results
 
     async def get_memory_context(
         self,
