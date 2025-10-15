@@ -225,7 +225,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Healthcare Clinics Backend",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    redirect_slashes=False  # Prevent HTTP redirects from HTTPS requests
 )
 
 # Configure CORS - explicitly allow production frontend
