@@ -16,7 +16,7 @@ from time import perf_counter
 if TYPE_CHECKING:
     import asyncio
 try:
-    from mem0 import Memory
+    from mem0 import Memory, MemoryClient
     MEM0_AVAILABLE = True
 except ImportError:
     MEM0_AVAILABLE = False
@@ -133,10 +133,25 @@ class ConversationMemoryManager:
         return storage_path
 
     def _init_mem0(self):
-        """Initialize mem0 with Qdrant vector store (self-hosted, local mode)"""
+        """Initialize mem0 (cloud if API key configured, otherwise local Qdrant)."""
 
-        # Use Qdrant in local mode - no external service needed!
-        # Data is stored locally in the filesystem for HIPAA compliance
+        api_key = os.getenv("MEM0_API_KEY")
+        base_url = os.getenv("MEM0_BASE_URL", "https://api.mem0.ai")
+
+        if api_key:
+            try:
+                logger.info("Initializing mem0 with managed service endpoint...")
+                self.memory = MemoryClient(api_key=api_key, host=base_url)
+                self.mem0_available = True
+                logger.info("✅ mem0 cloud initialization successful")
+                return
+            except Exception as cloud_error:
+                logger.error(f"❌ mem0 cloud initialization failed: {cloud_error}", exc_info=True)
+                if os.environ.get('MEM0_REQUIRED', 'false').lower() == 'true':
+                    raise
+                # Fall back to local configuration
+
+        # Default to local Qdrant-backed configuration
         mem0_config = {
             "llm": {
                 "provider": "openai",
@@ -155,7 +170,6 @@ class ConversationMemoryManager:
                 "provider": "qdrant",
                 "config": {
                     "collection_name": "whatsapp_memories",
-                    # Ensure directory exists
                     "path": self._ensure_qdrant_path(),
                     "embedding_model_dims": 1536
                 }
@@ -164,12 +178,11 @@ class ConversationMemoryManager:
         }
 
         try:
-            logger.info("Initializing mem0 with Qdrant vector store (local mode)...")
+            logger.info("Initializing mem0 with local Qdrant vector store...")
             self.memory = Memory.from_config(mem0_config)
             self.mem0_available = True
             logger.info("✅ mem0 initialized successfully")
 
-            # Test mem0 connectivity
             try:
                 test_memories = self.memory.get_all(user_id="system_test", limit=1)
                 logger.info(f"✅ mem0 connectivity test passed (found {len(test_memories)} memories)")
@@ -180,7 +193,6 @@ class ConversationMemoryManager:
             logger.error(f"❌ mem0 initialization failed: {e}", exc_info=True)
             self.memory = None
             self.mem0_available = False
-            # Don't silently fail - raise if mem0 is critical
             if os.environ.get('MEM0_REQUIRED', 'false').lower() == 'true':
                 raise
 

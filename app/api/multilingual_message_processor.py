@@ -130,24 +130,6 @@ class MultilingualMessageProcessor:
         self.escalation_handler = EscalationHandler()
         self.followup_scheduler = FollowupScheduler()
 
-        # Clinic information (can be loaded from database)
-        self.clinic_info = {
-            'hours': {
-                'weekdays': '9:00-19:00',
-                'saturday': '9:00-14:00',
-                'sunday': 'Closed'
-            },
-            'services': [
-                'Dental cleaning',
-                'Teeth whitening',
-                'Orthodontics',
-                'Dental implants',
-                'Emergency care',
-                'General dentistry'
-            ],
-            'location': 'Mexico City'
-        }
-
         self._org_to_clinic_cache: Dict[str, str] = {}
         self._known_clinic_ids: Set[str] = set()
         self._patient_upsert_cache: Dict[Tuple[str, str], float] = {}
@@ -155,6 +137,7 @@ class MultilingualMessageProcessor:
         self._clinic_cache_warm_timestamps: Dict[str, float] = {}
         self._clinic_cache_inflight: Set[str] = set()
         self._clinic_cache_warm_ttl = int(os.getenv("CLINIC_CACHE_WARM_TTL_SECONDS", "900"))
+        self._clinic_profile_cache: Dict[str, Dict[str, Any]] = {}
 
     async def process_message(self, request: MessageRequest) -> MessageResponse:
         """Process incoming WhatsApp message with AI, RAG, and persistent memory"""
@@ -214,6 +197,15 @@ class MultilingualMessageProcessor:
 
         if effective_clinic_id:
             self._known_clinic_ids.add(effective_clinic_id)
+
+        clinic_profile = await self._get_clinic_profile(effective_clinic_id)
+
+        resolved_clinic_name = (
+            clinic_profile.get('name')
+            or (session.get('name') if isinstance(session, dict) else None)
+            or request.clinic_name
+            or "Clinic"
+        )
 
         if self._should_warm_clinic_cache(effective_clinic_id):
             self._clinic_cache_inflight.add(effective_clinic_id)
@@ -430,13 +422,14 @@ DO NOT attempt to answer complex questions yourself.
         # Generate AI response with full context
         ai_response, detected_language = await self._generate_response(
             user_message=request.body,
-            clinic_name=request.clinic_name,
+            clinic_name=resolved_clinic_name,
             clinic_id=effective_clinic_id or resolved_request_clinic_id or request.clinic_id,
             session_history=session_messages,
             knowledge_context=[],  # No RAG - knowledge via tools only
             memory_context=memory_context,
             user_preferences=user_preferences,
-            additional_context=additional_context
+            additional_context=additional_context,
+            clinic_profile=clinic_profile
         )
 
         # Update patient with extracted name and detected language
@@ -628,9 +621,28 @@ DO NOT attempt to answer complex questions yourself.
         knowledge_context: List[str] = None,
         memory_context: List[str] = None,
         user_preferences: Dict[str, Any] = None,
-        additional_context: str = ""
+        additional_context: str = "",
+        clinic_profile: Optional[Dict[str, Any]] = None
     ) -> tuple[str, str]:
         """Generate AI response using OpenAI with automatic language detection, RAG context, and memory"""
+
+        clinic_profile = clinic_profile or {}
+        location_parts = []
+        if clinic_profile.get('city'):
+            location_parts.append(clinic_profile['city'])
+        if clinic_profile.get('state'):
+            location_parts.append(clinic_profile['state'])
+        if clinic_profile.get('country'):
+            location_parts.append(clinic_profile['country'])
+        profile_location = clinic_profile.get('location') or ', '.join([part for part in location_parts if part]) or clinic_profile.get('timezone') or 'Unknown'
+
+        services_list = clinic_profile.get('services') or []
+        services_text = ', '.join(services_list[:6]) if services_list else "Information available upon request"
+
+        hours = clinic_profile.get('hours') or {}
+        weekday_hours = hours.get('weekdays') or hours.get('monday') or "Not provided"
+        saturday_hours = hours.get('saturday') or "Not provided"
+        sunday_hours = hours.get('sunday') or "Not provided"
 
         # Build knowledge context section with enhanced formatting
         knowledge_section = ""
@@ -769,13 +781,13 @@ CRITICAL LANGUAGE RULE: You MUST maintain conversation language consistency. Use
 {additional_context}{conversation_summary}{memory_section}{preferences_section}{knowledge_section}
 Clinic Information:
 - Name: {clinic_name}
-- Location: {self.clinic_info['location']}
-- Services: {', '.join(self.clinic_info['services'])}
+- Location: {profile_location}
+- Services: {services_text}
 - Staff: {doctor_info_text if doctor_info_text else "Information available upon request"}
 - Hours:
-  - Monday-Friday: {self.clinic_info['hours']['weekdays']}
-  - Saturday: {self.clinic_info['hours']['saturday']}
-  - Sunday: {self.clinic_info['hours']['sunday']}
+  - Monday-Friday: {weekday_hours}
+  - Saturday: {saturday_hours}
+  - Sunday: {sunday_hours}
 
 Instructions:
 1. ABSOLUTELY CRITICAL: Maintain conversation language consistency. Stay in the current conversation language unless the user explicitly switches with a full sentence.
@@ -1325,6 +1337,31 @@ IMPORTANT BEHAVIORS:
         except Exception as e:
             logger.error(f"Error mapping organization to clinic: {e}")
             return organization_id
+
+    async def _get_clinic_profile(self, clinic_id: Optional[str]) -> Dict[str, Any]:
+        """Fetch clinic profile data with Redis caching."""
+        if not clinic_id:
+            return {}
+
+        if clinic_id in self._clinic_profile_cache:
+            return self._clinic_profile_cache[clinic_id]
+
+        try:
+            from app.tools.clinic_info_tool import ClinicInfoTool
+            from app.config import get_redis_client
+
+            supabase_client = get_supabase_client()
+            redis_client = get_redis_client()
+            tool = ClinicInfoTool(clinic_id=clinic_id, redis_client=redis_client)
+            profile = await tool.get_clinic_info(supabase_client)
+
+            if profile:
+                self._clinic_profile_cache[clinic_id] = profile
+                return profile
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning(f"Unable to fetch clinic profile for {clinic_id}: {exc}")
+
+        return {}
 
     def _should_warm_clinic_cache(self, clinic_id: Optional[str]) -> bool:
         """Determine if clinic cache warming should be triggered."""

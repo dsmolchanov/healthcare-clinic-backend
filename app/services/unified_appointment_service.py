@@ -299,7 +299,7 @@ class UnifiedAppointmentService:
                             INSERT INTO healthcare.appointments (
                                 id, clinic_id, patient_id, doctor_id,
                                 appointment_date, start_time, end_time,
-                                status, appointment_type, reason, notes,
+                                status, appointment_type, reason_for_visit, notes,
                                 reservation_id, room_id, created_at, updated_at
                             )
                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)

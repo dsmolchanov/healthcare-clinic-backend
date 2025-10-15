@@ -102,24 +102,55 @@ class ClinicInfoTool:
                     logger.warning(f"Redis cache error, falling back to DB: {cache_error}")
 
             # Cache miss or no Redis - fetch from database
-            result = supabase_client.table('clinics').select('*').eq(
-                'id', self.clinic_id
-            ).limit(1).execute()
+            result = (
+                supabase_client
+                .schema('healthcare')
+                .table('clinics')
+                .select('id,name,address,city,state,country,phone,email,timezone,business_hours,settings')
+                .eq('id', self.clinic_id)
+                .limit(1)
+                .execute()
+            )
 
             if not result.data:
                 return {}
 
             clinic = result.data[0]
+            city = clinic.get('city') or ''
+            state = clinic.get('state') or ''
+            country = clinic.get('country') or ''
+
+            location_parts = [part for part in [city, state, country] if part]
+            settings = clinic.get('settings') or {}
+            if isinstance(settings, str):
+                try:
+                    settings = json.loads(settings)
+                except Exception:
+                    settings = {}
+            supported_languages = (
+                clinic.get('supported_languages')
+                or settings.get('supported_languages')
+                or ['en']
+            )
+            business_hours = clinic.get('business_hours') or {}
+            if isinstance(business_hours, str):
+                try:
+                    business_hours = json.loads(business_hours)
+                except Exception:
+                    business_hours = {}
+
             clinic_info = {
                 'name': clinic.get('name', ''),
                 'address': clinic.get('address', ''),
-                'city': clinic.get('city', ''),
-                'state': clinic.get('state', ''),
-                'country': clinic.get('country', ''),
+                'city': city,
+                'state': state,
+                'country': country,
                 'phone': clinic.get('phone', ''),
                 'email': clinic.get('email', ''),
-                'hours': clinic.get('business_hours', {}),
-                'languages': clinic.get('supported_languages', ['en'])
+                'hours': business_hours,
+                'timezone': clinic.get('timezone'),
+                'languages': supported_languages,
+                'location': ', '.join(location_parts) if location_parts else clinic.get('timezone', '')
             }
 
             # Cache the result for future use
