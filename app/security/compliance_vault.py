@@ -379,31 +379,46 @@ class ComplianceVault:
         compliance_flags: list = None
     ):
         """Create audit log entry for compliance"""
+        timestamp = datetime.utcnow()
+
+        # Map to existing audit_logs schema while also populating new fields
         audit_entry = {
-            'organization_id': organization_id,
-            'event_type': f'secret_{action}',
-            'event_category': 'security_event',
-            'event_data': {
+            # Existing schema fields (required)
+            'operation': f'secret_{action}',  # Maps to event_type
+            'table_name': 'vault_storage',     # Maps to event_category
+            'record_id': secret_type,          # Maps to resource_id
+            'user_id': user_id,
+            'accessed_at': timestamp.isoformat(),
+            'metadata': {
                 'secret_type': secret_type,
                 'action': action,
-                'timestamp': datetime.utcnow().isoformat(),
-                'user_id': user_id,
+                'organization_id': organization_id,
                 'actor_type': 'user' if user_id else 'system',
-                'compliance_flags': compliance_flags or [],  # Move to event_data
+                'compliance_flags': compliance_flags or [],
                 'checksum': self._calculate_checksum({
                     'organization_id': organization_id,
                     'secret_type': secret_type,
                     'action': action
                 })
             },
+            'contains_phi': True,  # Calendar data may contain PHI
+
+            # New schema fields (added by migration, optional)
+            'organization_id': organization_id,
+            'event_type': f'secret_{action}',
+            'event_category': 'security_event',
+            'event_data': {
+                'secret_type': secret_type,
+                'action': action,
+                'timestamp': timestamp.isoformat(),
+                'user_id': user_id,
+                'actor_type': 'user' if user_id else 'system',
+                'compliance_flags': compliance_flags or []
+            },
             'resource_type': 'secret',
             'resource_id': secret_type,
-            'contains_phi': True,  # Calendar data may contain PHI
-            'created_at': datetime.utcnow().isoformat()
+            'created_at': timestamp.isoformat()
         }
-
-        # Only include actor_id if table supports it (optional field)
-        # Removed from top-level to avoid schema mismatch - stored in event_data instead
 
         self.supabase.table('audit_logs').insert(audit_entry).execute()
 
