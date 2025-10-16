@@ -51,10 +51,10 @@ class AppointmentRequest:
     patient_id: str
     doctor_id: str
     clinic_id: str
-    service_id: Optional[str] = None
     start_time: datetime
     end_time: datetime
     appointment_type: AppointmentType
+    service_id: Optional[str] = None
     reason: Optional[str] = None
     notes: Optional[str] = None
     patient_phone: Optional[str] = None
