@@ -563,38 +563,18 @@ class IntentRouter:
             redis_client = get_redis_client()
             price_tool = PriceQueryTool(clinic_id=clinic_id, redis_client=redis_client)
 
-            # Smart query cleaning with multi-layer fallback
-            import re
+            # Use enhanced text normalization (fixes veneers/implants issue)
+            from app.services.text_normalization import normalize_query
 
-            # 1) Remove action verbs/nouns that cause false ANDs in FTS
-            action_words = [
-                # Russian action words
-                r'установк\w*', r'постав\w*', r'сдела\w*', r'провед\w*', r'нужн\w*', r'хочу', r'хотел\w*',
-                r'сколько', r'стоит', r'стоимость', r'цена', r'цен[аы]', r'на', r'за', r'какая', r'какова',
-                # English action words
-                r'install\w*', r'need\w*', r'want\w*', r'get\w*', r'make\w*', r'do\w*',
-                r'how', r'much', r'does', r'cost', r'price\w*', r'of', r'the', r'a', r'an', r'is', r'for',
-                r'what\w*', r'tell', r'me', r'about',
-                # Spanish action words
-                r'instalar\w*', r'necesit\w*', r'quier\w*', r'hacer\w*',
-                r'cuánto', r'cuesta', r'cuestan', r'precio\w*', r'de', r'el', r'la', r'los', r'las', r'un\w*',
-                r'qué', r'para',
-                # Hebrew action words
-                r'להתקי\w*', r'צרי\w*', r'רוצ\w*',
-                r'כמה', r'עול\w*', r'מחיר\w*', r'של', r'את', r'ה\w*', r'מה'
-            ]
+            # Normalize the query with language-specific processing
+            # This handles typos, stopwords, and extracts service names correctly
+            query = normalize_query(user_text, language=lang)
 
-            clean = user_text
-            for pattern in action_words:
-                clean = re.sub(r'\b' + pattern + r'\b', ' ', clean, flags=re.IGNORECASE)
+            # Fallback to original if normalization returns empty
+            if not query or len(query.strip()) < 2:
+                query = user_text
 
-            # Clean up multiple spaces, punctuation
-            clean = re.sub(r'[?!.,:;]', ' ', clean)
-            clean = ' '.join(clean.split()).strip()
-
-            query = clean or user_text
-
-            logger.info(f"Querying services with: '{query}'")
+            logger.info(f"Querying services with: '{query}' (normalized from: '{user_text}')")
 
             # Use PriceQueryTool which handles cache → DB fallback automatically
             matched_services = await price_tool.get_services_by_query(
@@ -607,6 +587,12 @@ class IntentRouter:
             if matched_services:
                 search_stage = matched_services[0].get('search_stage', 'unknown')
                 logger.info(f"Found {len(matched_services)} services (stage: {search_stage})")
+
+                # Safety check: Reject low-confidence default_fallback results
+                # This prevents returning random services (e.g., implants when asking for veneers)
+                if search_stage == 'default_fallback':
+                    logger.warning(f"Rejecting default_fallback results - likely irrelevant matches")
+                    matched_services = []  # Treat as no results
             else:
                 logger.info(f"Found 0 services")
 
