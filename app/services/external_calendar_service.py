@@ -383,16 +383,19 @@ class ExternalCalendarService:
             logger.info(f"Phase 3: RESERVE - Confirming reservation {reservation_id}")
             try:
                 reserve_results = []
+                internal_confirmed = False
 
                 if skip_internal_confirmation:
                     reserve_results.append({
                         'success': True,
-                        'appointment_id': appointment_payload.get('id')
+                        'appointment_id': appointment_payload.get('id'),
+                        'internal_confirmed': False
                     })
                 else:
-                    reserve_results.append(
-                        await self._confirm_internal_appointment(reservation_id, appointment_payload)
-                    )
+                    internal_result = await self._confirm_internal_appointment(reservation_id, appointment_payload)
+                    internal_confirmed = internal_result.get('success', False)
+                    internal_result['internal_confirmed'] = internal_confirmed
+                    reserve_results.append(internal_result)
 
                 external_results = await asyncio.gather(
                     self._confirm_google_calendar_event(reservation_id, appointment_payload),
@@ -428,6 +431,7 @@ class ExternalCalendarService:
                     'reservation_id': reservation_id,
                     'confirmed_calendars': successful_confirmations,
                     'appointment_id': appointment_id,
+                    'internal_confirmed': internal_confirmed,
                     'partial_failures': failed_confirmations if failed_confirmations else None
                 }
 

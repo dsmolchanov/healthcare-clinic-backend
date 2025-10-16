@@ -45,13 +45,19 @@ class CerebrasAdapter(LLMAdapter):
 
             latency_ms = int((time.time() - start_time) * 1000)
 
-            # Extract content - Cerebras returns content in message.content
-            content = response.choices[0].message.content
+            # Extract content - Cerebras may return content in reasoning field
+            message = response.choices[0].message
+            content = message.content
+
+            # If content is None but we have reasoning, use reasoning instead
+            if not content and hasattr(message, 'reasoning') and message.reasoning:
+                logger.info(f"Cerebras returned content in reasoning field, extracting...")
+                content = message.reasoning
 
             # Log for debugging
             if not content and response.usage.completion_tokens > 0:
                 logger.warning(f"Cerebras returned empty content but generated {response.usage.completion_tokens} tokens")
-                logger.warning(f"Message object: {response.choices[0].message}")
+                logger.warning(f"Message object: {message}")
 
             return LLMResponse(
                 content=content or "",  # Ensure non-None content
@@ -101,13 +107,19 @@ class CerebrasAdapter(LLMAdapter):
             # Normalize tool calls
             tool_calls = self.normalize_tool_calls(response)
 
-            # Extract content - Cerebras returns content in message.content
-            content = response.choices[0].message.content
+            # Extract content - Cerebras may return content in reasoning field
+            message = response.choices[0].message
+            content = message.content
+
+            # If content is None but we have reasoning, use reasoning instead
+            if not content and hasattr(message, 'reasoning') and message.reasoning:
+                logger.info(f"Cerebras returned content in reasoning field, extracting...")
+                content = message.reasoning
 
             # Log for debugging
             if not content and response.usage.completion_tokens > 0:
                 logger.warning(f"Cerebras returned empty content but generated {response.usage.completion_tokens} tokens")
-                logger.warning(f"Message object: {response.choices[0].message}")
+                logger.warning(f"Message object: {message}")
 
             return LLMResponse(
                 content=content or "",  # Ensure non-None content

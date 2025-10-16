@@ -194,7 +194,9 @@ class UnifiedAppointmentService:
 
             reservation_id = hold_result.get('reservation_id')
             appointment_payload['reservation_id'] = reservation_id
-            precreated_appointment_id = hold_result.get('appointment_id')
+
+            internal_confirmed = hold_result.get('internal_confirmed', False)
+            precreated_appointment_id = hold_result.get('appointment_id') if internal_confirmed else None
             if precreated_appointment_id:
                 appointment_id = precreated_appointment_id
                 appointment_payload['id'] = appointment_id
