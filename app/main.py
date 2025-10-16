@@ -302,8 +302,6 @@ from app.api import evolution_webhook
 app.include_router(evolution_webhook.router)
 
 # Include Rule Engine routes
-from app.api import rules_routes
-app.include_router(rules_routes.router)
 
 # Include Scheduling API for intelligent scheduling system
 from app.api import scheduling_routes

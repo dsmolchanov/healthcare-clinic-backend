@@ -1,5 +1,8 @@
 # Room Assignment Performance Report
 
+> **Note**  
+> This report covers the legacy rule-engine implementation. The production system now uses the unified scheduling service; retain this document for archival reference.
+
 **Issue**: #34 - Database Migrations, Testing & Performance
 **Stream**: C - Integration & Load Testing
 **Date**: 2025-10-14

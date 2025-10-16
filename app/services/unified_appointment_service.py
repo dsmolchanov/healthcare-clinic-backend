@@ -15,8 +15,6 @@ from enum import Enum
 from supabase import create_client, Client
 from .external_calendar_service import ExternalCalendarService
 from .websocket_manager import websocket_manager, NotificationType
-from .rule_evaluator import RuleEvaluator, EvaluationContext, TimeSlot as RuleTimeSlot
-from .policy_cache import PolicyCache
 from ..database import get_db_connection
 import asyncpg
 
@@ -91,10 +89,6 @@ class UnifiedAppointmentService:
             self.healthcare_supabase = self.supabase
         self.calendar_service = ExternalCalendarService(self.supabase)
         self.default_appointment_duration = timedelta(minutes=30)
-
-        # Initialize room assignment components
-        self.policy_cache = PolicyCache(self.supabase)
-        self.rule_evaluator = RuleEvaluator(self.supabase, self.policy_cache)
 
     async def get_available_slots(
         self,
@@ -257,45 +251,10 @@ class UnifiedAppointmentService:
                         if not available_rooms_rows:
                             logger.warning("No available rooms found")
                         else:
-                            # Convert rows to dict for compatibility with scoring logic
-                            available_rooms = [dict(row) for row in available_rooms_rows]
-
-                            # Create evaluation context
-                            context = EvaluationContext(
-                                clinic_id=request.clinic_id,
-                                patient_id=request.patient_id,
-                                requested_service=request.appointment_type.value
-                            )
-
-                            # Score each available room
-                            scored_slots = []
-                            for room in available_rooms:
-                                # Create a TimeSlot for rules evaluation
-                                slot = RuleTimeSlot(
-                                    id=str(uuid.uuid4()),
-                                    doctor_id=request.doctor_id,
-                                    room_id=str(room['id']),
-                                    service_id=request.appointment_type.value,
-                                    start_time=request.start_time,
-                                    end_time=request.end_time
-                                )
-
-                                # Evaluate the slot
-                                result = await self.rule_evaluator.evaluate_slot(context, slot)
-
-                                if result.is_valid:
-                                    scored_slots.append((room, result.score))
-                                    logger.debug(f"Room {room['id']} scored {result.score}")
-                                else:
-                                    logger.debug(f"Room {room['id']} invalid: {result.explanations}")
-
-                            # Select the room with the highest score
-                            if scored_slots:
-                                best_room, best_score = max(scored_slots, key=lambda x: x[1])
-                                room_id = str(best_room['id'])
-                                logger.info(f"Selected room {room_id} with score {best_score}")
-                            else:
-                                logger.warning("Rules engine found no valid rooms")
+                            # Pick the first available room (rule engine removed)
+                            selected_room = dict(available_rooms_rows[0])
+                            room_id = str(selected_room['id'])
+                            logger.info(f"Selected room {room_id} using availability-first strategy")
 
                         # Phase 3: Insert appointment within transaction
                         appointment_insert = await conn.execute(

@@ -1,10 +1,13 @@
 # Room-Specific Rule Types
 
-This document describes the room-specific rule types available in the RuleEvaluator service for intelligent room assignment during appointment scheduling.
+> **Deprecated**  
+> The legacy `RuleEvaluator` service and associated booking rules were removed in favor of the new scheduling service. This document is retained for historical reference only.
+
+This document describes the room-specific rule types previously available in the RuleEvaluator service for intelligent room assignment during appointment scheduling.
 
 ## Overview
 
-The RuleEvaluator now supports 4 room-specific rule types that enable automated room assignment based on various constraints and preferences:
+Historically the RuleEvaluator supported 4 room-specific rule types that enabled automated room assignment based on various constraints and preferences:
 
 - **2 Hard Constraints**: Must be satisfied for a room to be valid
 - **2 Soft Preferences**: Used for scoring and ranking available rooms

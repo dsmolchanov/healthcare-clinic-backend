@@ -610,7 +610,7 @@ class EscalationManager:
 
         logger.warning("escalation.appointment_placeholder", extra={
             "escalation_id": escalation['id'],
-            "message": "TODO: Integrate with actual appointment service"
+            "note": "TODO: Integrate with actual appointment service"
         })
 
         return placeholder_appointment

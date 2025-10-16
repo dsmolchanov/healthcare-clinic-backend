@@ -86,21 +86,13 @@ pytest tests/integration/test_room_assignment_integration.py::TestRoomOverrideFl
 # Conflict detection
 pytest tests/integration/test_room_assignment_integration.py::TestConflictDetection -v
 
-# Rules engine
-pytest tests/integration/test_room_assignment_integration.py::TestRulesEngineIntegration -v
-```
-
-### With Coverage Report
-
-```bash
+# View coverage
 pytest tests/integration/ \
   --cov=app/services/unified_appointment_service \
   --cov=app/api/appointments_api \
-  --cov=app/services/rule_evaluator \
   --cov-report=html \
   --cov-report=term
 
-# View report
 open htmlcov/index.html
 ```
 

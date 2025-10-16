@@ -66,18 +66,13 @@ async def get_escalation_manager():
     """
     global _escalation_manager
 
-    # TODO: Wait for Task #17 to implement EscalationManager
-    # from ..services.scheduling.escalation_manager import EscalationManager
-    #
-    # if _escalation_manager is None:
-    #     db = await get_supabase()
-    #     _escalation_manager = EscalationManager(db)
-    #
-    # return _escalation_manager
+    from ..services.scheduling.escalation_manager import EscalationManager
 
-    # Placeholder return
-    logger.warning("EscalationManager not yet implemented (waiting for Task #17)")
-    return None
+    if _escalation_manager is None:
+        db = await get_supabase()
+        _escalation_manager = EscalationManager(db)
+
+    return _escalation_manager
 
 
 # ============================================================================
@@ -131,13 +126,6 @@ async def suggest_slots(
     ```
     """
     try:
-        # TODO: Implement once SchedulingService is ready (Task #19)
-        if service is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="SchedulingService not yet implemented. Waiting for Task #19."
-            )
-
         date_range = DateRange(start_date=start_date, end_date=end_date)
 
         slots = await service.suggest_slots(
@@ -216,13 +204,6 @@ async def hold_slot(
     ```
     """
     try:
-        # TODO: Implement once SchedulingService is ready (Task #19)
-        if service is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="SchedulingService not yet implemented. Waiting for Task #19."
-            )
-
         hold = await service.hold_slot(
             slot=slot,
             client_hold_id=client_hold_id,
@@ -278,13 +259,6 @@ async def confirm_hold(
     ```
     """
     try:
-        # TODO: Implement once SchedulingService is ready (Task #19)
-        if service is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="SchedulingService not yet implemented. Waiting for Task #19."
-            )
-
         appointment = await service.confirm_hold(
             hold_id=hold_id,
             patient_id=patient_id,

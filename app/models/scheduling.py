@@ -65,6 +65,7 @@ class HoldResponse(BaseModel):
     slot: Slot = Field(..., description="Held slot")
     expires_at: datetime = Field(..., description="Hold expiration time")
     client_hold_id: str = Field(..., description="Client-provided idempotency key")
+    is_new: bool = Field(..., description="True if the hold was newly created")
 
 
 class AppointmentResponse(BaseModel):

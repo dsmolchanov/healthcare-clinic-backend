@@ -14,11 +14,32 @@ import asyncio
 import aiohttp
 from pathlib import Path
 import logging
-import fitz  # PyMuPDF for PDF handling
-from PIL import Image
+try:  # Optional dependency used only for PDF parsing
+    import fitz  # type: ignore  # PyMuPDF for PDF handling
+except ImportError:  # pragma: no cover
+    fitz = None
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None
 import io
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_pymupdf_available():
+    if fitz is None:  # pragma: no cover - exercised only when dependency missing
+        raise RuntimeError(
+            "PyMuPDF (fitz) is required for PDF processing. Install 'pymupdf' to enable this feature."
+        )
+
+
+def _ensure_pillow_available():
+    if Image is None:  # pragma: no cover
+        raise RuntimeError(
+            "Pillow is required for image processing. Install 'pillow' to enable this feature."
+        )
 
 class DataType(Enum):
     STRING = "string"
@@ -277,6 +298,8 @@ class GrokMultimodalParser:
         images = []
         try:
             pdf_stream = io.BytesIO(pdf_bytes)
+            _ensure_pymupdf_available()
+            _ensure_pymupdf_available()
             doc = fitz.open(stream=pdf_stream, filetype="pdf")
             
             pages_to_process = min(len(doc), max_pages)

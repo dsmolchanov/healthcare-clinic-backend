@@ -259,6 +259,7 @@ class SchedulingService:
                     hold_id=UUID(hold["id"]),
                     expires_at=datetime.fromisoformat(hold["expires_at"]),
                     slot=slot,
+                    client_hold_id=client_hold_id,
                     is_new=False
                 )
 
@@ -286,6 +287,8 @@ class SchedulingService:
                 "end_time": slot.end_time.isoformat(),
                 "expires_at": expires_at.isoformat(),
                 "client_hold_id": client_hold_id,
+                "slot_id": getattr(slot, "slot_id", str(uuid4())),
+                "doctor_name": getattr(slot, "doctor_name", "Unknown"),
                 "created_at": datetime.utcnow().isoformat()
             }
 
@@ -299,6 +302,7 @@ class SchedulingService:
                 hold_id=UUID(hold_data["id"]),
                 expires_at=expires_at,
                 slot=slot,
+                client_hold_id=client_hold_id,
                 is_new=True
             )
 
@@ -395,16 +399,22 @@ class SchedulingService:
                 )
                 calendar_synced = sync_result.get("success", False)
                 calendar_event_ids = sync_result.get("event_ids")
+                if isinstance(calendar_event_ids, list):
+                    calendar_event_ids = {f"event_{idx}": event_id for idx, event_id in enumerate(calendar_event_ids)}
             except Exception as e:
                 logger.warning(f"Calendar sync failed (non-blocking): {e}")
 
             # Create slot model for response
             slot = Slot(
+                slot_id=hold.get("slot_id", hold["id"]),
                 doctor_id=UUID(hold["doctor_id"]),
-                room_id=UUID(hold["room_id"]),
+                doctor_name=hold.get("doctor_name", "Unknown"),
+                room_id=UUID(hold["room_id"]) if hold.get("room_id") else None,
+                service_id=UUID(hold.get("service_id", str(service_id))),
                 start_time=datetime.fromisoformat(hold["start_time"]),
                 end_time=datetime.fromisoformat(hold["end_time"]),
-                score=0.0
+                score=0.0,
+                explanation=[]
             )
 
             return AppointmentResponse(
@@ -749,22 +759,25 @@ class SchedulingService:
                 logger.warning("No patient_id provided, skipping escalation")
                 return None
 
-            escalation_id = await self.escalation_manager.create_escalation(
+            request_payload = {
+                "service_id": str(service_id),
+                "patient_id": str(patient_id),
+                "date_range": {
+                    "start_date": date_range.start_date.isoformat(),
+                    "end_date": date_range.end_date.isoformat()
+                },
+                "hard_constraints": hard_constraints.dict() if hard_constraints else {}
+            }
+
+            escalation = await self.escalation_manager.create_escalation(
                 clinic_id=clinic_id,
-                patient_id=patient_id,
-                service_id=service_id,
-                reason="no_available_slots",
-                context={
-                    "date_range": {
-                        "start_date": date_range.start_date.isoformat(),
-                        "end_date": date_range.end_date.isoformat()
-                    },
-                    "hard_constraints": hard_constraints.dict() if hard_constraints else None
-                }
+                request=request_payload,
+                reason="no_available_slots"
             )
 
+            escalation_id = escalation.get("id") if escalation else None
             logger.info(f"Created escalation {escalation_id}")
-            return escalation_id
+            return UUID(escalation_id) if escalation_id else None
 
         except Exception as e:
             logger.error(f"Error creating escalation: {e}")
