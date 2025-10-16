@@ -526,13 +526,19 @@ class ConversationMemoryManager:
         user_candidates = self._candidate_mem0_user_ids(clean_phone, resolved_clinic)
         target_user_id = user_candidates[0]
 
+        # Convert string content to list format required by mem0 API
+        if isinstance(content, str):
+            # Infer role from metadata if available, default to user
+            role = (metadata_payload or {}).get('role', 'user')
+            content = [{"role": role, "content": content}]
+
         try:
             loop = asyncio.get_event_loop()
             result = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
                     lambda: self.memory.add(
-                        content,  # mem0 handles both str and List[Dict] formats
+                        content,  # Now always in List[Dict] format as required by mem0
                         user_id=target_user_id,
                         metadata=metadata_payload
                     )

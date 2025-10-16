@@ -202,7 +202,7 @@ class MultilingualMessageProcessor:
         # CONSOLIDATED HYDRATION: Use Task #2 CacheService to load all context in <100ms
         # Replaces 7-8 separate queries with single optimized call
         from app.services.cache_service import CacheService
-        from app.cache.redis_client import get_redis_client
+        from app.config import get_redis_client
 
         cache_service = CacheService(
             redis_client=get_redis_client(),
