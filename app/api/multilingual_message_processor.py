@@ -445,9 +445,11 @@ DO NOT attempt to answer complex questions yourself.
         from app.services.fast_path_service import FastPathService
         from app.services.language_service import LanguageService
         from app.services.session_service import SessionService
+        from app.config import get_redis_client
 
         # Initialize services for routing
-        language_service = LanguageService()
+        redis_client = get_redis_client()
+        language_service = LanguageService(redis_client)
         session_service = SessionService(get_supabase_client())
 
         # Build context for router (using hydrated data + memory)
