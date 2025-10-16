@@ -85,6 +85,10 @@ class UnifiedAppointmentService:
                 os.environ.get("SUPABASE_URL"),
                 os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
             )
+        try:
+            self.healthcare_supabase = self.supabase.schema('healthcare')
+        except AttributeError:
+            self.healthcare_supabase = self.supabase
         self.calendar_service = ExternalCalendarService(self.supabase)
         self.default_appointment_duration = timedelta(minutes=30)
 
@@ -774,7 +778,7 @@ class UnifiedAppointmentService:
         try:
             if reservation_id:
                 # Update the hold status to cancelled
-                self.supabase.table('calendar_holds')\
+                self.healthcare_supabase.table('calendar_holds')\
                     .update({'status': 'cancelled'})\
                     .eq('reservation_id', reservation_id)\
                     .execute()
@@ -787,7 +791,7 @@ class UnifiedAppointmentService:
         try:
             if reservation_id:
                 # Update hold status to confirmed
-                self.supabase.table('calendar_holds')\
+                self.healthcare_supabase.table('calendar_holds')\
                     .update({'status': 'confirmed'})\
                     .eq('reservation_id', reservation_id)\
                     .execute()
@@ -800,7 +804,7 @@ class UnifiedAppointmentService:
         try:
             if reservation_id:
                 # Update hold status to cancelled
-                self.supabase.table('calendar_holds')\
+                self.healthcare_supabase.table('calendar_holds')\
                     .update({'status': 'cancelled'})\
                     .eq('reservation_id', reservation_id)\
                     .execute()

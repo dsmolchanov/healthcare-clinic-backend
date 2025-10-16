@@ -199,7 +199,32 @@ class MultilingualMessageProcessor:
         if effective_clinic_id:
             self._known_clinic_ids.add(effective_clinic_id)
 
-        clinic_profile = await self._get_clinic_profile(effective_clinic_id)
+        # CONSOLIDATED HYDRATION: Use Task #2 CacheService to load all context in <100ms
+        # Replaces 7-8 separate queries with single optimized call
+        from app.services.cache_service import CacheService
+        from app.cache.redis_client import get_redis_client
+
+        cache_service = CacheService(
+            redis_client=get_redis_client(),
+            supabase_client=self.supabase
+        )
+
+        # Hydrate complete context (clinic, patient, session_state)
+        hydrated = await cache_service.hydrate_context(
+            clinic_id=effective_clinic_id,
+            phone=request.from_phone,
+            session_id=session_id
+        )
+
+        # Extract hydrated data
+        clinic_profile = hydrated.get('clinic', {})
+        patient_profile = hydrated.get('patient', {})
+        session_state_data = hydrated.get('session_state', {})
+
+        # Make services available for router
+        clinic_services = hydrated.get('services', [])
+        clinic_doctors = hydrated.get('doctors', [])
+        clinic_faqs = hydrated.get('faqs', [])
 
         resolved_clinic_name = (
             clinic_profile.get('name')
@@ -220,9 +245,6 @@ class MultilingualMessageProcessor:
             detected_language=None  # Will be detected later
         )
 
-        # Phase 8: PARALLEL I/O - Fan out all DB calls concurrently
-        # This reduces 3-4s of serial DB calls to ~1s
-
         # Kick off message storage (fire-and-forget)
         store_msg_task = asyncio.create_task(
             self.memory_manager.store_message(
@@ -241,7 +263,7 @@ class MultilingualMessageProcessor:
             )
         )
 
-        # Fan out all other queries in parallel
+        # Memory-specific queries still run in parallel (not part of clinic bundle)
         history_task = self.memory_manager.get_conversation_history(
             phone_number=request.from_phone,
             clinic_id=effective_clinic_id,
@@ -260,7 +282,7 @@ class MultilingualMessageProcessor:
             query=request.body
         )
 
-        # Gather all in parallel (return_exceptions to not fail on single error)
+        # Gather memory queries in parallel (return_exceptions to not fail on single error)
         results = await asyncio.gather(
             history_task,
             prefs_task,
@@ -275,8 +297,6 @@ class MultilingualMessageProcessor:
 
         user_preferences = user_preferences or {}
         is_new_conversation = len(conversation_history) == 0
-
-        patient_profile = await self._fetch_patient_profile(effective_clinic_id, request.from_phone)
         patient_name = None
         patient_id = None
 
@@ -420,7 +440,90 @@ DO NOT attempt to answer complex questions yourself.
         # Extract name from user message if present
         extracted_first, extracted_last = self._extract_name_from_message(request.body)
 
-        # Generate AI response with full context
+        # FAST-PATH ROUTING: Classify message and handle FAQ/PRICE queries without LLM
+        from app.services.router_service import RouterService, Lane
+        from app.services.fast_path_service import FastPathService
+        from app.services.language_service import LanguageService
+        from app.services.session_service import SessionService
+
+        # Initialize services for routing
+        language_service = LanguageService()
+        session_service = SessionService(get_supabase_client())
+
+        # Build context for router (using hydrated data)
+        router_context = {
+            'patient': {
+                'id': patient_id,
+                'name': patient_name,
+                'phone': request.from_phone
+            },
+            'clinic': {
+                'id': effective_clinic_id,
+                'name': resolved_clinic_name,
+                'services': clinic_services,  # From hydrated context
+                'doctors': clinic_doctors,    # From hydrated context
+                'faqs': clinic_faqs          # From hydrated context
+            },
+            'session_state': {
+                'turn_status': session_turn_status,
+                'last_agent_action': last_agent_action
+            },
+            'history': session_messages
+        }
+
+        # Classify message into lane
+        router = RouterService(language_service, session_service)
+        lane, metadata = await router.classify(request.body, router_context)
+
+        logger.info(f"Message classified as {lane} lane (confidence: {metadata.get('confidence', 0):.2f})")
+
+        # Handle fast-path lanes (FAQ, PRICE) without LLM
+        if lane in [Lane.FAQ, Lane.PRICE]:
+            fast_path = FastPathService(language_service, session_service)
+
+            if lane == Lane.FAQ:
+                result = await fast_path.handle_faq_query(request.body, router_context)
+            else:  # PRICE lane
+                service_id = metadata.get('service_id')
+                confidence = metadata.get('confidence', 0)
+                result = await fast_path.handle_price_query(
+                    request.body, router_context, service_id, confidence
+                )
+
+            # If fast-path succeeded, return the response
+            if result and not result.get('fallback_to_complex'):
+                ai_response = result.get('reply', '')
+                detected_language = result.get('language', 'en')
+
+                # Store assistant response
+                await self.memory_manager.store_message(
+                    session_id=session_id,
+                    role='assistant',
+                    content=ai_response,
+                    phone_number=request.from_phone,
+                    metadata={
+                        'lane': lane,
+                        'fast_path': True,
+                        'latency_ms': result.get('latency_ms', 0)
+                    }
+                )
+
+                # Return fast-path response
+                return MessageResponse(
+                    message=ai_response,
+                    session_id=session_id,
+                    status="success",
+                    detected_language=detected_language,
+                    metadata={
+                        'lane': lane,
+                        'fast_path': True,
+                        'latency_ms': result.get('latency_ms', 0)
+                    }
+                )
+            else:
+                logger.info(f"Fast-path failed or requested fallback, proceeding to LLM")
+
+        # Generate AI response with full context (for SCHEDULING, COMPLEX lanes, or fast-path fallback)
         ai_response, detected_language = await self._generate_response(
             user_message=request.body,
             clinic_name=resolved_clinic_name,

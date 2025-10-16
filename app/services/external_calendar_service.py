@@ -87,6 +87,10 @@ class ExternalCalendarService:
                 os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
                 options=options
             )
+        try:
+            self.healthcare_supabase = self.supabase.schema('healthcare')
+        except AttributeError:
+            self.healthcare_supabase = self.supabase
         self.compliance = ComplianceManager() if COMPLIANCE_AVAILABLE else None
         self.vault = ComplianceVault() if VAULT_AVAILABLE else None
         self.hold_duration = timedelta(minutes=5)  # Calendar hold duration
@@ -428,7 +432,7 @@ class ExternalCalendarService:
                     }
 
             # Check existing holds
-            holds_result = self.supabase.table('calendar_holds').select('*').eq(
+            holds_result = self.healthcare_supabase.table('calendar_holds').select('*').eq(
                 'doctor_id', doctor_id
             ).eq(
                 'status', 'pending'
@@ -605,7 +609,7 @@ class ExternalCalendarService:
                 }
             }
 
-            result = self.supabase.table('calendar_holds').insert(hold_data).execute()
+            result = self.healthcare_supabase.table('calendar_holds').insert(hold_data).execute()
 
             if result.data:
                 return {
@@ -765,7 +769,7 @@ class ExternalCalendarService:
             logger.info(f"Rolling back holds for reservation {reservation_id}")
 
             # Get hold information
-            hold_result = self.supabase.table('calendar_holds').select('*').eq(
+            hold_result = self.healthcare_supabase.table('calendar_holds').select('*').eq(
                 'reservation_id', reservation_id
             ).execute()
 
@@ -795,7 +799,7 @@ class ExternalCalendarService:
     async def _cancel_internal_hold(self, reservation_id: str) -> Dict[str, Any]:
         """Cancel internal hold"""
         try:
-            result = self.supabase.table('calendar_holds').update({
+            result = self.healthcare_supabase.table('calendar_holds').update({
                 'status': 'cancelled',
                 'metadata': {'cancelled_at': datetime.now().isoformat(), 'cancelled_by': 'rollback'}
             }).eq('reservation_id', reservation_id).execute()
@@ -868,7 +872,7 @@ class ExternalCalendarService:
                 appointment_id = result.data[0]['id']
 
                 # Update hold status to confirmed
-                self.supabase.table('calendar_holds').update({
+                self.healthcare_supabase.table('calendar_holds').update({
                     'status': 'confirmed',
                     'internal_hold_id': appointment_id,
                     'metadata': {'confirmed_at': datetime.now().isoformat()}
@@ -906,7 +910,7 @@ class ExternalCalendarService:
             service = build('calendar', 'v3', credentials=credentials)
 
             # Find the hold event
-            holds_result = self.supabase.table('calendar_holds').select('*').eq(
+            holds_result = self.healthcare_supabase.table('calendar_holds').select('*').eq(
                 'reservation_id', reservation_id
             ).eq('status', 'pending').execute()
 

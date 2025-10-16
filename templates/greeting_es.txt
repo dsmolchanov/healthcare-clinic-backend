@@ -1,0 +1,1 @@
+Hola{{ ' ' + first_name if first_name else '' }}, ¿en qué puedo ayudarte hoy?

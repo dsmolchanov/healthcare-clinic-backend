@@ -14,6 +14,7 @@ from enum import Enum
 from .websocket_manager import websocket_manager, NotificationType
 from .external_calendar_service import ExternalCalendarService
 from .unified_appointment_service import UnifiedAppointmentService
+from ..database import create_supabase_client
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +63,10 @@ class RealtimeConflictDetector:
     """
 
     def __init__(self):
-        self.calendar_service = ExternalCalendarService()
-        self.appointment_service = UnifiedAppointmentService()
+        self.healthcare_supabase = create_supabase_client('healthcare')
+        self.public_supabase = create_supabase_client('public')
+        self.calendar_service = ExternalCalendarService(self.healthcare_supabase)
+        self.appointment_service = UnifiedAppointmentService(self.healthcare_supabase)
 
         # Active conflicts tracking
         self.active_conflicts: Dict[str, ConflictEvent] = {}
@@ -339,16 +342,8 @@ class RealtimeConflictDetector:
         conflicts = []
 
         try:
-            from supabase import create_client
-            import os
-
-            supabase = create_client(
-                os.environ.get("SUPABASE_URL"),
-                os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-            )
-
             # Get pending holds
-            holds_result = supabase.table('calendar_holds')\
+            holds_result = self.healthcare_supabase.table('calendar_holds')\
                 .select('*')\
                 .eq('doctor_id', doctor_id)\
                 .eq('status', 'pending')\
@@ -615,15 +610,7 @@ class RealtimeConflictDetector:
             hold_data = conflict.details.get('hold_data')
             if hold_data:
                 # Extend hold by 10 minutes
-                from supabase import create_client
-                import os
-
-                supabase = create_client(
-                    os.environ.get("SUPABASE_URL"),
-                    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-                )
-
-                result = supabase.rpc('extend_calendar_hold', {
+                result = self.public_supabase.rpc('extend_calendar_hold', {
                     'p_reservation_id': hold_data['reservation_id'],
                     'p_additional_minutes': 10
                 }).execute()
@@ -638,15 +625,7 @@ class RealtimeConflictDetector:
         try:
             hold_data = conflict.details.get('hold_data')
             if hold_data:
-                from supabase import create_client
-                import os
-
-                supabase = create_client(
-                    os.environ.get("SUPABASE_URL"),
-                    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-                )
-
-                supabase.table('calendar_holds')\
+                self.healthcare_supabase.table('calendar_holds')\
                     .update({'status': 'cancelled'})\
                     .eq('reservation_id', hold_data['reservation_id'])\
                     .execute()

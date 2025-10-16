@@ -156,20 +156,48 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
             print(f"[Background] Raw data that failed to parse: {body_bytes[:500]}")
             return
 
+        # IDEMPOTENCY CHECK: Reject duplicate messages using Redis SETNX
+        # Extract message ID for deduplication
+        message_data = data.get("message", {})
+        key = message_data.get("key", {})
+        message_id = key.get("id")
+
+        if message_id:
+            from app.cache.redis_client import get_redis_client
+            redis_client = get_redis_client()
+            idempotency_key = f"webhook:msg:{message_id}"
+            idempotency_ttl = 3600  # 1 hour - prevent processing same message twice within this window
+
+            # Try to set the key (SETNX - set if not exists)
+            # Returns 1 if key was set (first time seeing this message)
+            # Returns 0 if key already exists (duplicate message)
+            idempotency_start = datetime.datetime.now()
+            is_first_time = redis_client.set(idempotency_key, "1", nx=True, ex=idempotency_ttl)
+            idempotency_duration = (datetime.datetime.now() - idempotency_start).total_seconds() * 1000
+
+            if not is_first_time:
+                print(f"[Background] ⏭️ DUPLICATE MESSAGE DETECTED (idempotency check: {idempotency_duration:.2f}ms)")
+                print(f"[Background] Message ID: {message_id}")
+                print(f"[Background] Skipping processing - message already handled")
+                return
+            else:
+                print(f"[Background] ✅ Idempotency check passed ({idempotency_duration:.2f}ms)")
+                print(f"[Background] Message ID: {message_id} (first time processing)")
+        else:
+            print(f"[Background] ⚠️ No message ID found - skipping idempotency check")
+
         # Evolution API sends both instanceName in body AND in URL path
         # The URL path is more reliable
         print(f"[Background] Step 2: Extracting message data...")
         actual_instance = instance_name  # Use the path parameter
-        message_data = data.get("message", {})
 
         print(f"[Background] Using instance from URL path: {actual_instance}")
         print(f"[Background] Message data keys: {list(message_data.keys())}")
         if message_data:
             print(f"[Background] Message data content:\n{json.dumps(message_data, indent=2)[:500]}")
 
-        # Extract message details
+        # Extract message details (key and message_data already extracted above for idempotency)
         print(f"[Background] Step 3: Extracting sender details...")
-        key = message_data.get("key", {})
         from_number = key.get("remoteJid", "").replace("@s.whatsapp.net", "")
         is_from_me = key.get("fromMe", False)
 

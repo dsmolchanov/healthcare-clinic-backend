@@ -1,0 +1,1 @@
+{{ first_name }}, tu cita ha sido confirmada para el {{ date }} a las {{ time }} con {{ doctor }}. ¡Te esperamos en la clínica!

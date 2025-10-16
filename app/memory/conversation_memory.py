@@ -500,11 +500,15 @@ class ConversationMemoryManager:
     async def add_mem0_memory(
         self,
         phone_number: str,
-        content: str,
+        content,  # Can be str or List[Dict] for structured messages
         metadata: Optional[Dict[str, Any]] = None,
         clinic_id: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
-        """Store a memory in mem0 and return summary metadata."""
+        """Store a memory in mem0 and return summary metadata.
+
+        Args:
+            content: Either a string or a list of message dicts [{"role": "user", "content": "..."}]
+        """
 
         self._ensure_mem0_initialized()
 
@@ -528,7 +532,7 @@ class ConversationMemoryManager:
                 loop.run_in_executor(
                     None,
                     lambda: self.memory.add(
-                        content,
+                        content,  # mem0 handles both str and List[Dict] formats
                         user_id=target_user_id,
                         metadata=metadata_payload
                     )
@@ -802,15 +806,19 @@ class ConversationMemoryManager:
         This provides better context than storing individual messages
         """
 
-        # Combine user and assistant into conversational context
-        conversation_turn = f"User: {user_message}\nAssistant: {assistant_response}"
+        # Format as structured messages array for mem0
+        # mem0 expects: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+        messages = [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": assistant_response}
+        ]
         clinic_id = (metadata or {}).get('clinic_id') if metadata else None
 
         await self._enqueue_mem0_job({
             'type': 'turn',
             'clinic_id': clinic_id,
             'phone_number': phone_number,
-            'content': conversation_turn,
+            'content': messages,  # Now sending structured messages instead of string
             'metadata': {
                 'session_id': session_id,
                 'timestamp': datetime.utcnow().isoformat(),

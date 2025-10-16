@@ -1,0 +1,1 @@
+Здравствуйте{{ ', ' + first_name if first_name else '' }}, стоимость услуги {{ service_name }} составляет {{ price }}.

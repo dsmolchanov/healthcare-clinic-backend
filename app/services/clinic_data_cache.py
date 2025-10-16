@@ -57,16 +57,17 @@ class ClinicDataCache:
 
             doctors = []
             try:
+                # Use 'active' column (current schema)
                 result = supabase_client.table('doctors').select(
                     'id,first_name,last_name,specialization,phone,email'
-                ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
+                ).eq('clinic_id', clinic_id).eq('active', True).execute()
                 doctors = result.data if result.data else []
             except Exception as e:
-                if 'is_active' in str(e):
-                    logger.debug("Falling back to legacy 'active' column for doctors")
+                if 'active' in str(e):
+                    logger.debug("Falling back to 'is_active' column for doctors")
                     result = supabase_client.table('doctors').select(
                         'id,first_name,last_name,specialization,phone,email'
-                    ).eq('clinic_id', clinic_id).eq('active', True).execute()
+                    ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
                     doctors = result.data if result.data else []
                 else:
                     raise
@@ -79,11 +80,11 @@ class ClinicDataCache:
 
         except Exception as e:
             logger.error(f"Error getting/caching doctors: {e}")
-            # Final fallback - try both column names
+            # Final fallback - try active column
             try:
                 result = supabase_client.table('doctors').select(
                     'id,first_name,last_name,specialization'
-                ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
+                ).eq('clinic_id', clinic_id).eq('active', True).execute()
                 return result.data if result.data else []
             except:
                 return []
@@ -103,16 +104,17 @@ class ClinicDataCache:
             logger.debug(f"❌ Cache MISS: fetching services for clinic {clinic_id}")
             services = []
             try:
+                # Use 'active' column (current schema)
                 result = supabase_client.schema('healthcare').table('services').select(
                     'id,name,description,base_price,category,duration_minutes,currency,code'
-                ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
+                ).eq('clinic_id', clinic_id).eq('active', True).execute()
                 services = result.data if result.data else []
             except Exception as e:
-                if 'is_active' in str(e):
-                    logger.debug("Falling back to legacy 'active' column for services")
+                if 'active' in str(e):
+                    logger.debug("Falling back to 'is_active' column for services")
                     result = supabase_client.schema('healthcare').table('services').select(
                         'id,name,description,base_price,category,duration_minutes,currency,code'
-                    ).eq('clinic_id', clinic_id).eq('active', True).execute()
+                    ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
                     services = result.data if result.data else []
                 else:
                     raise

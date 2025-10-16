@@ -1,0 +1,1 @@
+Hola{{ ' ' + first_name if first_name else '' }}, el precio de {{ service_name }} es {{ price }}.
