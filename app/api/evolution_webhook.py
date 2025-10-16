@@ -163,7 +163,7 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
         message_id = key.get("id")
 
         if message_id:
-            from app.cache.redis_client import get_redis_client
+            from app.config import get_redis_client
             redis_client = get_redis_client()
             idempotency_key = f"webhook:msg:{message_id}"
             idempotency_ttl = 3600  # 1 hour - prevent processing same message twice within this window
