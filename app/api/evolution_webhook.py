@@ -13,7 +13,7 @@ import logging
 import asyncio
 from app.api.multilingual_message_processor import MessageRequest, MultilingualMessageProcessor
 from app.security.webhook_verification import verify_webhook_signature
-from app.services.message_router import message_router, MessageType, MessageSource
+from app.services.message_router import MessageType  # Keep MessageType enum for logging
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -369,46 +369,56 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
         # Create session ID from phone number
         session_id = f"whatsapp_{from_number}_{actual_instance}"
 
-        # Route message through dual-lane architecture
-        print(f"\n[Background] Step 5: Routing through dual-lane architecture...")
+        # Route message through NEW multilingual processor with RouterService + FastPathService
+        print(f"\n[Background] Step 5: Processing with multilingual processor (with memory support)...")
         print(f"[Background] Message type: {message_type.value}")
         print(f"[Background] Session ID: {session_id}")
 
         ai_start = datetime.datetime.now()
 
         try:
-            # Use the message router with timeout to prevent blocking
-            # Set aggressive timeout since Evolution expects response in ~5s
-            routing_result = await asyncio.wait_for(
-                message_router.route_message(
-                    message=text,
-                    session_id=session_id,
-                    source=MessageSource.WHATSAPP,
-                    message_type=message_type,
-                    metadata={
-                        "from_number": from_number,
-                        "instance_name": actual_instance,
-                        "clinic_id": clinic_id,
-                        "user_name": push_name,
-                        "channel": "whatsapp",
-                        "message_sid": key.get("id"),
-                        "whatsapp_message_id": key.get("id")
-                    }
-                ),
+            # Use the NEW message processor with RouterService and FastPathService
+            # This includes memory retrieval and fast-path routing
+            request_obj = MessageRequest(
+                from_phone=from_number,
+                to_phone=actual_instance,  # Use instance as "to" identifier
+                body=text,
+                message_sid=key.get("id"),
+                clinic_id=clinic_id,
+                clinic_name=clinic_name or "Clinic",
+                channel="whatsapp",
+                profile_name=push_name,
+                metadata={
+                    "instance_name": actual_instance,
+                    "user_name": push_name,
+                    "whatsapp_message_id": key.get("id"),
+                    "session_id": session_id
+                }
+            )
+
+            # Process with timeout
+            message_response = await asyncio.wait_for(
+                message_processor.process_message(request_obj),
                 timeout=30.0  # 30 second max for AI processing
             )
-            print(f"[Background] ✅ Message routed successfully")
+
+            # Extract response from MessageResponse object
+            ai_response = message_response.message
+            routing_path = message_response.metadata.get("routing_path", "multilingual_processor")
+            latency_ms = message_response.metadata.get("processing_time_ms", 0)
+
+            print(f"[Background] ✅ Message processed successfully via {routing_path}")
         except asyncio.TimeoutError:
-            print(f"[Background] ⏰ Routing timed out after 30s - using fallback response")
+            print(f"[Background] ⏰ Processing timed out after 30s - using fallback response")
             # Use fallback response on timeout
             ai_response = "Thank you for your message. We're processing your request and will respond shortly."
             routing_path = "timeout_fallback"
             latency_ms = 30000
             # Continue to send this fallback message
         except Exception as routing_error:
-            print(f"[Background] ❌ Routing error: {routing_error}")
+            print(f"[Background] ❌ Processing error: {routing_error}")
             import traceback
-            print(f"[Background] Routing traceback:\n{traceback.format_exc()}")
+            print(f"[Background] Processing traceback:\n{traceback.format_exc()}")
             # Use error fallback
             ai_response = "We received your message. Please try again or contact us directly."
             routing_path = "error_fallback"
@@ -416,12 +426,6 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
 
         ai_end = datetime.datetime.now()
         ai_duration = (ai_end - ai_start).total_seconds()
-
-        # Extract response from routing result (if not already set by timeout/error handler)
-        if 'ai_response' not in locals():
-            ai_response = routing_result.get("response", "I'm processing your message. Please wait a moment.")
-            routing_path = routing_result.get("routing_path", "unknown")
-            latency_ms = routing_result.get("latency_ms", 0)
 
         print(f"[Background] ✅ Response received via {routing_path} in {ai_duration:.2f}s ({latency_ms:.2f}ms)")
         print(f"[Background] AI response length: {len(ai_response)} chars")
