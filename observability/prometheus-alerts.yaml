@@ -1,0 +1,181 @@
+groups:
+  - name: healthcare_backend_alerts
+    interval: 30s
+    rules:
+      # High Latency Alerts
+      - alert: HighWebhookLatency
+        expr: |
+          histogram_quantile(0.95, sum(rate(webhook_request_duration_seconds_bucket[5m])) by (le, lane)) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+          component: webhook
+        annotations:
+          summary: "High webhook latency detected"
+          description: "P95 latency for {{ $labels.lane }} lane is {{ $value }}s (threshold: 2s)"
+          runbook_url: "https://docs.example.com/runbooks/high-latency"
+
+      - alert: CriticalWebhookLatency
+        expr: |
+          histogram_quantile(0.95, sum(rate(webhook_request_duration_seconds_bucket[5m])) by (le, lane)) > 5.0
+        for: 2m
+        labels:
+          severity: critical
+          component: webhook
+        annotations:
+          summary: "CRITICAL webhook latency detected"
+          description: "P95 latency for {{ $labels.lane }} lane is {{ $value }}s (threshold: 5s) - immediate action required"
+          runbook_url: "https://docs.example.com/runbooks/critical-latency"
+
+      # Cache Hit Rate Alerts
+      - alert: LowCacheHitRate
+        expr: |
+          sum(rate(cache_hits_total[10m])) by (cache_type) /
+          (sum(rate(cache_hits_total[10m])) by (cache_type) + sum(rate(cache_misses_total[10m])) by (cache_type)) * 100 < 80
+        for: 10m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: "Low cache hit rate for {{ $labels.cache_type }}"
+          description: "Cache hit rate for {{ $labels.cache_type }} is {{ $value }}% (threshold: 80%)"
+          runbook_url: "https://docs.example.com/runbooks/low-cache-hit-rate"
+
+      - alert: CriticalCacheHitRate
+        expr: |
+          sum(rate(cache_hits_total[10m])) by (cache_type) /
+          (sum(rate(cache_hits_total[10m])) by (cache_type) + sum(rate(cache_misses_total[10m])) by (cache_type)) * 100 < 50
+        for: 5m
+        labels:
+          severity: critical
+          component: cache
+        annotations:
+          summary: "CRITICAL cache hit rate for {{ $labels.cache_type }}"
+          description: "Cache hit rate for {{ $labels.cache_type }} is {{ $value }}% (threshold: 50%) - Redis may be down"
+          runbook_url: "https://docs.example.com/runbooks/critical-cache-hit-rate"
+
+      # Error Rate Alerts
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(errors_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: application
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value }} errors/sec (threshold: 0.1/sec)"
+          runbook_url: "https://docs.example.com/runbooks/high-error-rate"
+
+      - alert: CriticalErrorRate
+        expr: |
+          sum(rate(errors_total[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: critical
+          component: application
+        annotations:
+          summary: "CRITICAL error rate detected"
+          description: "Error rate is {{ $value }} errors/sec (threshold: 1.0/sec) - immediate action required"
+          runbook_url: "https://docs.example.com/runbooks/critical-error-rate"
+
+      # mem0 Queue Alerts
+      - alert: HighMem0QueueSize
+        expr: mem0_write_queue_size > 100
+        for: 10m
+        labels:
+          severity: warning
+          component: mem0
+        annotations:
+          summary: "High mem0 write queue size"
+          description: "mem0 write queue has {{ $value }} items (threshold: 100)"
+          runbook_url: "https://docs.example.com/runbooks/high-mem0-queue"
+
+      - alert: Mem0WriteFailures
+        expr: |
+          sum(rate(mem0_writes_total{status="failure"}[5m])) / sum(rate(mem0_writes_total[5m])) * 100 > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: mem0
+        annotations:
+          summary: "High mem0 write failure rate"
+          description: "mem0 write failure rate is {{ $value }}% (threshold: 10%)"
+          runbook_url: "https://docs.example.com/runbooks/mem0-write-failures"
+
+      # Hydration Performance Alerts
+      - alert: SlowContextHydration
+        expr: |
+          histogram_quantile(0.95, sum(rate(context_hydration_duration_seconds_bucket[5m])) by (le)) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: "Slow context hydration detected"
+          description: "P95 hydration latency is {{ $value }}s (threshold: 200ms)"
+          runbook_url: "https://docs.example.com/runbooks/slow-hydration"
+
+      # Database Performance Alerts
+      - alert: SlowDatabaseQueries
+        expr: |
+          histogram_quantile(0.95, sum(rate(database_query_duration_seconds_bucket[5m])) by (le, operation)) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Slow database queries detected"
+          description: "P95 query latency for {{ $labels.operation }} is {{ $value }}s (threshold: 1s)"
+          runbook_url: "https://docs.example.com/runbooks/slow-database"
+
+      # Idempotency Alerts
+      - alert: HighDuplicateMessageRate
+        expr: |
+          rate(duplicate_messages_total[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: idempotency
+        annotations:
+          summary: "High duplicate message rate"
+          description: "Receiving {{ $value }} duplicate messages/sec (threshold: 0.5/sec)"
+          runbook_url: "https://docs.example.com/runbooks/high-duplicate-rate"
+
+      # Throughput Alerts
+      - alert: LowThroughput
+        expr: |
+          sum(rate(webhook_requests_total[5m])) < 0.01
+        for: 15m
+        labels:
+          severity: info
+          component: webhook
+        annotations:
+          summary: "Low request throughput"
+          description: "Request rate is {{ $value }} req/sec (expected: >0.01/sec) - may indicate connectivity issues"
+          runbook_url: "https://docs.example.com/runbooks/low-throughput"
+
+      - alert: HighThroughput
+        expr: |
+          sum(rate(webhook_requests_total[5m])) > 100
+        for: 5m
+        labels:
+          severity: info
+          component: webhook
+        annotations:
+          summary: "Unusually high request throughput"
+          description: "Request rate is {{ $value }} req/sec (typical: <100/sec) - monitor for capacity issues"
+          runbook_url: "https://docs.example.com/runbooks/high-throughput"
+
+      # Fast-Path Performance Alerts
+      - alert: LowFastPathCoverage
+        expr: |
+          (sum(rate(lane_classification_total{lane=~"faq|price"}[10m])) / sum(rate(lane_classification_total[10m]))) * 100 < 50
+        for: 15m
+        labels:
+          severity: info
+          component: router
+        annotations:
+          summary: "Low fast-path coverage"
+          description: "Only {{ $value }}% of messages using fast-path (target: >70%)"
+          runbook_url: "https://docs.example.com/runbooks/low-fast-path"

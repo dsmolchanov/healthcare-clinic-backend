@@ -1,0 +1,274 @@
+{
+  "dashboard": {
+    "title": "Healthcare Backend - Task #6 Integration Performance",
+    "tags": ["healthcare", "webhook", "performance"],
+    "timezone": "browser",
+    "schemaVersion": 16,
+    "version": 1,
+    "refresh": "10s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Request Latency (P50, P95, P99)",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, sum(rate(webhook_request_duration_seconds_bucket[5m])) by (le, lane))",
+            "legendFormat": "P50 - {{lane}}",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(webhook_request_duration_seconds_bucket[5m])) by (le, lane))",
+            "legendFormat": "P95 - {{lane}}",
+            "refId": "B"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(webhook_request_duration_seconds_bucket[5m])) by (le, lane))",
+            "legendFormat": "P99 - {{lane}}",
+            "refId": "C"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "s",
+            "label": "Latency",
+            "logBase": 1,
+            "min": 0
+          }
+        ],
+        "thresholds": [
+          {
+            "value": 0.5,
+            "colorMode": "critical",
+            "op": "gt",
+            "fill": true,
+            "line": true
+          },
+          {
+            "value": 2.0,
+            "colorMode": "critical",
+            "op": "gt",
+            "fill": true,
+            "line": true
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Cache Hit Rate",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "sum(rate(cache_hits_total[5m])) by (cache_type) / (sum(rate(cache_hits_total[5m])) by (cache_type) + sum(rate(cache_misses_total[5m])) by (cache_type)) * 100",
+            "legendFormat": "{{cache_type}} hit rate",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "percent",
+            "label": "Hit Rate",
+            "logBase": 1,
+            "min": 0,
+            "max": 100
+          }
+        ],
+        "thresholds": [
+          {
+            "value": 80,
+            "colorMode": "critical",
+            "op": "lt",
+            "fill": true,
+            "line": true
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Error Rate",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "sum(rate(errors_total[5m])) by (error_type, component)",
+            "legendFormat": "{{error_type}} - {{component}}",
+            "refId": "A"
+          },
+          {
+            "expr": "sum(rate(duplicate_messages_total[5m]))",
+            "legendFormat": "Duplicate messages",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "reqps",
+            "label": "Errors/sec",
+            "logBase": 1,
+            "min": 0
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Throughput & Lane Distribution",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "sum(rate(webhook_requests_total[5m]))",
+            "legendFormat": "Total requests/sec",
+            "refId": "A"
+          },
+          {
+            "expr": "sum(rate(lane_classification_total[5m])) by (lane)",
+            "legendFormat": "{{lane}} lane",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "reqps",
+            "label": "Requests/sec",
+            "logBase": 1,
+            "min": 0
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Context Hydration Performance",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, sum(rate(context_hydration_duration_seconds_bucket[5m])) by (le))",
+            "legendFormat": "P50 hydration",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(context_hydration_duration_seconds_bucket[5m])) by (le))",
+            "legendFormat": "P95 hydration",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "s",
+            "label": "Duration",
+            "logBase": 1,
+            "min": 0
+          }
+        ],
+        "thresholds": [
+          {
+            "value": 0.1,
+            "colorMode": "critical",
+            "op": "gt",
+            "fill": true,
+            "line": true
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "mem0 Write Queue & Operations",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "mem0_write_queue_size",
+            "legendFormat": "Queue size",
+            "refId": "A"
+          },
+          {
+            "expr": "sum(rate(mem0_writes_total[5m])) by (status)",
+            "legendFormat": "Writes/sec - {{status}}",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "short",
+            "label": "Count",
+            "logBase": 1,
+            "min": 0
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Database Query Performance",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(database_query_duration_seconds_bucket[5m])) by (le, operation))",
+            "legendFormat": "P95 - {{operation}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "s",
+            "label": "Duration",
+            "logBase": 1,
+            "min": 0
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Idempotency Check Performance",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(idempotency_check_duration_seconds_bucket[5m])) by (le))",
+            "legendFormat": "P95 idempotency check",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(duplicate_messages_total[5m])",
+            "legendFormat": "Duplicates/sec",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "s",
+            "label": "Duration",
+            "logBase": 1,
+            "min": 0
+          }
+        ],
+        "thresholds": [
+          {
+            "value": 0.001,
+            "colorMode": "critical",
+            "op": "gt",
+            "fill": true,
+            "line": true
+          }
+        ]
+      }
+    ],
+    "annotations": {
+      "list": [
+        {
+          "datasource": "Prometheus",
+          "enable": true,
+          "expr": "ALERTS{alertname=~\".*\"}",
+          "iconColor": "red",
+          "name": "Alerts",
+          "step": "60s",
+          "tagKeys": "alertname",
+          "textFormat": "{{alertname}}",
+          "titleFormat": "Alert"
+        }
+      ]
+    }
+  }
+}
