@@ -206,7 +206,7 @@ class MultilingualMessageProcessor:
 
         cache_service = CacheService(
             redis_client=get_redis_client(),
-            supabase_client=self.supabase
+            supabase_client=get_supabase_client()
         )
 
         # Hydrate complete context (clinic, patient, session_state)
