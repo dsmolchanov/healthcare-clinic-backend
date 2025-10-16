@@ -8,6 +8,7 @@ import json
 import uuid
 import redis
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, Field
@@ -16,6 +17,9 @@ from mem0 import Memory
 from openai import OpenAI
 from fastapi import HTTPException
 from supabase import create_client, Client
+from app.utils.feature_flags import is_mem0_reads_enabled, is_mem0_writes_enabled
+
+logger = logging.getLogger(__name__)
 
 # Initialize services
 redis_client = redis.Redis(
@@ -277,6 +281,11 @@ class ConversationMemory:
     @staticmethod
     async def remember(user_id: str, content: str, metadata: Dict[str, Any] = None):
         """Store important information in long-term memory"""
+        # Feature flag check: Only write to mem0 if enabled
+        if not is_mem0_writes_enabled():
+            logger.debug("mem0 writes disabled via feature flag")
+            return
+
         if memory:
             memory.add(
                 messages=content,
@@ -289,10 +298,15 @@ class ConversationMemory:
     @staticmethod
     async def recall(user_id: str, query: str = None) -> List[Dict]:
         """Retrieve relevant memories for user"""
+        # Feature flag check: Only read from mem0 if enabled
+        if not is_mem0_reads_enabled():
+            logger.debug("mem0 reads disabled via feature flag, returning empty memories")
+            return []
+
         if not memory:
             print("Warning: mem0 not available, returning empty memories")
             return []
-            
+
         if query:
             memories = memory.search(query=query, user_id=user_id, limit=5)
         else:

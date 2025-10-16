@@ -9,6 +9,11 @@ kill_timeout = '30s'
 
 [env]
   PORT = '8080'
+  # Feature Flags for mem0-redis epic rollout
+  FAST_PATH_ENABLED = 'false'
+  MEM0_READS_ENABLED = 'false'
+  MEM0_SHADOW_MODE = 'false'
+  CANARY_SAMPLE_RATE = '0.0'
 
 # Define separate processes for web and worker
 [processes]

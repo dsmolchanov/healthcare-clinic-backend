@@ -4,6 +4,7 @@ import re
 import logging
 from typing import Optional, Dict, Any
 from enum import Enum
+from app.utils.feature_flags import is_fast_path_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,11 @@ class IntentRouter:
         Returns:
             Intent enum or Intent.UNKNOWN
         """
+        # Feature flag check: Return UNKNOWN if fast-path disabled
+        if not is_fast_path_enabled():
+            logger.debug("Fast-path disabled via feature flag, returning UNKNOWN")
+            return Intent.UNKNOWN
+
         if not text or len(text) < 3:
             return Intent.UNKNOWN
 
