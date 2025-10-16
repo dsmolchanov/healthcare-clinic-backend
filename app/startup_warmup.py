@@ -44,35 +44,34 @@ async def warmup_clinic_data(clinic_ids: List[str] = None):
 
         for clinic_id in clinic_ids:
             try:
-                # Warm up clinic info (location, hours, contact)
-                from app.tools.clinic_info_tool import ClinicInfoTool
                 import json
 
-                tool = ClinicInfoTool(clinic_id, redis)
-                clinic_info = await tool.get_clinic_info(supabase)
+                # OPTIMIZATION: Use get_clinic_bundle RPC for single database call
+                # This replaces 4 separate queries (clinic, doctors, services, faqs) with 1 RPC
+                result = supabase.rpc('get_clinic_bundle', {'p_clinic_id': clinic_id}).execute()
 
-                # Cache clinic info separately for fast access (v2 includes city/state/country)
+                if not result.data:
+                    logger.warning(f"No data returned for clinic {clinic_id}")
+                    continue
+
+                bundle = result.data
+                clinic_info = bundle.get('clinic', {})
+                doctors = bundle.get('doctors', [])
+                services = bundle.get('services', [])
+                faqs = bundle.get('faqs', [])
+
+                # Cache clinic info separately for fast access
                 cache_key = f"clinic:{clinic_id}:info:v2"
                 redis.setex(cache_key, 3600, json.dumps(clinic_info))
 
-                # Fetch all data in parallel for faster warmup
-                doctors, services, faqs = await asyncio.gather(
-                    cache.get_doctors(clinic_id, supabase),
-                    cache.get_services(clinic_id, supabase),
-                    cache.get_faqs(clinic_id, supabase),
-                    return_exceptions=True  # Don't let one failure block others
+                # Cache the individual collections using the cache service
+                # (This ensures they're in the expected format for other code)
+                await asyncio.gather(
+                    cache._set_cache(f"clinic:{clinic_id}:doctors", doctors, 3600),
+                    cache._set_cache(f"clinic:{clinic_id}:services", services, 3600),
+                    cache._set_cache(f"clinic:{clinic_id}:faqs", faqs, 3600),
+                    return_exceptions=True
                 )
-
-                # Handle partial failures
-                if isinstance(doctors, Exception):
-                    logger.error(f"Failed to cache doctors for {clinic_id}: {doctors}")
-                    doctors = []
-                if isinstance(services, Exception):
-                    logger.error(f"Failed to cache services for {clinic_id}: {services}")
-                    services = []
-                if isinstance(faqs, Exception):
-                    logger.error(f"Failed to cache FAQs for {clinic_id}: {faqs}")
-                    faqs = []
 
                 total_doctors += len(doctors)
                 total_services += len(services)
@@ -81,7 +80,7 @@ async def warmup_clinic_data(clinic_ids: List[str] = None):
                 logger.info(
                     f"✅ Warmed clinic {clinic_id[:8]}...: "
                     f"{len(doctors)} doctors, {len(services)} services, {len(faqs)} FAQs, "
-                    f"clinic info ({clinic_info.get('name', 'N/A')})"
+                    f"clinic info ({clinic_info.get('name', 'N/A')}) [1 RPC call]"
                 )
 
             except Exception as e:
