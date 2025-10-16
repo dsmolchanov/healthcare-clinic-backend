@@ -82,6 +82,13 @@ class CapabilityMatrix:
         # Sort by preference
         candidates = [ModelCapability(**row) for row in result.data]
 
+        # Filter out Cerebras models (temporarily disabled due to httpx compatibility)
+        candidates = [m for m in candidates if m.provider != LLMProvider.CEREBRAS]
+
+        if not candidates:
+            logger.warning("No compatible models found after filtering, falling back to default")
+            return await self.get_default_model()
+
         if prefer_speed:
             # Sort by output speed descending
             candidates.sort(key=lambda m: m.avg_output_speed, reverse=True)

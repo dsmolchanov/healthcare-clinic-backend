@@ -4,7 +4,7 @@ from app.services.llm.capability_matrix import CapabilityMatrix
 from app.services.llm.adapters.glm_adapter import GLMAdapter
 from app.services.llm.adapters.gemini_adapter import GeminiAdapter
 from app.services.llm.adapters.openai_adapter import OpenAIAdapter
-from app.services.llm.adapters.cerebras_adapter import CerebrasAdapter
+# from app.services.llm.adapters.cerebras_adapter import CerebrasAdapter  # Disabled due to httpx compatibility
 import logging
 import time
 
@@ -35,7 +35,9 @@ class LLMFactory:
         elif capability.provider == LLMProvider.OPENAI:
             adapter = OpenAIAdapter(capability)
         elif capability.provider == LLMProvider.CEREBRAS:
-            adapter = CerebrasAdapter(capability)
+            # Cerebras disabled due to httpx 0.28.1 compatibility issues
+            logger.warning(f"Cerebras provider disabled, falling back to OpenAI")
+            raise ValueError(f"Cerebras provider temporarily disabled")
         else:
             raise ValueError(f"Unsupported provider: {capability.provider}")
 
