@@ -51,6 +51,7 @@ class AppointmentRequest:
     patient_id: str
     doctor_id: str
     clinic_id: str
+    service_id: Optional[str]
     start_time: datetime
     end_time: datetime
     appointment_type: AppointmentType
@@ -152,18 +153,34 @@ class UnifiedAppointmentService:
         try:
             logger.info(f"Booking appointment for patient {request.patient_id} with doctor {request.doctor_id}")
 
+            appointment_id = str(uuid.uuid4())
+            duration_minutes = max(
+                1,
+                int((request.end_time - request.start_time).total_seconds() // 60)
+            )
+            appointment_payload = {
+                'id': appointment_id,
+                'clinic_id': request.clinic_id,
+                'patient_id': request.patient_id,
+                'doctor_id': request.doctor_id,
+                'appointment_type': request.appointment_type.value,
+                'appointment_date': request.start_time.date().isoformat(),
+                'start_time': request.start_time,
+                'end_time': request.end_time,
+                'duration_minutes': duration_minutes,
+                'status': AppointmentStatus.SCHEDULED.value,
+                'reason_for_visit': request.reason or '',
+                'notes': request.notes or '',
+                'patient_phone': request.patient_phone,
+                'patient_email': request.patient_email
+            }
+
             # Phase 1: Use calendar service to check and hold
             success, hold_result = await self.calendar_service.ask_hold_reserve(
                 doctor_id=request.doctor_id,
                 start_time=request.start_time,
                 end_time=request.end_time,
-                appointment_data={
-                    'patient_id': request.patient_id,
-                    'clinic_id': request.clinic_id,
-                    'type': request.appointment_type.value,
-                    'reason': request.reason,
-                    'notes': request.notes
-                }
+                appointment_data=appointment_payload
             )
 
             if not success:
@@ -219,7 +236,7 @@ class UnifiedAppointmentService:
                             request.end_time.time()
                         )
 
-                        if conflict_check:
+                        if conflict_check and str(conflict_check['id']) != appointment_id:
                             raise Exception(f"Doctor is already booked during this time slot")
 
                         # Phase 2: Room Auto-Assignment with locking
@@ -256,35 +273,89 @@ class UnifiedAppointmentService:
                             room_id = str(selected_room['id'])
                             logger.info(f"Selected room {room_id} using availability-first strategy")
 
-                        # Phase 3: Insert appointment within transaction
-                        appointment_insert = await conn.execute(
-                            """
-                            INSERT INTO healthcare.appointments (
-                                id, clinic_id, patient_id, doctor_id,
-                                appointment_date, start_time, end_time,
-                                status, appointment_type, reason_for_visit, notes,
-                                reservation_id, room_id, created_at, updated_at
-                            )
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                            """,
-                            uuid.UUID(appointment_id),
-                            uuid.UUID(request.clinic_id),
-                            uuid.UUID(request.patient_id),
-                            uuid.UUID(request.doctor_id),
-                            request.start_time.date(),
-                            request.start_time.time(),
-                            request.end_time.time(),
-                            AppointmentStatus.SCHEDULED.value,
-                            request.appointment_type.value,
-                            request.reason or '',
-                            request.notes or '',
-                            hold_result.get('reservation_id'),
-                            uuid.UUID(room_id) if room_id else None,
-                            datetime.now(),
-                            datetime.now()
-                        )
+                        # Phase 3: Insert or update appointment within transaction
+                        now = datetime.now()
+                        appointment_uuid = uuid.UUID(appointment_id)
 
-                        logger.info(f"Appointment {appointment_id} created successfully in transaction")
+                        if precreated_appointment_id:
+                            existing_row = await conn.fetchrow(
+                                """
+                                SELECT id FROM healthcare.appointments
+                                WHERE id = $1
+                                FOR UPDATE
+                                """,
+                                appointment_uuid
+                            )
+
+                            if not existing_row:
+                                raise Exception(f"Pre-created appointment {appointment_id} not found during update")
+
+                            await conn.execute(
+                                """
+                                UPDATE healthcare.appointments
+                                SET clinic_id = $2,
+                                    patient_id = $3,
+                                    doctor_id = $4,
+                                    appointment_date = $5,
+                                    start_time = $6,
+                                    end_time = $7,
+                                    duration_minutes = $8,
+                                    status = $9,
+                                    appointment_type = $10,
+                                    reason_for_visit = $11,
+                                    notes = $12,
+                                    reservation_id = $13,
+                                    room_id = $14,
+                                    updated_at = $15
+                                WHERE id = $1
+                                """,
+                                appointment_uuid,
+                                uuid.UUID(request.clinic_id),
+                                uuid.UUID(request.patient_id),
+                                uuid.UUID(request.doctor_id),
+                                request.start_time.date(),
+                                request.start_time.time(),
+                                request.end_time.time(),
+                                duration_minutes,
+                                AppointmentStatus.SCHEDULED.value,
+                                request.appointment_type.value,
+                                request.reason or '',
+                                request.notes or '',
+                                reservation_id,
+                                uuid.UUID(room_id) if room_id else None,
+                                now
+                            )
+                            logger.info(f"Appointment {appointment_id} updated with reservation {reservation_id}")
+                        else:
+                            await conn.execute(
+                                """
+                                INSERT INTO healthcare.appointments (
+                                    id, clinic_id, patient_id, doctor_id,
+                                    appointment_date, start_time, end_time, duration_minutes,
+                                    status, appointment_type, reason_for_visit, notes,
+                                    reservation_id, room_id, created_at, updated_at
+                                )
+                                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                                """,
+                                appointment_uuid,
+                                uuid.UUID(request.clinic_id),
+                                uuid.UUID(request.patient_id),
+                                uuid.UUID(request.doctor_id),
+                                request.start_time.date(),
+                                request.start_time.time(),
+                                request.end_time.time(),
+                                duration_minutes,
+                                AppointmentStatus.SCHEDULED.value,
+                                request.appointment_type.value,
+                                request.reason or '',
+                                request.notes or '',
+                                reservation_id,
+                                uuid.UUID(room_id) if room_id else None,
+                                now,
+                                now
+                            )
+                            logger.info(f"Appointment {appointment_id} created successfully with reservation {reservation_id}")
+
                         if room_id:
                             logger.info(f"Appointment assigned to room {room_id}")
 
@@ -298,11 +369,13 @@ class UnifiedAppointmentService:
                     'appointment_date': request.start_time.date().isoformat(),
                     'start_time': request.start_time.time().isoformat(),
                     'end_time': request.end_time.time().isoformat(),
+                    'duration_minutes': duration_minutes,
                     'status': AppointmentStatus.SCHEDULED.value,
                     'appointment_type': request.appointment_type.value,
                     'reason': request.reason or '',
+                    'reason_for_visit': request.reason or '',
                     'notes': request.notes or '',
-                    'reservation_id': hold_result.get('reservation_id'),
+                    'reservation_id': reservation_id,
                     'room_id': room_id,
                     'created_at': datetime.now().isoformat(),
                     'updated_at': datetime.now().isoformat()
@@ -310,7 +383,7 @@ class UnifiedAppointmentService:
 
             except asyncpg.UniqueViolationError as e:
                 logger.error(f"Unique constraint violation (double-booking prevented): {e}")
-                await self._rollback_calendar_hold(hold_result.get('reservation_id'))
+                await self._rollback_calendar_hold(reservation_id)
                 return AppointmentResult(
                     success=False,
                     error="This time slot is no longer available (double-booking prevented)"
@@ -318,14 +391,14 @@ class UnifiedAppointmentService:
             except Exception as e:
                 logger.error(f"Failed to create appointment in transaction: {e}")
                 # Rollback the calendar hold
-                await self._rollback_calendar_hold(hold_result.get('reservation_id'))
+                await self._rollback_calendar_hold(reservation_id)
                 return AppointmentResult(
                     success=False,
                     error=f"Failed to create appointment: {str(e)}"
                 )
 
             # Phase 4: Confirm calendar events
-            await self._confirm_calendar_events(hold_result.get('reservation_id'))
+            await self._confirm_calendar_events(reservation_id)
 
             # Log the appointment creation
             await self._log_appointment_operation(
@@ -346,7 +419,7 @@ class UnifiedAppointmentService:
             return AppointmentResult(
                 success=True,
                 appointment_id=appointment_id,
-                reservation_id=hold_result.get('reservation_id'),
+                reservation_id=reservation_id,
                 external_events=hold_result.get('external_event_ids', {})
             )
 
@@ -449,16 +522,30 @@ class UnifiedAppointmentService:
             appointment = appointment_result.data[0]
 
             # Check availability for new time slot
+            new_duration_minutes = max(
+                1,
+                int((new_end_time - new_start_time).total_seconds() // 60)
+            )
+
             success, hold_result = await self.calendar_service.ask_hold_reserve(
                 doctor_id=appointment['doctor_id'],
                 start_time=new_start_time,
                 end_time=new_end_time,
                 appointment_data={
+                    'id': appointment_id,
                     'patient_id': appointment['patient_id'],
                     'clinic_id': appointment['clinic_id'],
-                    'type': appointment.get('appointment_type', 'consultation'),
-                    'reason': appointment.get('reason', ''),
-                    'reschedule_from': appointment_id
+                    'doctor_id': appointment['doctor_id'],
+                    'appointment_type': appointment.get('appointment_type', 'consultation'),
+                    'appointment_date': new_start_time.date().isoformat(),
+                    'start_time': new_start_time,
+                    'end_time': new_end_time,
+                    'duration_minutes': new_duration_minutes,
+                    'status': AppointmentStatus.SCHEDULED.value,
+                    'reason_for_visit': appointment.get('reason_for_visit', ''),
+                    'notes': appointment.get('notes'),
+                    'reschedule_from': appointment_id,
+                    'skip_internal_confirmation': True
                 }
             )
 
@@ -469,24 +556,37 @@ class UnifiedAppointmentService:
                     conflicts=hold_result.get('conflicts', [])
                 )
 
+            new_reservation_id = hold_result.get('reservation_id')
+
             # Update appointment with new time
             update_result = self.supabase.table('appointments')\
                 .update({
                     'appointment_date': new_start_time.date().isoformat(),
                     'start_time': new_start_time.time().isoformat(),
                     'end_time': new_end_time.time().isoformat(),
+                    'duration_minutes': new_duration_minutes,
                     'status': AppointmentStatus.RESCHEDULED.value,
-                    'reservation_id': hold_result.get('reservation_id'),
+                    'reservation_id': new_reservation_id,
                     'updated_at': datetime.now().isoformat()
                 })\
                 .eq('id', appointment_id)\
                 .execute()
 
+            appointment.update({
+                'appointment_date': new_start_time.date().isoformat(),
+                'start_time': new_start_time.time().isoformat(),
+                'end_time': new_end_time.time().isoformat(),
+                'duration_minutes': new_duration_minutes,
+                'status': AppointmentStatus.RESCHEDULED.value,
+                'reservation_id': new_reservation_id,
+                'updated_at': datetime.now().isoformat()
+            })
+
             # Cancel old calendar events and confirm new ones
             if appointment.get('reservation_id'):
                 await self._cancel_calendar_events(appointment['reservation_id'])
 
-            await self._confirm_calendar_events(hold_result.get('reservation_id'))
+            await self._confirm_calendar_events(new_reservation_id)
 
             # Log the reschedule
             await self._log_appointment_operation(
@@ -513,7 +613,7 @@ class UnifiedAppointmentService:
             return AppointmentResult(
                 success=True,
                 appointment_id=appointment_id,
-                reservation_id=hold_result.get('reservation_id')
+                reservation_id=new_reservation_id
             )
 
         except Exception as e:

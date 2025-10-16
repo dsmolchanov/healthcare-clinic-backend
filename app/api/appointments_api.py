@@ -108,6 +108,7 @@ class BookAppointmentRequest(BaseModel):
     patient_id: str
     doctor_id: str
     clinic_id: str
+    service_id: Optional[str] = None
     start_time: str  # ISO format datetime string
     end_time: str    # ISO format datetime string
     appointment_type: AppointmentTypeEnum
@@ -253,6 +254,7 @@ async def book_appointment(
             patient_id=request.patient_id,
             doctor_id=request.doctor_id,
             clinic_id=request.clinic_id,
+            service_id=request.service_id,
             start_time=request.start_time,
             end_time=request.end_time,
             appointment_type=AppointmentType(request.appointment_type.value),

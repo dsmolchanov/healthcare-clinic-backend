@@ -4,6 +4,7 @@ from app.services.llm.capability_matrix import CapabilityMatrix
 from app.services.llm.adapters.glm_adapter import GLMAdapter
 from app.services.llm.adapters.gemini_adapter import GeminiAdapter
 from app.services.llm.adapters.openai_adapter import OpenAIAdapter
+from app.services.llm.adapters.cerebras_adapter import CerebrasAdapter
 import logging
 import time
 
@@ -33,6 +34,8 @@ class LLMFactory:
             adapter = GeminiAdapter(capability)
         elif capability.provider == LLMProvider.OPENAI:
             adapter = OpenAIAdapter(capability)
+        elif capability.provider == LLMProvider.CEREBRAS:
+            adapter = CerebrasAdapter(capability)
         else:
             raise ValueError(f"Unsupported provider: {capability.provider}")
 

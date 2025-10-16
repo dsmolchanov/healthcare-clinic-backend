@@ -8,7 +8,7 @@ import json
 import uuid
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date, time
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 
@@ -342,25 +342,76 @@ class ExternalCalendarService:
                 await self._rollback_holds(reservation_id)
                 return False, {'error': 'Failed to secure holds across all calendars', 'details': failed_holds}
 
+            appointment_payload = dict(appointment_data or {})
+            appointment_payload.setdefault('doctor_id', doctor_id)
+            appointment_payload['reservation_id'] = reservation_id
+
+            if 'appointment_type' not in appointment_payload:
+                appointment_payload['appointment_type'] = appointment_payload.get('type')
+            if 'reason_for_visit' not in appointment_payload and appointment_payload.get('reason') is not None:
+                appointment_payload['reason_for_visit'] = appointment_payload.get('reason')
+            if 'start_time' not in appointment_payload:
+                appointment_payload['start_time'] = start_time
+            if 'end_time' not in appointment_payload:
+                appointment_payload['end_time'] = end_time
+            appointment_payload.setdefault('appointment_date', start_time.date().isoformat())
+            appointment_payload.setdefault(
+                'duration_minutes',
+                max(1, int((end_time - start_time).total_seconds() // 60))
+            )
+            appointment_payload.setdefault('status', appointment_payload.get('status') or 'scheduled')
+
+            skip_internal_confirmation = appointment_payload.pop('skip_internal_confirmation', False)
+
+            required_fields = ['clinic_id', 'patient_id', 'doctor_id', 'appointment_type']
+            missing_fields = [field for field in required_fields if not appointment_payload.get(field)]
+
+            if missing_fields:
+                if not skip_internal_confirmation:
+                    logger.warning(
+                        f"Missing fields {missing_fields} for reservation {reservation_id}; "
+                        "skipping internal confirmation."
+                    )
+                    skip_internal_confirmation = True
+                else:
+                    logger.debug(
+                        f"Skipping internal confirmation for reservation {reservation_id} due to missing fields: "
+                        f"{missing_fields}"
+                    )
+
             # Phase 3: RESERVE - Confirm in all systems or rollback
             logger.info(f"Phase 3: RESERVE - Confirming reservation {reservation_id}")
             try:
-                reserve_operations = await asyncio.gather(
-                    self._confirm_internal_appointment(reservation_id, appointment_data),
-                    self._confirm_google_calendar_event(reservation_id, appointment_data),
-                    self._confirm_outlook_calendar_event(reservation_id, appointment_data),
+                reserve_results = []
+
+                if skip_internal_confirmation:
+                    reserve_results.append({
+                        'success': True,
+                        'appointment_id': appointment_payload.get('id')
+                    })
+                else:
+                    reserve_results.append(
+                        await self._confirm_internal_appointment(reservation_id, appointment_payload)
+                    )
+
+                external_results = await asyncio.gather(
+                    self._confirm_google_calendar_event(reservation_id, appointment_payload),
+                    self._confirm_outlook_calendar_event(reservation_id, appointment_payload),
                     return_exceptions=True
                 )
+                reserve_results.extend(external_results)
 
                 # Check if any confirmations failed
                 failed_confirmations = []
                 successful_confirmations = 0
-                appointment_id = None
+                appointment_id = appointment_payload.get('id')
 
-                for i, op in enumerate(reserve_operations):
+                for i, op in enumerate(reserve_results):
                     if isinstance(op, Exception):
                         failed_confirmations.append(f"Confirmation {i}: {str(op)}")
-                    elif op.get('success', False):
+                        continue
+
+                    if op.get('success'):
                         successful_confirmations += 1
                         if op.get('appointment_id'):
                             appointment_id = op['appointment_id']
@@ -369,7 +420,6 @@ class ExternalCalendarService:
 
                 if failed_confirmations:
                     logger.error(f"Some confirmations failed: {failed_confirmations}")
-                    # If critical confirmations failed, rollback everything
                     if successful_confirmations == 0:
                         await self._rollback_reservations(reservation_id)
                         return False, {'error': 'All confirmation operations failed', 'details': failed_confirmations}
@@ -865,8 +915,78 @@ class ExternalCalendarService:
     ) -> Dict[str, Any]:
         """Confirm internal appointment and update hold status"""
         try:
-            # Create the appointment record
-            result = self.supabase.table('appointments').insert(appointment_data).execute()
+            appointment_id = appointment_data.get('id')
+
+            # Normalize payload to match appointments schema
+            appointment_type = appointment_data.get('appointment_type') or appointment_data.get('type') or 'consultation'
+            reason_for_visit = appointment_data.get('reason_for_visit')
+            if reason_for_visit is None and appointment_data.get('reason') is not None:
+                reason_for_visit = appointment_data.get('reason')
+
+            appointment_date = appointment_data.get('appointment_date')
+            if isinstance(appointment_date, datetime):
+                appointment_date = appointment_date.date()
+            if isinstance(appointment_date, date):
+                appointment_date = appointment_date.isoformat()
+
+            start_time_value = appointment_data.get('start_time')
+            if isinstance(start_time_value, datetime):
+                start_time_str = start_time_value.time().isoformat()
+            elif isinstance(start_time_value, time):
+                start_time_str = start_time_value.isoformat()
+            elif isinstance(start_time_value, str):
+                start_time_str = start_time_value
+                if 'T' in start_time_str:
+                    try:
+                        start_time_str = datetime.fromisoformat(start_time_str.replace('Z', '+00:00')).time().isoformat()
+                    except ValueError:
+                        pass
+            else:
+                start_time_str = None
+
+            end_time_value = appointment_data.get('end_time')
+            if isinstance(end_time_value, datetime):
+                end_time_str = end_time_value.time().isoformat()
+            elif isinstance(end_time_value, time):
+                end_time_str = end_time_value.isoformat()
+            elif isinstance(end_time_value, str):
+                end_time_str = end_time_value
+                if 'T' in end_time_str:
+                    try:
+                        end_time_str = datetime.fromisoformat(end_time_str.replace('Z', '+00:00')).time().isoformat()
+                    except ValueError:
+                        pass
+            else:
+                end_time_str = None
+
+            duration_minutes = appointment_data.get('duration_minutes')
+            if isinstance(duration_minutes, timedelta):
+                duration_minutes = max(1, int(duration_minutes.total_seconds() // 60))
+            if duration_minutes is None and isinstance(start_time_value, datetime) and isinstance(end_time_value, datetime):
+                duration_minutes = max(1, int((end_time_value - start_time_value).total_seconds() // 60))
+
+            payload = {
+                'clinic_id': appointment_data.get('clinic_id'),
+                'patient_id': appointment_data.get('patient_id'),
+                'doctor_id': appointment_data.get('doctor_id'),
+                'appointment_type': appointment_type,
+                'appointment_date': appointment_date,
+                'start_time': start_time_str,
+                'end_time': end_time_str,
+                'duration_minutes': duration_minutes,
+                'status': appointment_data.get('status') or 'scheduled',
+                'reason_for_visit': reason_for_visit or '',
+                'notes': appointment_data.get('notes'),
+                'reservation_id': appointment_data.get('reservation_id') or reservation_id
+            }
+
+            if appointment_id:
+                payload['id'] = appointment_id
+
+            # Remove keys with None values (Supabase rejects unknown/null columns)
+            payload = {k: v for k, v in payload.items() if v is not None}
+
+            result = self.supabase.table('appointments').insert(payload).execute()
 
             if result.data:
                 appointment_id = result.data[0]['id']

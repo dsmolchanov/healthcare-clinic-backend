@@ -9,6 +9,7 @@ class LLMProvider(str, Enum):
     GLM = "glm"
     GOOGLE = "google"
     OPENAI = "openai"
+    CEREBRAS = "cerebras"
 
 
 class ToolCall(BaseModel):
@@ -42,8 +43,8 @@ class ModelCapability(BaseModel):
     # Performance
     max_input_tokens: int
     max_output_tokens: int
-    avg_output_speed: Optional[float] = None
-    avg_ttft: Optional[float] = None
+    avg_output_speed_tokens_per_sec: Optional[float] = None
+    avg_ttft_seconds: Optional[float] = None
     p95_latency_ms: Optional[int] = None
 
     # Capabilities
