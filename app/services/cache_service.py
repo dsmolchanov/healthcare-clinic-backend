@@ -225,9 +225,9 @@ class CacheService:
                 logger.warning(f"Lock wait timeout for {cache_key}")
 
         try:
-            # Load from RPC
+            # Load from RPC (execute() is synchronous, not async)
             start_time = time.time()
-            result = await self.supabase.rpc('get_clinic_bundle', {'p_clinic_id': clinic_id}).execute()
+            result = self.supabase.rpc('get_clinic_bundle', {'p_clinic_id': clinic_id}).execute()
             rpc_time_ms = (time.time() - start_time) * 1000
             logger.info(f"📊 RPC get_clinic_bundle took {rpc_time_ms:.2f}ms for clinic {clinic_id}")
 
@@ -283,8 +283,8 @@ class CacheService:
                 logger.debug(f"✅ Cache HIT: patient profile (hashed)")
                 return json.loads(cached_data)
 
-            # Cache miss - load from database
-            result = await self.supabase.schema('healthcare').table('patients').select(
+            # Cache miss - load from database (execute() is synchronous, not async)
+            result = self.supabase.schema('healthcare').table('patients').select(
                 'id,first_name,last_name,phone,email,date_of_birth,preferred_language'
             ).eq('phone', phone_number).eq('clinic_id', clinic_id).maybe_single().execute()
 
@@ -335,7 +335,8 @@ class CacheService:
         session_state = None
         if session_id:
             try:
-                result = await self.supabase.table('conversation_sessions').select(
+                # execute() is synchronous, not async
+                result = self.supabase.table('conversation_sessions').select(
                     'turn_status,last_agent_action,pending_since'
                 ).eq('id', session_id).maybe_single().execute()
                 session_state = result.data if result.data else {}

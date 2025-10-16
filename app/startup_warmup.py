@@ -63,18 +63,16 @@ async def warmup_clinic_data(clinic_ids: List[str] = None):
                 services = bundle.get('services', [])
                 faqs = bundle.get('faqs', [])
 
-                # Cache clinic info separately for fast access
-                cache_key = f"clinic:{clinic_id}:info:v2"
-                redis.setex(cache_key, 3600, json.dumps(clinic_info))
+                # Cache clinic info and collections directly in Redis
+                cache_key_info = f"clinic:{clinic_id}:info:v2"
+                cache_key_doctors = f"clinic:{clinic_id}:doctors"
+                cache_key_services = f"clinic:{clinic_id}:services"
+                cache_key_faqs = f"clinic:{clinic_id}:faqs"
 
-                # Cache the individual collections using the cache service
-                # (This ensures they're in the expected format for other code)
-                await asyncio.gather(
-                    cache._set_cache(f"clinic:{clinic_id}:doctors", doctors, 3600),
-                    cache._set_cache(f"clinic:{clinic_id}:services", services, 3600),
-                    cache._set_cache(f"clinic:{clinic_id}:faqs", faqs, 3600),
-                    return_exceptions=True
-                )
+                redis.setex(cache_key_info, 3600, json.dumps(clinic_info))
+                redis.setex(cache_key_doctors, 3600, json.dumps(doctors))
+                redis.setex(cache_key_services, 3600, json.dumps(services))
+                redis.setex(cache_key_faqs, 3600, json.dumps(faqs))
 
                 total_doctors += len(doctors)
                 total_services += len(services)
