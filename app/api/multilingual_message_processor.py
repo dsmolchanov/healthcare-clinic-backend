@@ -450,7 +450,7 @@ DO NOT attempt to answer complex questions yourself.
         language_service = LanguageService()
         session_service = SessionService(get_supabase_client())
 
-        # Build context for router (using hydrated data)
+        # Build context for router (using hydrated data + memory)
         router_context = {
             'patient': {
                 'id': patient_id,
@@ -468,7 +468,9 @@ DO NOT attempt to answer complex questions yourself.
                 'turn_status': session_turn_status,
                 'last_agent_action': last_agent_action
             },
-            'history': session_messages
+            'history': session_messages,
+            'memory': memory_context,  # Add memory for fast-path personalization
+            'preferences': user_preferences  # Add preferences for personalization
         }
 
         # Classify message into lane

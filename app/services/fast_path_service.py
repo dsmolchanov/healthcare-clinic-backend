@@ -103,6 +103,20 @@ class FastPathService:
             language = patient.get('preferred_language', 'es')
             first_name = patient.get('first_name')
 
+            # Memory context for personalization
+            memory = context.get('memory', [])
+            history = context.get('history', [])
+
+            # Check if user previously asked about this service
+            service_name_lower = service.get('name', '').lower()
+            has_asked_before = any(
+                service_name_lower in str(mem).lower()
+                for mem in memory
+            ) or any(
+                service_name_lower in msg.get('content', '').lower()
+                for msg in history[-5:]  # Check last 5 messages
+            )
+
             # Format price
             price = service.get('price', 0)
             currency = service.get('currency', 'MXN')
@@ -112,12 +126,13 @@ class FastPathService:
             service_name_i18n = service.get('name_i18n', {})
             service_name = service_name_i18n.get(language, service_name_i18n.get('es', service.get('name', 'servicio')))
 
-            # Render template
+            # Render template with memory context
             template_vars = {
                 'first_name': first_name,
                 'service_name': service_name,
                 'price': formatted_price,
-                'duration': service.get('duration_minutes', 30)
+                'duration': service.get('duration_minutes', 30),
+                'returning_inquiry': has_asked_before  # Flag for template to add "as discussed" context
             }
 
             reply = self.language.render_template(
@@ -180,6 +195,14 @@ class FastPathService:
             language = patient.get('preferred_language', 'es')
             first_name = patient.get('first_name')
 
+            # Memory context for personalization
+            memory = context.get('memory', [])
+            preferences = context.get('preferences', {})
+            history = context.get('history', [])
+
+            # Determine if returning user (has conversation history or memories)
+            is_returning = len(history) > 0 or len(memory) > 0
+
             # Determine FAQ category (simplified for now)
             category = self._detect_faq_category(message, language)
 
@@ -188,12 +211,17 @@ class FastPathService:
             reply = faq_responses.get(category, {}).get(language)
 
             if not reply:
-                # Use generic greeting template as fallback
-                reply = self.language.render_template(
-                    'greeting',
-                    language,
-                    {'first_name': first_name}
-                )
+                # Use personalized greeting based on memory
+                if is_returning:
+                    # Returning user - use "Welcome back" greeting
+                    reply = self._get_returning_user_greeting(language, first_name)
+                else:
+                    # New user - use standard greeting
+                    reply = self.language.render_template(
+                        'greeting',
+                        language,
+                        {'first_name': first_name}
+                    )
                 reply += " " + self._get_generic_faq_response(category, language)
 
             # Track performance
@@ -318,6 +346,35 @@ class FastPathService:
         }
 
         return responses.get(language, responses['es']).get(category, responses[language]['general'])
+
+    def _get_returning_user_greeting(self, language: str, first_name: Optional[str] = None) -> str:
+        """
+        Get personalized "Welcome back" greeting for returning users
+
+        Args:
+            language: Language code
+            first_name: Optional user first name
+
+        Returns:
+            Personalized greeting text
+        """
+        greetings = {
+            'ru': {
+                'with_name': f'С возвращением, {first_name}!' if first_name else 'С возвращением!',
+                'without_name': 'С возвращением!'
+            },
+            'es': {
+                'with_name': f'¡Bienvenido de nuevo, {first_name}!' if first_name else '¡Bienvenido de nuevo!',
+                'without_name': '¡Bienvenido de nuevo!'
+            },
+            'en': {
+                'with_name': f'Welcome back, {first_name}!' if first_name else 'Welcome back!',
+                'without_name': 'Welcome back!'
+            }
+        }
+
+        lang_greetings = greetings.get(language, greetings['es'])
+        return lang_greetings['with_name'] if first_name else lang_greetings['without_name']
 
     async def _fallback_to_complex(
         self,
