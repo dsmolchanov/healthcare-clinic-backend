@@ -51,7 +51,7 @@ class AppointmentRequest:
     patient_id: str
     doctor_id: str
     clinic_id: str
-    service_id: Optional[str]
+    service_id: Optional[str] = None
     start_time: datetime
     end_time: datetime
     appointment_type: AppointmentType
@@ -163,6 +163,7 @@ class UnifiedAppointmentService:
                 'clinic_id': request.clinic_id,
                 'patient_id': request.patient_id,
                 'doctor_id': request.doctor_id,
+                'service_id': request.service_id,
                 'appointment_type': request.appointment_type.value,
                 'appointment_date': request.start_time.date().isoformat(),
                 'start_time': request.start_time,
@@ -172,7 +173,8 @@ class UnifiedAppointmentService:
                 'reason_for_visit': request.reason or '',
                 'notes': request.notes or '',
                 'patient_phone': request.patient_phone,
-                'patient_email': request.patient_email
+                'patient_email': request.patient_email,
+                'skip_internal_confirmation': True
             }
 
             # Phase 1: Use calendar service to check and hold
@@ -190,9 +192,16 @@ class UnifiedAppointmentService:
                     conflicts=hold_result.get('conflicts', [])
                 )
 
+            reservation_id = hold_result.get('reservation_id')
+            appointment_payload['reservation_id'] = reservation_id
+            precreated_appointment_id = hold_result.get('appointment_id')
+            if precreated_appointment_id:
+                appointment_id = precreated_appointment_id
+                appointment_payload['id'] = appointment_id
+
             # Phase 2 & 3: Room assignment + Create appointment (wrapped in transaction)
-            appointment_id = str(uuid.uuid4())
             room_id = None
+            resolved_service_id: Optional[str] = request.service_id
 
             try:
                 # Use database transaction with row-level locking to prevent race conditions
@@ -238,6 +247,13 @@ class UnifiedAppointmentService:
 
                         if conflict_check and str(conflict_check['id']) != appointment_id:
                             raise Exception(f"Doctor is already booked during this time slot")
+
+                        if not resolved_service_id:
+                            resolved_service_id = await self._resolve_service_id(
+                                conn,
+                                request.doctor_id
+                            )
+                        appointment_payload['service_id'] = resolved_service_id
 
                         # Phase 2: Room Auto-Assignment with locking
                         logger.info("Starting room auto-assignment within transaction")
@@ -296,23 +312,25 @@ class UnifiedAppointmentService:
                                 SET clinic_id = $2,
                                     patient_id = $3,
                                     doctor_id = $4,
-                                    appointment_date = $5,
-                                    start_time = $6,
-                                    end_time = $7,
-                                    duration_minutes = $8,
-                                    status = $9,
-                                    appointment_type = $10,
-                                    reason_for_visit = $11,
-                                    notes = $12,
-                                    reservation_id = $13,
-                                    room_id = $14,
-                                    updated_at = $15
+                                    service_id = $5,
+                                    appointment_date = $6,
+                                    start_time = $7,
+                                    end_time = $8,
+                                    duration_minutes = $9,
+                                    status = $10,
+                                    appointment_type = $11,
+                                    reason_for_visit = $12,
+                                    notes = $13,
+                                    reservation_id = $14,
+                                    room_id = $15,
+                                    updated_at = $16
                                 WHERE id = $1
                                 """,
                                 appointment_uuid,
                                 uuid.UUID(request.clinic_id),
                                 uuid.UUID(request.patient_id),
                                 uuid.UUID(request.doctor_id),
+                                uuid.UUID(resolved_service_id) if resolved_service_id else None,
                                 request.start_time.date(),
                                 request.start_time.time(),
                                 request.end_time.time(),
@@ -330,17 +348,18 @@ class UnifiedAppointmentService:
                             await conn.execute(
                                 """
                                 INSERT INTO healthcare.appointments (
-                                    id, clinic_id, patient_id, doctor_id,
+                                    id, clinic_id, patient_id, doctor_id, service_id,
                                     appointment_date, start_time, end_time, duration_minutes,
                                     status, appointment_type, reason_for_visit, notes,
                                     reservation_id, room_id, created_at, updated_at
                                 )
-                                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                                 """,
                                 appointment_uuid,
                                 uuid.UUID(request.clinic_id),
                                 uuid.UUID(request.patient_id),
                                 uuid.UUID(request.doctor_id),
+                                uuid.UUID(resolved_service_id) if resolved_service_id else None,
                                 request.start_time.date(),
                                 request.start_time.time(),
                                 request.end_time.time(),
@@ -356,6 +375,8 @@ class UnifiedAppointmentService:
                             )
                             logger.info(f"Appointment {appointment_id} created successfully with reservation {reservation_id}")
 
+                        request.service_id = resolved_service_id
+
                         if room_id:
                             logger.info(f"Appointment assigned to room {room_id}")
 
@@ -366,6 +387,7 @@ class UnifiedAppointmentService:
                     'clinic_id': request.clinic_id,
                     'patient_id': request.patient_id,
                     'doctor_id': request.doctor_id,
+                    'service_id': resolved_service_id,
                     'appointment_date': request.start_time.date().isoformat(),
                     'start_time': request.start_time.time().isoformat(),
                     'end_time': request.end_time.time().isoformat(),
@@ -795,6 +817,40 @@ class UnifiedAppointmentService:
         except Exception as e:
             logger.error(f"Error checking slot availability: {e}")
             return False, []
+
+    async def _resolve_service_id(
+        self,
+        conn: asyncpg.Connection,
+        doctor_id: str
+    ) -> Optional[str]:
+        """
+        Resolve a default service for the doctor when none is provided.
+        Prefers preferred/allowed/derived mappings.
+        """
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT ds.service_id
+                FROM healthcare.doctor_services ds
+                WHERE ds.doctor_id = $1
+                  AND ds.status IN ('preferred', 'allowed', 'derived')
+                ORDER BY
+                    CASE ds.status
+                        WHEN 'preferred' THEN 1
+                        WHEN 'allowed' THEN 2
+                        WHEN 'derived' THEN 3
+                        ELSE 4
+                    END,
+                    ds.created_at
+                LIMIT 1
+                """,
+                uuid.UUID(doctor_id)
+            )
+            if row and row.get('service_id'):
+                return str(row['service_id'])
+        except Exception as e:
+            logger.warning(f"Unable to resolve service for doctor {doctor_id}: {e}")
+        return None
 
     async def _get_doctor_working_hours(self, doctor_id: str, date: datetime) -> Dict[str, datetime]:
         """Get doctor's working hours for a specific date"""

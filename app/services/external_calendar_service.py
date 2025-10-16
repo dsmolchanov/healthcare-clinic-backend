@@ -969,6 +969,7 @@ class ExternalCalendarService:
                 'clinic_id': appointment_data.get('clinic_id'),
                 'patient_id': appointment_data.get('patient_id'),
                 'doctor_id': appointment_data.get('doctor_id'),
+                'service_id': appointment_data.get('service_id'),
                 'appointment_type': appointment_type,
                 'appointment_date': appointment_date,
                 'start_time': start_time_str,
@@ -977,6 +978,7 @@ class ExternalCalendarService:
                 'status': appointment_data.get('status') or 'scheduled',
                 'reason_for_visit': reason_for_visit or '',
                 'notes': appointment_data.get('notes'),
+                'room_id': appointment_data.get('room_id'),
                 'reservation_id': appointment_data.get('reservation_id') or reservation_id
             }
 

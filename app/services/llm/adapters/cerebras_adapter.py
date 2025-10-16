@@ -45,8 +45,16 @@ class CerebrasAdapter(LLMAdapter):
 
             latency_ms = int((time.time() - start_time) * 1000)
 
+            # Extract content - Cerebras returns content in message.content
+            content = response.choices[0].message.content
+
+            # Log for debugging
+            if not content and response.usage.completion_tokens > 0:
+                logger.warning(f"Cerebras returned empty content but generated {response.usage.completion_tokens} tokens")
+                logger.warning(f"Message object: {response.choices[0].message}")
+
             return LLMResponse(
-                content=response.choices[0].message.content,
+                content=content or "",  # Ensure non-None content
                 tool_calls=[],
                 provider=self.provider,
                 model=self.model,
@@ -93,8 +101,16 @@ class CerebrasAdapter(LLMAdapter):
             # Normalize tool calls
             tool_calls = self.normalize_tool_calls(response)
 
+            # Extract content - Cerebras returns content in message.content
+            content = response.choices[0].message.content
+
+            # Log for debugging
+            if not content and response.usage.completion_tokens > 0:
+                logger.warning(f"Cerebras returned empty content but generated {response.usage.completion_tokens} tokens")
+                logger.warning(f"Message object: {response.choices[0].message}")
+
             return LLMResponse(
-                content=response.choices[0].message.content,
+                content=content or "",  # Ensure non-None content
                 tool_calls=tool_calls,
                 provider=self.provider,
                 model=self.model,
