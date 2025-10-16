@@ -16,6 +16,7 @@ zstandard==0.22.0  # Compression for Redis cache (Task #2)
 openai==1.58.1
 google-genai==1.40.0  # Gemini 2.5 Flash/Lite support
 zhipuai==2.1.5.20250825  # GLM-4.5 SDK
+cerebras-cloud-sdk==1.8.0  # Cerebras ultra-fast inference
 requests==2.31.0
 # LangChain provider integrations for LLM factory
 langchain-openai==0.3.0
