@@ -15,6 +15,9 @@ import hmac
 from typing import Dict, Any
 import httpx
 
+# Apply runtime patches before additional imports that rely on OpenAI client setup.
+import app.patches.openai_httpx_fix  # noqa: E402,F401
+
 from supabase import create_client, Client
 # from app.api import quick_onboarding_router  # Disabled - using RPC version instead
 from app.api import quick_onboarding_rpc

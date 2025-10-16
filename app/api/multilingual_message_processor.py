@@ -1253,6 +1253,9 @@ IMPORTANT BEHAVIORS:
         """
         import re
 
+        # Log raw response for debugging
+        logger.info(f"🔍 Raw LLM response (length: {len(response)}): {response[:500]}{'...' if len(response) > 500 else ''}")
+
         # First, remove all complete <think>...</think> blocks (including nested/multiple)
         while re.search(r'<think>.*?</think>', response, flags=re.DOTALL):
             response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)

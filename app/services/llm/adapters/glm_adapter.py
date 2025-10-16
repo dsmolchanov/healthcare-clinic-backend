@@ -102,8 +102,14 @@ class GLMAdapter(LLMAdapter):
             # Normalize tool calls
             tool_calls = self.normalize_tool_calls(response)
 
+            # Extract content (may be None for thinking-heavy responses)
+            content = response.choices[0].message.content or ""
+
+            # Log raw response for debugging
+            logger.info(f"GLM raw response content (length: {len(content)}): {content[:200] if content else '(empty)'}")
+
             return LLMResponse(
-                content=response.choices[0].message.content,
+                content=content,
                 tool_calls=tool_calls,
                 provider=self.provider,
                 model=self.model,
