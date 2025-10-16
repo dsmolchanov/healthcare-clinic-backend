@@ -255,19 +255,24 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
         clinic_id = None
         actual_organization_id = None
 
+        # Initialize clinic_name
+        clinic_name = None
+
         try:
             # Strategy 1: Assume extracted ID is clinic_id (most common case)
-            clinic_result = supabase.table('clinics').select('id, organization_id').eq('id', organization_id).limit(1).execute()
+            clinic_result = supabase.table('clinics').select('id, organization_id, name').eq('id', organization_id).limit(1).execute()
             if clinic_result.data and len(clinic_result.data) > 0:
                 clinic_id = clinic_result.data[0]['id']
                 actual_organization_id = clinic_result.data[0].get('organization_id')
+                clinic_name = clinic_result.data[0].get('name', 'Clinic')
                 print(f"[Background] ✅ Resolved by clinic_id: clinic={clinic_id}, org={actual_organization_id}")
             else:
                 # Strategy 2: Assume extracted ID is organization_id (fallback)
-                clinic_result = supabase.table('clinics').select('id, organization_id').eq('organization_id', organization_id).limit(1).execute()
+                clinic_result = supabase.table('clinics').select('id, organization_id, name').eq('organization_id', organization_id).limit(1).execute()
                 if clinic_result.data and len(clinic_result.data) > 0:
                     clinic_id = clinic_result.data[0]['id']
                     actual_organization_id = clinic_result.data[0].get('organization_id')
+                    clinic_name = clinic_result.data[0].get('name', 'Clinic')
                     print(f"[Background] ✅ Resolved by organization_id: clinic={clinic_id}, org={actual_organization_id}")
                 else:
                     # Strategy 3: Final fallback - use ID as-is and query first clinic
