@@ -8,7 +8,7 @@ with rule-based optimization.
 import os
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from uuid import UUID, uuid4
 from functools import lru_cache
@@ -34,6 +34,9 @@ from .scheduling.escalation_manager import EscalationManager
 from .external_calendar_service import ExternalCalendarService
 from .scheduling.query_profiler import profile_query, PerformanceMonitor
 from .scheduling.cache_monitor import CacheMonitor, global_cache_monitor
+from app.policies import PolicyCompiler
+from app.policies.compiler import RuleEffectType, CompiledPolicy
+from app.policies.starter_pack import get_starter_pack_bundle
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,8 @@ class SchedulingService:
         self.escalation_manager = EscalationManager(self.db)
         self.calendar_service = ExternalCalendarService(self.db)
         self.perf_monitor = PerformanceMonitor()
+        self.policy_compiler = PolicyCompiler()
+        self._policy_cache: Dict[str, Dict[str, Any]] = {}
 
     @profile_query("suggest_slots")
     async def suggest_slots(
@@ -158,6 +163,23 @@ class SchedulingService:
             )
             logger.info(f"{len(valid_slots)} slots passed constraint checks")
 
+            # Step 3b: Apply policy constraints
+            policy = await self._get_active_policy(clinic_id)
+            doctor_appointments = await self._get_doctor_appointments(clinic_id)
+
+            valid_slots = await self._apply_policy_constraints(
+                valid_slots,
+                clinic_id,
+                service_id,
+                policy,
+                settings,
+                doctor_appointments,
+                hard_constraints,
+                patient_preferences,
+                date_range,
+                patient_id
+            )
+
             # Step 4: Check if we need to escalate
             if not valid_slots:
                 escalation_id = await self._escalate_no_slots(
@@ -177,7 +199,11 @@ class SchedulingService:
                 valid_slots,
                 clinic_id,
                 settings,
-                patient_preferences
+                patient_preferences,
+                doctor_appointments=doctor_appointments,
+                policy=policy,
+                service_id=service_id,
+                hard_constraints=hard_constraints
             )
 
             # Step 6: Sort and take top 10
@@ -465,6 +491,8 @@ class SchedulingService:
 
         if result.data:
             settings = result.data[0]
+            settings.setdefault("open_hour", 8)
+            settings.setdefault("close_hour", 20)
         else:
             # Default settings
             logger.warning(f"No settings found for clinic {clinic_id}, using defaults")
@@ -472,6 +500,8 @@ class SchedulingService:
                 "grid_minutes": 15,
                 "max_days_ahead": 3,
                 "hold_duration_minutes": 5,
+                "open_hour": 8,
+                "close_hour": 20,
                 "preference_weights": {
                     "least_busy": 0.3,
                     "pack_schedule": 0.25,
@@ -552,6 +582,7 @@ class SchedulingService:
                                 "room_name": room.get("name", ""),
                                 "start_time": slot_time,
                                 "end_time": slot_time + timedelta(minutes=duration_minutes),
+                                "duration_minutes": duration_minutes,
                                 "score": 0.0
                             })
 
@@ -654,13 +685,298 @@ class SchedulingService:
 
         return valid_slots
 
+    async def _get_active_policy(self, clinic_id: UUID) -> Optional[CompiledPolicy]:
+        """Fetch the active policy snapshot for a clinic (with caching)."""
+        cache_key = str(clinic_id)
+        cached = self._policy_cache.get(cache_key)
+        if cached:
+            fetched_at = cached.get("fetched_at")
+            if fetched_at and datetime.utcnow() - fetched_at < timedelta(minutes=5):
+                return cached.get("policy")
+
+        try:
+            result = self.db.table("policy_snapshots")\
+                .select("bundle")\
+                .eq("clinic_id", str(clinic_id))\
+                .eq("active", True)\
+                .limit(1)\
+                .execute()
+
+            if result.data:
+                bundle = result.data[0].get("bundle") or {}
+            else:
+                bundle = get_starter_pack_bundle(bundle_id=f"{clinic_id}-starter")
+
+            policy = self.policy_compiler.get_or_compile(bundle)
+            self._policy_cache[cache_key] = {
+                "policy": policy,
+                "fetched_at": datetime.utcnow()
+            }
+            return policy
+        except Exception as exc:
+            logger.warning(f"Failed to load policy snapshot for clinic {clinic_id}: {exc}")
+            if cached:
+                return cached.get("policy")
+            return None
+
+    async def _apply_policy_constraints(
+        self,
+        slots: List[Dict[str, Any]],
+        clinic_id: UUID,
+        service_id: UUID,
+        policy: Optional[CompiledPolicy],
+        settings: Dict[str, Any],
+        doctor_appointments: Dict[UUID, List[Dict]],
+        hard_constraints: Optional[HardConstraints],
+        patient_preferences: Optional[Dict[str, Any]],
+        date_range: DateRange,
+        patient_id: Optional[UUID]
+    ) -> List[Dict[str, Any]]:
+        """Filter slots by policy hard rules."""
+        if not policy or not policy.hard_rules:
+            return slots
+
+        filtered: List[Dict[str, Any]] = []
+
+        for slot in slots:
+            context = self._build_policy_context(
+                slot,
+                settings,
+                doctor_appointments,
+                patient_preferences,
+                hard_constraints
+            )
+
+            deny_slot = False
+            policy_notes: List[str] = []
+
+            for rule in policy.hard_rules:
+                try:
+                    if not rule.matches(context):
+                        continue
+                except Exception as exc:
+                    logger.warning(f"Error evaluating rule {rule.rule_id}: {exc}")
+                    continue
+
+                effect = rule.effect_payload
+                explanation = effect.get("explain_template") or rule.metadata.get("explain_template")
+
+                if rule.effect_type == RuleEffectType.DENY:
+                    deny_slot = True
+                    if explanation:
+                        logger.debug(f"Policy deny rule {rule.rule_id} matched for slot")
+                    break
+
+                if rule.effect_type == RuleEffectType.ESCALATE:
+                    escalation_id = await self._escalate_no_slots(
+                        clinic_id,
+                        patient_id,
+                        service_id,
+                        date_range,
+                        hard_constraints
+                    )
+                    raise NoSlotsAvailableError(
+                        explanation or "Request escalated for manual review",
+                        escalation_id=escalation_id
+                    )
+
+                if rule.effect_type == RuleEffectType.REQUIRE_FIELD:
+                    required_field = effect.get("field")
+                    if required_field and not self._context_field_truthy(context, required_field):
+                        deny_slot = True
+                        if explanation:
+                            policy_notes.append(explanation)
+                        break
+
+                if rule.effect_type == RuleEffectType.LIMIT_OCCURRENCE:
+                    logger.debug(
+                        "Limit occurrence rule %s matched (not enforced in real-time)",
+                        rule.rule_id
+                    )
+                    if explanation:
+                        policy_notes.append(explanation)
+
+            if deny_slot:
+                continue
+
+            if policy_notes:
+                slot.setdefault("explanations", []).extend(policy_notes)
+
+            filtered.append(slot)
+
+        return filtered
+
+    def _apply_policy_soft_rules(
+        self,
+        slot: Dict[str, Any],
+        policy: CompiledPolicy,
+        context: Dict[str, Any]
+    ) -> List[str]:
+        """Apply soft rules to adjust slot score/explanations."""
+        explanations: List[str] = []
+
+        for rule in policy.soft_rules:
+            try:
+                if not rule.matches(context):
+                    continue
+            except Exception as exc:
+                logger.warning(f"Error evaluating soft rule {rule.rule_id}: {exc}")
+                continue
+
+            effect = rule.effect_payload
+            explanation = (
+                effect.get("explain_template")
+                or effect.get("message")
+                or rule.metadata.get("explain_template")
+            )
+
+            if rule.effect_type == RuleEffectType.ADJUST_SCORE:
+                delta = effect.get("delta", 0)
+                slot["score"] = slot.get("score", 0.0) + delta
+                if explanation:
+                    explanations.append(f"{explanation} (+{delta:.1f})")
+            elif rule.effect_type == RuleEffectType.WARN:
+                if explanation:
+                    explanations.append(explanation)
+
+        return explanations
+
+    def _build_policy_context(
+        self,
+        slot: Dict[str, Any],
+        settings: Dict[str, Any],
+        doctor_appointments: Dict[UUID, List[Dict]],
+        patient_preferences: Optional[Dict[str, Any]],
+        hard_constraints: Optional[HardConstraints]
+    ) -> Dict[str, Any]:
+        """Construct context dictionary used by policy rules."""
+        start_time = slot["start_time"]
+        end_time = slot["end_time"]
+        duration = slot.get("duration_minutes") or int((end_time - start_time).total_seconds() / 60)
+
+        minutes_since_prev, minutes_until_next = self._compute_slot_adjacency(
+            slot["doctor_id"],
+            start_time,
+            duration,
+            doctor_appointments
+        )
+
+        context = {
+            "clinic": {
+                "hours": {
+                    "open_hour": settings.get("open_hour", 8),
+                    "close_hour": settings.get("close_hour", 20)
+                }
+            },
+            "appointment": {
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+                "within_working_hours": self._within_working_hours(start_time, end_time, settings),
+                "duration_minutes": duration
+            },
+            "slot": {
+                "minutes_since_previous": minutes_since_prev,
+                "minutes_until_next": minutes_until_next
+            },
+            "request": {
+                "is_emergency": self._is_emergency_request(patient_preferences),
+                "human_override": bool(patient_preferences.get("human_override")) if patient_preferences else False,
+                "preferred_doctor_id": str(hard_constraints.doctor_id) if hard_constraints and hard_constraints.doctor_id else None
+            },
+            "doctor": {
+                "id": str(slot["doctor_id"]),
+                "is_least_busy": self._is_least_busy(slot["doctor_id"], start_time, doctor_appointments),
+            }
+        }
+
+        return context
+
+    @staticmethod
+    def _context_field_truthy(context: Dict[str, Any], field_path: str) -> bool:
+        value = context
+        for part in field_path.split("."):
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                return False
+        return bool(value)
+
+    @staticmethod
+    def _within_working_hours(start: datetime, end: datetime, settings: Dict[str, Any]) -> bool:
+        open_hour = settings.get("open_hour", 8)
+        close_hour = settings.get("close_hour", 20)
+        start_boundary = time(hour=open_hour)
+        end_boundary = time(hour=close_hour)
+        return start.time() >= start_boundary and end.time() <= end_boundary
+
+    def _is_emergency_request(self, patient_preferences: Optional[Dict[str, Any]]) -> bool:
+        if not patient_preferences:
+            return False
+        if patient_preferences.get("is_emergency"):
+            return True
+        return patient_preferences.get("urgency") == "emergency"
+
+    def _is_least_busy(
+        self,
+        doctor_id: UUID,
+        slot_time: datetime,
+        doctor_appointments: Dict[UUID, List[Dict]]
+    ) -> bool:
+        slot_date = slot_time.date()
+        min_count = None
+        doctor_count = 0
+
+        for doc_id, appointments in doctor_appointments.items():
+            count = sum(
+                1
+                for apt in appointments
+                if datetime.fromisoformat(apt["start_time"]).date() == slot_date
+            )
+            if doc_id == doctor_id:
+                doctor_count = count
+            min_count = count if min_count is None else min(min_count, count)
+
+        return doctor_count <= (min_count if min_count is not None else doctor_count)
+
+    @staticmethod
+    def _compute_slot_adjacency(
+        doctor_id: UUID,
+        slot_start: datetime,
+        duration_minutes: int,
+        doctor_appointments: Dict[UUID, List[Dict]]
+    ) -> Tuple[Optional[float], Optional[float]]:
+        appointments = doctor_appointments.get(doctor_id, [])
+        prev_diff = None
+        next_diff = None
+        slot_end = slot_start + timedelta(minutes=duration_minutes)
+
+        for apt in appointments:
+            apt_start = datetime.fromisoformat(apt["start_time"])
+            apt_end = datetime.fromisoformat(apt["end_time"])
+
+            if apt_end <= slot_start:
+                diff = (slot_start - apt_end).total_seconds() / 60
+                if prev_diff is None or diff < prev_diff:
+                    prev_diff = diff
+            elif apt_start >= slot_end:
+                diff = (apt_start - slot_end).total_seconds() / 60
+                if next_diff is None or diff < next_diff:
+                    next_diff = diff
+
+        return prev_diff, next_diff
+
     @profile_query("score_preferences")
     async def _score_soft_preferences(
         self,
         valid_slots: List[Dict[str, Any]],
         clinic_id: UUID,
         settings: Dict[str, Any],
-        patient_preferences: Optional[Dict[str, Any]] = None
+        patient_preferences: Optional[Dict[str, Any]] = None,
+        *,
+        doctor_appointments: Optional[Dict[UUID, List[Dict]]] = None,
+        policy: Optional[CompiledPolicy] = None,
+        service_id: Optional[UUID] = None,
+        hard_constraints: Optional[HardConstraints] = None
     ) -> List[Dict[str, Any]]:
         """
         Score slots based on soft preferences.
@@ -676,8 +992,9 @@ class SchedulingService:
         """
         scorer = PreferenceScorer(settings)
 
-        # Get all appointments for scoring context
-        doctor_appointments = await self._get_doctor_appointments(clinic_id)
+        # Get all appointments for scoring context if not provided
+        if doctor_appointments is None:
+            doctor_appointments = await self._get_doctor_appointments(clinic_id)
         room_preferences = await self._get_room_preferences(clinic_id)
 
         for slot in valid_slots:
@@ -709,6 +1026,22 @@ class SchedulingService:
 
             slot["score"] = scorer.calculate_total_score(slot, components)
             slot["explanations"] = scorer.generate_explanations(components)
+
+            if policy:
+                context = self._build_policy_context(
+                    slot,
+                    settings,
+                    doctor_appointments,
+                    patient_preferences,
+                    hard_constraints
+                )
+                policy_explanations = self._apply_policy_soft_rules(
+                    slot,
+                    policy,
+                    context
+                )
+                if policy_explanations:
+                    slot["explanations"].extend(policy_explanations)
 
         return valid_slots
 
