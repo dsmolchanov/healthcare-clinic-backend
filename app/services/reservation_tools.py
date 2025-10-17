@@ -274,7 +274,23 @@ class ReservationTools:
             else:
                 # Single appointment booking
                 # Use the booking service to create appointment
-                result = await self.booking_service.book_appointment(appointment_data)
+                result = await self.booking_service.book_appointment(
+                    patient_phone=appointment_data['patient_phone'],
+                    clinic_id=self.clinic_id,
+                    appointment_details={
+                        'doctor_id': appointment_data['doctor_id'],
+                        'service_id': appointment_data['service_id'],
+                        'date': appointment_datetime.date().isoformat(),
+                        'time': appointment_datetime.time().isoformat(),
+                        'duration_minutes': appointment_data['duration_minutes'],
+                        'type': appointment_data.get('appointment_type', 'general'),
+                        'reason': appointment_data.get('notes'),
+                        'first_name': appointment_data.get('patient_name', '').split()[0] if appointment_data.get('patient_name') else 'Pending',
+                        'last_name': ' '.join(appointment_data.get('patient_name', '').split()[1:]) if appointment_data.get('patient_name') and len(appointment_data.get('patient_name', '').split()) > 1 else 'Registration',
+                        'email': appointment_data.get('patient_email')
+                    },
+                    idempotency_key=appointment_data.get('idempotency_key')
+                )
 
                 if result and 'error' not in result:
                     # Confirm the hold

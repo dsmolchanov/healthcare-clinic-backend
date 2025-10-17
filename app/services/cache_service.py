@@ -188,21 +188,25 @@ class CacheService:
             cached_gen_str = self.redis.get(gen_key)
 
             if cached_data:
-                # Parse metadata (first byte indicates if compressed)
-                is_compressed = cached_data[0] == 1
-                data_bytes = cached_data[1:]
+                try:
+                    # Parse metadata (first byte indicates if compressed)
+                    is_compressed = cached_data[0] == 1
+                    data_bytes = cached_data[1:]
 
-                # Decompress if needed
-                decompressed = self._decompress(data_bytes, is_compressed)
-                bundle = json.loads(decompressed.decode('utf-8'))
+                    # Decompress if needed
+                    decompressed = self._decompress(data_bytes, is_compressed)
+                    bundle = json.loads(decompressed.decode('utf-8'))
 
-                # Validate generation
-                cached_gen = int(cached_gen_str) if cached_gen_str else None
-                if await self._is_cache_valid(clinic_id, 'clinics', cached_gen):
-                    logger.debug(f"✅ Cache HIT: bundle for clinic {clinic_id}")
-                    return bundle
-                else:
-                    logger.debug(f"🔄 Cache STALE: invalidating bundle for clinic {clinic_id}")
+                    # Validate generation
+                    cached_gen = int(cached_gen_str) if cached_gen_str else None
+                    if await self._is_cache_valid(clinic_id, 'clinics', cached_gen):
+                        logger.debug(f"✅ Cache HIT: bundle for clinic {clinic_id}")
+                        return bundle
+                    else:
+                        logger.debug(f"🔄 Cache STALE: invalidating bundle for clinic {clinic_id}")
+                        self.redis.delete(cache_key, gen_key)
+                except (UnicodeDecodeError, json.JSONDecodeError, zstd.ZstdError) as decode_error:
+                    logger.warning(f"Cache data corrupted, deleting: {decode_error}")
                     self.redis.delete(cache_key, gen_key)
         except Exception as e:
             logger.warning(f"Cache read error: {e}")
@@ -217,10 +221,14 @@ class CacheService:
                 # Lock released, try cache again
                 cached_data = self.redis.get(cache_key)
                 if cached_data:
-                    is_compressed = cached_data[0] == 1
-                    data_bytes = cached_data[1:]
-                    decompressed = self._decompress(data_bytes, is_compressed)
-                    return json.loads(decompressed.decode('utf-8'))
+                    try:
+                        is_compressed = cached_data[0] == 1
+                        data_bytes = cached_data[1:]
+                        decompressed = self._decompress(data_bytes, is_compressed)
+                        return json.loads(decompressed.decode('utf-8'))
+                    except (UnicodeDecodeError, json.JSONDecodeError, zstd.ZstdError) as decode_error:
+                        logger.warning(f"Cache data corrupted after lock wait: {decode_error}")
+                        self.redis.delete(cache_key, gen_key)
             else:
                 logger.warning(f"Lock wait timeout for {cache_key}")
 
