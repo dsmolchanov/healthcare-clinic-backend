@@ -17,6 +17,7 @@ openai==1.58.1
 google-genai==1.40.0  # Gemini 2.5 Flash/Lite support
 zhipuai==2.1.5.20250825  # GLM-4.5 SDK
 requests==2.31.0
+jsonschema>=4.21.1
 # LangChain provider integrations for LLM factory
 langchain-openai==0.3.0
 langchain-google-genai==2.0.5

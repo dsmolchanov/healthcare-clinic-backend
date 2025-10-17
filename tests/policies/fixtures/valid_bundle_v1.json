@@ -1,0 +1,89 @@
+{
+  "schema_version": "1.0.0",
+  "bundle_id": "clinic-014-rules",
+  "generated_at": "2025-10-19T17:30:00Z",
+  "tenant_id": "tenant_92",
+  "rules": [
+    {
+      "rule_id": "R-BLOCK-HOLIDAY",
+      "version": 1,
+      "status": "active",
+      "scope": {
+        "type": "clinic",
+        "id": "clinic_014"
+      },
+      "precedence": 10,
+      "temporal": {
+        "timezone": "America/New_York"
+      },
+      "conditions": {
+        "any": [
+          {
+            "field": "appointment.date",
+            "operator": "in",
+            "value": [
+              "2025-12-25"
+            ]
+          },
+          {
+            "field": "appointment.is_holiday",
+            "operator": "equals",
+            "value": true
+          }
+        ]
+      },
+      "effect": {
+        "type": "DENY",
+        "reason_code": "HOLIDAY_BLOCK",
+        "explain_template": "Clinic is closed for holidays on {{ appointment.date }}."
+      },
+      "explain_template": "Clinic is closed for holidays on {{ appointment.date }}.",
+      "reason_code": "HOLIDAY_BLOCK"
+    },
+    {
+      "rule_id": "R-PREFER-MIDDAY",
+      "version": 1,
+      "status": "active",
+      "scope": {
+        "type": "provider",
+        "id": "prov_123"
+      },
+      "precedence": 20,
+      "salience": 50,
+      "conditions": {
+        "all": [
+          {
+            "field": "visit_type",
+            "operator": "equals",
+            "value": "new_patient_consult"
+          },
+          {
+            "any": [
+              {
+                "field": "appointment.hour",
+                "operator": "between",
+                "value": [
+                  10,
+                  15
+                ]
+              },
+              {
+                "field": "appointment.time_of_day",
+                "operator": "equals",
+                "value": "midday"
+              }
+            ]
+          }
+        ]
+      },
+      "effect": {
+        "type": "ADJUST_SCORE",
+        "delta": 5,
+        "reason_code": "PREF_NEW_PATIENT_MIDDAY",
+        "explain_template": "Prefers midday new-patient consult slots."
+      },
+      "explain_template": "Prefers midday new-patient consult slots.",
+      "reason_code": "PREF_NEW_PATIENT_MIDDAY"
+    }
+  ]
+}

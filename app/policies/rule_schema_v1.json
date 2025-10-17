@@ -1,0 +1,621 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.plaintalk.ai/healthcare/rules/rule-schema-v1.json",
+  "title": "Healthcare Scheduling Policy Bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "bundle_id",
+    "generated_at",
+    "rules"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Semantic version for the rule DSL schema."
+    },
+    "bundle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{3,64}$",
+      "description": "Identifier for the compiled policy bundle."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp indicating when the bundle was generated."
+    },
+    "tenant_id": {
+      "type": "string",
+      "description": "Tenant/global identifier the policy applies to."
+    },
+    "clinic_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional clinic or facility UUID scoped by the policy."
+    },
+    "author": {
+      "type": "string",
+      "description": "Human approver or system actor who activated the bundle."
+    },
+    "description": {
+      "type": "string",
+      "description": "Optional summary describing the policy bundle."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Arbitrary metadata for the bundle.",
+      "additionalProperties": true
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Vendor-specific experimental data.",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timezone": {
+      "type": "string",
+      "pattern": "^[A-Za-z]+(?:/[A-Za-z0-9_+-]+)+$",
+      "description": "IANA timezone identifier."
+    },
+    "ruleStatus": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "staged",
+        "active",
+        "superseded",
+        "archived"
+      ]
+    },
+    "scope": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "global",
+            "organization",
+            "tenant",
+            "clinic",
+            "department",
+            "provider",
+            "service",
+            "room",
+            "payer",
+            "visit_type"
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional UUID or identifier for the scoped entity."
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "description": "Additional scope tags for downstream systems."
+        }
+      }
+    },
+    "temporalConstraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "effective_from": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "effective_until": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "timezone": {
+          "$ref": "#/$defs/timezone"
+        },
+        "grace_period_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10080,
+          "description": "Optional grace period applied around start/end boundaries."
+        }
+      }
+    },
+    "conditionLeaf": {
+      "type": "object",
+      "required": [
+        "field",
+        "operator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.]+$",
+          "description": "Dot-notation path within the evaluation context."
+        },
+        "operator": {
+          "type": "string",
+          "enum": [
+            "equals",
+            "not_equals",
+            "greater_than",
+            "greater_or_equal",
+            "less_than",
+            "less_or_equal",
+            "in",
+            "not_in",
+            "between",
+            "contains",
+            "not_contains",
+            "starts_with",
+            "ends_with",
+            "regex",
+            "is_null",
+            "is_not_null"
+          ]
+        },
+        "value": {
+          "description": "Comparison value(s) used by the operator.",
+          "oneOf": [
+            {
+              "type": [
+                "string",
+                "number",
+                "boolean"
+              ]
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean"
+                ]
+              },
+              "minItems": 1
+            },
+            {
+              "type": "object",
+              "additionalProperties": true
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "case_sensitive": {
+          "type": "boolean",
+          "default": true
+        },
+        "timezone": {
+          "$ref": "#/$defs/timezone"
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "operator": {
+                "const": "between"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "string",
+                    "number"
+                  ]
+                },
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          }
+        }
+      ]
+    },
+    "conditionNode": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/conditionLeaf"
+        },
+        {
+          "type": "object",
+          "required": [
+            "all"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "all": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/conditionNode"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "any"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "any": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/conditionNode"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "none"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "none": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/conditionNode"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "not"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "not": {
+              "$ref": "#/$defs/conditionNode"
+            }
+          }
+        }
+      ]
+    },
+    "effect": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "DENY"
+            },
+            "reason_code": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "explain_template": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "queue"
+          ],
+          "properties": {
+            "type": {
+              "const": "ESCALATE"
+            },
+            "queue": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "priority": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "sla_minutes": {
+              "type": "integer",
+              "minimum": 5,
+              "maximum": 1440
+            },
+            "reason_code": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "explain_template": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "message"
+          ],
+          "properties": {
+            "type": {
+              "const": "WARN"
+            },
+            "message": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "reason_code": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "field"
+          ],
+          "properties": {
+            "type": {
+              "const": "REQUIRE_FIELD"
+            },
+            "field": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "reason_code": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "explain_template": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "delta"
+          ],
+          "properties": {
+            "type": {
+              "const": "ADJUST_SCORE"
+            },
+            "delta": {
+              "type": "number",
+              "minimum": -10,
+              "maximum": 10
+            },
+            "cap_total": {
+              "type": "number",
+              "minimum": -20,
+              "maximum": 20
+            },
+            "reason_code": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "explain_template": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "dimension",
+            "max_n"
+          ],
+          "properties": {
+            "type": {
+              "const": "LIMIT_OCCURRENCE"
+            },
+            "dimension": {
+              "type": "string",
+              "enum": [
+                "tenant_day",
+                "tenant_week",
+                "clinic_day",
+                "clinic_week",
+                "provider_day",
+                "provider_week",
+                "patient_day",
+                "patient_week"
+              ]
+            },
+            "max_n": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000
+            },
+            "window_hours": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 168
+            },
+            "reason_code": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "explain_template": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          }
+        }
+      ]
+    },
+    "llmTrace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "prompt_version": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "explanationTemplate": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable template rendered when the rule fires."
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "status",
+        "scope",
+        "precedence",
+        "effect"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{3,64}$"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "$ref": "#/$defs/ruleStatus"
+        },
+        "owner": {
+          "type": "string",
+          "description": "Primary owner responsible for this rule."
+        },
+        "natural_language_intent": {
+          "type": "string",
+          "description": "Original human intent prompt."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "precedence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "salience": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "temporal": {
+          "$ref": "#/$defs/temporalConstraints"
+        },
+        "conditions": {
+          "$ref": "#/$defs/conditionNode",
+          "description": "Boolean expression that must evaluate to true for the rule to apply.",
+          "default": {
+            "all": []
+          }
+        },
+        "effect": {
+          "$ref": "#/$defs/effect"
+        },
+        "explain_template": {
+          "$ref": "#/$defs/explanationTemplate"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{3,64}$"
+          },
+          "uniqueItems": true
+        },
+        "llm_trace": {
+          "$ref": "#/$defs/llmTrace"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "extensions": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0.0",
+  "bundle_id": "duplicate-precedence",
+  "generated_at": "2025-10-19T18:00:00Z",
+  "rules": [
+    {
+      "rule_id": "R-DUPLICATE",
+      "status": "active",
+      "scope": {
+        "type": "clinic",
+        "id": "clinic_001"
+      },
+      "precedence": 5,
+      "effect": {
+        "type": "DENY",
+        "reason_code": "DUPLICATE",
+        "explain_template": "Duplicate rule test."
+      },
+      "explain_template": "Duplicate rule test.",
+      "reason_code": "DUPLICATE",
+      "dependencies": [
+        "UNKNOWN_RULE"
+      ]
+    },
+    {
+      "rule_id": "R-DUPLICATE",
+      "status": "active",
+      "scope": {
+        "type": "clinic",
+        "id": "clinic_001"
+      },
+      "precedence": 5,
+      "effect": {
+        "type": "WARN",
+        "message": "Duplicate precedence test.",
+        "reason_code": "WARN_DUPLICATE"
+      },
+      "reason_code": "WARN_DUPLICATE"
+    }
+  ]
+}
