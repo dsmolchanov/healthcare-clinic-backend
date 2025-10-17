@@ -65,8 +65,8 @@ class RealtimeConflictDetector:
     def __init__(self):
         self.healthcare_supabase = create_supabase_client('healthcare')
         self.public_supabase = create_supabase_client('public')
-        self.calendar_service = ExternalCalendarService(self.healthcare_supabase)
-        self.appointment_service = UnifiedAppointmentService(self.healthcare_supabase)
+        self.calendar_service = ExternalCalendarService(supabase=self.healthcare_supabase)
+        self.appointment_service = UnifiedAppointmentService(supabase=self.healthcare_supabase)
 
         # Active conflicts tracking
         self.active_conflicts: Dict[str, ConflictEvent] = {}

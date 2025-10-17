@@ -967,7 +967,7 @@ async def check_whatsapp_status(clinic_id: str):
 
 @router.post("/{clinic_id}/whatsapp/test")
 async def test_whatsapp_connection(clinic_id: str):
-    """Send a test WhatsApp message to verify connection"""
+    """Send a test WhatsApp message to verify connection via Evolution API"""
     try:
         service = get_service()
 
@@ -991,40 +991,60 @@ async def test_whatsapp_connection(clinic_id: str):
                 'error': 'No WhatsApp number configured'
             }
 
-        # Try to send a test message using Twilio
-        try:
-            import os
-            from twilio.rest import Client
+        # Get WhatsApp integration to find instance name
+        org_id = clinic.get('organization_id')
+        integration_result = service.supabase.schema('healthcare').table('integrations').select(
+            'id, config'
+        ).eq('organization_id', org_id).eq('type', 'whatsapp').eq('enabled', True).limit(1).execute()
 
-            account_sid = os.environ.get('TWILIO_ACCOUNT_SID')
-            auth_token = os.environ.get('TWILIO_AUTH_TOKEN')
-
-            if not account_sid or not auth_token:
-                return {
-                    'success': False,
-                    'error': 'Twilio credentials not configured on server'
-                }
-
-            client = Client(account_sid, auth_token)
-
-            # Send test message
-            message = client.messages.create(
-                body=f"🎉 Test message from {clinic.get('name', 'your clinic')}! Your WhatsApp integration is working correctly.",
-                from_='whatsapp:+14155238886',  # Twilio Sandbox number
-                to=f'whatsapp:{whatsapp_number}'
-            )
-
-            return {
-                'success': True,
-                'message': 'Test message sent successfully',
-                'message_sid': message.sid,
-                'to': whatsapp_number
-            }
-
-        except Exception as twilio_error:
+        if not integration_result.data:
             return {
                 'success': False,
-                'error': f'Failed to send test message: {str(twilio_error)}'
+                'error': 'No WhatsApp integration found. Please configure Evolution API integration first.'
+            }
+
+        config = integration_result.data[0].get('config', {})
+        instance_name = config.get('instance_name')
+
+        if not instance_name:
+            return {
+                'success': False,
+                'error': 'WhatsApp instance name not configured in integration'
+            }
+
+        # Send test message via Evolution API
+        try:
+            from app.services.whatsapp_queue.evolution_client import send_text, is_connected
+
+            # Check if instance is connected first
+            connected = await is_connected(instance_name)
+            if not connected:
+                return {
+                    'success': False,
+                    'error': f'WhatsApp instance "{instance_name}" is not connected. Please scan QR code in Evolution API.'
+                }
+
+            # Send test message
+            test_message = f"🎉 Test message from {clinic.get('name', 'your clinic')}! Your WhatsApp integration is working correctly."
+            success = await send_text(instance_name, whatsapp_number, test_message)
+
+            if success:
+                return {
+                    'success': True,
+                    'message': 'Test message sent successfully via Evolution API',
+                    'to': whatsapp_number,
+                    'instance': instance_name
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': 'Failed to send test message. Check Evolution API logs.'
+                }
+
+        except Exception as evolution_error:
+            return {
+                'success': False,
+                'error': f'Failed to send test message: {str(evolution_error)}'
             }
 
     except Exception as e:

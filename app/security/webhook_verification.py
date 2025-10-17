@@ -18,12 +18,9 @@ class WebhookVerifier:
     def __init__(self):
         # Get webhook secrets from environment
         self.evolution_secret = os.getenv("EVOLUTION_WEBHOOK_SECRET", "")
-        self.twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "")
 
         if not self.evolution_secret:
             logger.warning("EVOLUTION_WEBHOOK_SECRET not configured - webhook verification disabled for Evolution")
-        if not self.twilio_auth_token:
-            logger.warning("TWILIO_AUTH_TOKEN not configured - webhook verification disabled for Twilio")
 
     def verify_evolution_signature(
         self,
@@ -59,59 +56,6 @@ class WebhookVerifier:
             logger.warning(f"Evolution webhook signature mismatch - expected: {expected_signature[:10]}..., got: {signature[:10]}...")
 
         return is_valid
-
-    def verify_twilio_signature(
-        self,
-        url: str,
-        params: dict,
-        signature: Optional[str]
-    ) -> bool:
-        """
-        Verify Twilio webhook signature.
-
-        Args:
-            url: Full URL of the webhook endpoint
-            params: Request parameters
-            signature: Signature from X-Twilio-Signature header
-
-        Returns:
-            True if signature is valid or verification is disabled, False otherwise
-        """
-        # If no auth token configured, skip verification (development mode)
-        if not self.twilio_auth_token:
-            logger.debug("Twilio webhook verification skipped - no auth token configured")
-            return True
-
-        if not signature:
-            logger.warning("Twilio webhook signature missing")
-            return False
-
-        # Import Twilio validator if available
-        try:
-            from twilio.request_validator import RequestValidator
-            validator = RequestValidator(self.twilio_auth_token)
-            is_valid = validator.validate(url, params, signature)
-
-            if not is_valid:
-                logger.warning("Twilio webhook signature validation failed")
-
-            return is_valid
-        except ImportError:
-            logger.warning("Twilio library not installed - using fallback verification")
-            # Fallback to basic HMAC verification
-            # Concatenate URL and sorted parameters
-            data = url
-            if params:
-                for key in sorted(params.keys()):
-                    data += key + str(params[key])
-
-            expected_signature = self._calculate_hmac_signature(
-                data.encode('utf-8'),
-                self.twilio_auth_token,
-                use_base64=True
-            )
-
-            return hmac.compare_digest(signature, expected_signature)
 
     def _calculate_hmac_signature(
         self,
@@ -150,27 +94,21 @@ webhook_verifier = WebhookVerifier()
 def verify_webhook_signature(
     provider: str,
     body: bytes = None,
-    signature: str = None,
-    url: str = None,
-    params: dict = None
+    signature: str = None
 ) -> bool:
     """
     Convenience function to verify webhook signatures.
 
     Args:
-        provider: Webhook provider ('evolution' or 'twilio')
-        body: Raw request body (for Evolution)
+        provider: Webhook provider (currently only 'evolution' supported)
+        body: Raw request body
         signature: Signature header value
-        url: Full URL (for Twilio)
-        params: Request parameters (for Twilio)
 
     Returns:
         True if signature is valid or verification is disabled
     """
     if provider.lower() == 'evolution':
         return webhook_verifier.verify_evolution_signature(body, signature)
-    elif provider.lower() == 'twilio':
-        return webhook_verifier.verify_twilio_signature(url, params, signature)
     else:
         logger.warning(f"Unknown webhook provider: {provider}")
         return False

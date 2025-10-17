@@ -25,11 +25,14 @@ class AppointmentBookingService:
     Manages appointment booking with calendar synchronization
     """
 
-    def __init__(self):
-        self.supabase: Client = create_client(
-            os.environ.get("SUPABASE_URL"),
-            os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-        )
+    def __init__(self, supabase_client: Client = None):
+        if supabase_client:
+            self.supabase = supabase_client
+        else:
+            self.supabase: Client = create_client(
+                os.environ.get("SUPABASE_URL"),
+                os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+            )
 
         self.vault = ComplianceVault()
         self.compliance = ComplianceManager()

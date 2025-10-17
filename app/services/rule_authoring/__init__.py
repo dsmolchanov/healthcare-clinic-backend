@@ -9,6 +9,11 @@ from .prompt_spec import (
     RuleAuthoringLLMConfig,
     get_default_rule_authoring_llm_config,
 )
+from .orchestrator import (
+    RuleAuthoringOrchestrator,
+    RuleAuthoringSessionState,
+    RuleAuthoringGuardrailError,
+)
 
 __all__ = [
     "build_rule_authoring_prompt",
@@ -16,4 +21,7 @@ __all__ = [
     "get_rule_authoring_system_prompt",
     "RuleAuthoringLLMConfig",
     "get_default_rule_authoring_llm_config",
+    "RuleAuthoringOrchestrator",
+    "RuleAuthoringSessionState",
+    "RuleAuthoringGuardrailError",
 ]

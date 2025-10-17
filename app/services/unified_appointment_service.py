@@ -88,7 +88,7 @@ class UnifiedAppointmentService:
             self.healthcare_supabase = self.supabase.schema('healthcare')
         except AttributeError:
             self.healthcare_supabase = self.supabase
-        self.calendar_service = ExternalCalendarService(self.supabase)
+        self.calendar_service = ExternalCalendarService(supabase=self.supabase)
         self.default_appointment_duration = timedelta(minutes=30)
 
     async def get_available_slots(

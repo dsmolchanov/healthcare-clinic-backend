@@ -505,7 +505,7 @@ class AutomatedRescheduler:
             # Use unified appointment service for the reschedule
             from app.services.unified_appointment_service import UnifiedAppointmentService
 
-            service = UnifiedAppointmentService(self.supabase)
+            service = UnifiedAppointmentService(supabase=self.supabase)
 
             result = await service.reschedule_appointment(
                 appointment_id=appointment['id'],

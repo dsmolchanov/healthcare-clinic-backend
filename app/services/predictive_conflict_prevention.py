@@ -66,7 +66,7 @@ class PredictiveConflictPrevention:
 
     def __init__(self, supabase=None):
         self.supabase = supabase
-        self.appointment_service = UnifiedAppointmentService(supabase)
+        self.appointment_service = UnifiedAppointmentService(supabase=supabase)
 
         # Active risk monitoring
         self.active_risks: Dict[str, ConflictRisk] = {}

@@ -50,10 +50,10 @@ class ReservationTools:
         self.supabase = create_supabase_client()
 
         # Initialize services
-        self.booking_service = AppointmentBookingService(self.supabase)
-        self.unified_service = UnifiedAppointmentService(clinic_id, self.supabase)
-        self.calendar_service = ExternalCalendarService(self.supabase)
-        self.scheduler = IntelligentScheduler(self.supabase)
+        self.booking_service = AppointmentBookingService(supabase_client=self.supabase)
+        self.unified_service = UnifiedAppointmentService(supabase=self.supabase)
+        self.calendar_service = ExternalCalendarService(supabase=self.supabase)
+        self.scheduler = IntelligentScheduler(supabase=self.supabase)
         self.conflict_detector = RealtimeConflictDetector()
         self.session_manager = RedisSessionManager()
 

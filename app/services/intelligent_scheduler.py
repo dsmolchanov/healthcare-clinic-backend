@@ -104,8 +104,8 @@ class IntelligentScheduler:
                 os.environ.get("SUPABASE_URL"),
                 os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
             )
-        self.appointment_service = UnifiedAppointmentService(self.supabase)
-        self.calendar_service = ExternalCalendarService(self.supabase)
+        self.appointment_service = UnifiedAppointmentService(supabase=self.supabase)
+        self.calendar_service = ExternalCalendarService(supabase=self.supabase)
 
         # Scheduling weights for optimization
         self.optimization_weights = {
