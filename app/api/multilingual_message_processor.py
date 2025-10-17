@@ -957,7 +957,7 @@ IMPORTANT BEHAVIORS:
             tool_schemas = get_tool_schemas(clinic_id)
             logger.info(f"Loaded {len(tool_schemas)} tool schemas for clinic {clinic_id}")
 
-            # Phase 8: Add timeout to LLM call (budget: 10s max for reasonable responses)
+            # Phase 8: Add timeout to LLM call (budget: 20s max for tool calling + memory retrieval)
             try:
                 # Try LLM Factory first (GPT-5-nano), fallback to direct OpenAI if factory not ready
                 try:
@@ -966,11 +966,11 @@ IMPORTANT BEHAVIORS:
                         factory.generate_with_tools(
                             messages=messages,
                             tools=tool_schemas,
-                            model=None,  # Let factory choose best tool-calling model (GLM-4.6 default)
+                            model=None,  # Let factory choose best tool-calling model (GPT-4o-mini default)
                             temperature=1.0,  # GPT-5-nano only supports default temperature of 1.0
                             max_tokens=300
                         ),
-                        timeout=10.0
+                        timeout=20.0  # Increased from 10s to allow for tool calling + mem0 retrieval
                     )
 
                     # Check if LLM wants to call tools
@@ -1099,6 +1099,133 @@ IMPORTANT BEHAVIORS:
                                     "content": info
                                 })
 
+                            elif tool_name == "check_availability":
+                                from app.services.reservation_tools import ReservationTools
+
+                                # Extract patient_id from session if available
+                                patient_id = None
+                                if session_history and len(session_history) > 0:
+                                    # Try to get patient_id from session metadata
+                                    for msg in session_history:
+                                        if msg.get('metadata', {}).get('patient_id'):
+                                            patient_id = msg['metadata']['patient_id']
+                                            break
+
+                                # Instantiate ReservationTools
+                                reservation_tools = ReservationTools(
+                                    clinic_id=clinic_id,
+                                    patient_id=patient_id
+                                )
+
+                                # Execute tool
+                                result = await reservation_tools.check_availability_tool(**tool_args)
+
+                                # Format result for LLM
+                                if result.get('success'):
+                                    slots = result.get('available_slots', [])
+                                    if slots:
+                                        result_text = f"Found {len(slots)} available slots:\n"
+                                        for slot in slots[:5]:  # Show top 5
+                                            result_text += f"- {slot['date']} at {slot['start_time']} with {slot['doctor_name']}\n"
+                                        if result.get('recommendation'):
+                                            result_text += f"\nRecommendation: {result['recommendation']}"
+                                    else:
+                                        result_text = "No available slots found for the requested service and timeframe."
+                                else:
+                                    result_text = f"Error checking availability: {result.get('error', 'Unknown error')}"
+
+                                logger.info(f"✅ check_availability tool returned: {result_text[:200]}...")
+                                tool_results.append({
+                                    "tool_call_id": tool_call.id,
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "content": result_text
+                                })
+
+                            elif tool_name == "book_appointment":
+                                from app.services.reservation_tools import ReservationTools
+
+                                # Extract patient_id from patient_info or session
+                                patient_id = None
+                                if 'patient_info' in tool_args and 'phone' in tool_args['patient_info']:
+                                    # TODO: Look up patient_id by phone number
+                                    # For now, will be created in booking service
+                                    pass
+
+                                reservation_tools = ReservationTools(
+                                    clinic_id=clinic_id,
+                                    patient_id=patient_id
+                                )
+
+                                result = await reservation_tools.book_appointment_tool(**tool_args)
+
+                                if result.get('success'):
+                                    appt = result.get('appointment', {})
+                                    confirmation = result.get('confirmation_message', 'Appointment booked successfully')
+                                    result_text = f"✅ {confirmation}\n"
+                                    result_text += f"Appointment ID: {result.get('appointment_id')}\n"
+                                    if appt:
+                                        result_text += f"Doctor: {appt.get('doctor_name', 'TBD')}\n"
+                                        result_text += f"Date: {appt.get('date')} at {appt.get('start_time')}"
+                                else:
+                                    result_text = f"❌ Booking failed: {result.get('error', 'Unknown error')}"
+
+                                logger.info(f"✅ book_appointment tool returned: {result_text[:200]}...")
+                                tool_results.append({
+                                    "tool_call_id": tool_call.id,
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "content": result_text
+                                })
+
+                            elif tool_name == "cancel_appointment":
+                                from app.services.reservation_tools import ReservationTools
+
+                                reservation_tools = ReservationTools(
+                                    clinic_id=clinic_id
+                                )
+
+                                result = await reservation_tools.cancel_appointment_tool(**tool_args)
+
+                                if result.get('success'):
+                                    result_text = f"✅ Appointment cancelled successfully"
+                                    if result.get('cancelled_count', 0) > 1:
+                                        result_text += f" ({result['cancelled_count']} appointments cancelled)"
+                                else:
+                                    result_text = f"❌ Cancellation failed: {result.get('error', 'Unknown error')}"
+
+                                logger.info(f"✅ cancel_appointment tool returned: {result_text}")
+                                tool_results.append({
+                                    "tool_call_id": tool_call.id,
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "content": result_text
+                                })
+
+                            elif tool_name == "reschedule_appointment":
+                                from app.services.reservation_tools import ReservationTools
+
+                                reservation_tools = ReservationTools(
+                                    clinic_id=clinic_id
+                                )
+
+                                result = await reservation_tools.reschedule_appointment_tool(**tool_args)
+
+                                if result.get('success'):
+                                    result_text = f"✅ Appointment rescheduled successfully to {tool_args['new_datetime']}"
+                                    if result.get('rescheduled_count', 0) > 1:
+                                        result_text += f" ({result['rescheduled_count']} appointments rescheduled)"
+                                else:
+                                    result_text = f"❌ Rescheduling failed: {result.get('error', 'Unknown error')}"
+
+                                logger.info(f"✅ reschedule_appointment tool returned: {result_text}")
+                                tool_results.append({
+                                    "tool_call_id": tool_call.id,
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "content": result_text
+                                })
+
                         # Add tool results to messages and get final response
                         messages.append({
                             "role": "assistant",
@@ -1168,7 +1295,7 @@ IMPORTANT BEHAVIORS:
                     }
 
             except asyncio.TimeoutError:
-                logger.error("LLM call exceeded 10s timeout, using fallback")
+                logger.error("LLM call exceeded 20s timeout, using fallback")
                 # Quick template fallback with smart content detection
                 from app.services.intent_router import IntentRouter
                 intent_router = IntentRouter()

@@ -105,15 +105,24 @@ class ClinicDataCache:
             services = []
             try:
                 # Use 'active' column (current schema)
+                # Include i18n fields for multi-language search support
                 result = supabase_client.schema('healthcare').table('services').select(
-                    'id,name,description,base_price,category,duration_minutes,currency,code'
+                    '''
+                    id,name,description,base_price,category,duration_minutes,currency,code,
+                    name_ru,name_en,name_es,name_pt,name_he,
+                    description_ru,description_en,description_es,description_pt,description_he
+                    '''
                 ).eq('clinic_id', clinic_id).eq('active', True).execute()
                 services = result.data if result.data else []
             except Exception as e:
                 if 'active' in str(e):
                     logger.debug("Falling back to 'is_active' column for services")
                     result = supabase_client.schema('healthcare').table('services').select(
-                        'id,name,description,base_price,category,duration_minutes,currency,code'
+                        '''
+                        id,name,description,base_price,category,duration_minutes,currency,code,
+                        name_ru,name_en,name_es,name_pt,name_he,
+                        description_ru,description_en,description_es,description_pt,description_he
+                        '''
                     ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
                     services = result.data if result.data else []
                 else:
@@ -126,6 +135,59 @@ class ClinicDataCache:
         except Exception as e:
             logger.error(f"Error getting/caching services: {e}")
             return []
+
+    def search_cached_services(
+        self,
+        cached_services: List[Dict[str, Any]],
+        query: str,
+        language: str = 'en'
+    ) -> List[Dict[str, Any]]:
+        """
+        Search cached services with language-aware field matching
+
+        Args:
+            cached_services: List of cached service dicts
+            query: Normalized search query
+            language: ISO 639-1 language code (en, es, ru, pt, he)
+
+        Returns:
+            List of matching services (exact + fuzzy matches)
+        """
+        query_lower = query.lower()
+        matches = []
+
+        # Define search fields by language priority
+        field_priority = {
+            'ru': ['name_ru', 'name', 'name_en'],
+            'es': ['name_es', 'name', 'name_en'],
+            'en': ['name_en', 'name'],
+            'pt': ['name_pt', 'name', 'name_en'],
+            'he': ['name_he', 'name', 'name_en']
+        }
+
+        search_fields = field_priority.get(language, ['name', 'name_en'])
+
+        for service in cached_services:
+            # Exact match in language-specific fields
+            for field in search_fields:
+                field_value = service.get(field, '')
+                if field_value and query_lower == field_value.lower():
+                    service['match_type'] = 'exact'
+                    service['match_field'] = field
+                    matches.append(service)
+                    break
+
+            # Substring match (fallback)
+            if service not in matches:
+                for field in search_fields:
+                    field_value = service.get(field, '')
+                    if field_value and query_lower in field_value.lower():
+                        service['match_type'] = 'substring'
+                        service['match_field'] = field
+                        matches.append(service)
+                        break
+
+        return matches
 
     async def get_faqs(self, clinic_id: str, supabase_client) -> List[Dict[str, Any]]:
         """

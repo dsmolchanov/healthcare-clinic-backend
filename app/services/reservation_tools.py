@@ -52,9 +52,9 @@ class ReservationTools:
         # Initialize services
         self.booking_service = AppointmentBookingService(self.supabase)
         self.unified_service = UnifiedAppointmentService(clinic_id, self.supabase)
-        self.calendar_service = ExternalCalendarService(clinic_id, self.supabase)
-        self.scheduler = IntelligentScheduler(clinic_id, self.supabase)
-        self.conflict_detector = RealtimeConflictDetector(clinic_id, self.supabase)
+        self.calendar_service = ExternalCalendarService(self.supabase)
+        self.scheduler = IntelligentScheduler(self.supabase)
+        self.conflict_detector = RealtimeConflictDetector()
         self.session_manager = RedisSessionManager()
 
         logger.info(f"Initialized ReservationTools for clinic {clinic_id}")
@@ -800,11 +800,38 @@ class ReservationTools:
 
     # Helper methods
 
-    async def _get_service_by_name(self, service_name: str) -> Optional[Dict[str, Any]]:
-        """Get service details by name from healthcare schema"""
+    async def _get_service_by_name(
+        self,
+        service_name: str,
+        language: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Get service details by name using hybrid search"""
         try:
-            result = self.supabase.schema('healthcare').table('services').select('*').ilike('name', f'%{service_name}%').execute()
-            return result.data[0] if result.data else None
+            # Initialize hybrid search service (lazy init)
+            if not hasattr(self, 'hybrid_search'):
+                from app.config import get_redis_client
+                from app.services.hybrid_search_service import HybridSearchService, EntityType
+                redis = get_redis_client()
+                self.hybrid_search = HybridSearchService(self.clinic_id, redis, self.supabase)
+
+            # Search using hybrid service
+            search_result = await self.hybrid_search.search(
+                query=service_name,
+                entity_type=EntityType.SERVICE,
+                language=language,
+                limit=1
+            )
+
+            if search_result['success'] and search_result['results']:
+                logger.info(
+                    f"✅ Service found via {search_result['search_metadata']['search_stage']}: "
+                    f"{search_result['results'][0]['name']}"
+                )
+                return search_result['results'][0]
+
+            logger.error(f"❌ Service '{service_name}' not found via hybrid search")
+            return None
+
         except Exception as e:
             logger.error(f"Error getting service: {str(e)}")
             return None

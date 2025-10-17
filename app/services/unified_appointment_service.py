@@ -253,7 +253,8 @@ class UnifiedAppointmentService:
                         if not resolved_service_id:
                             resolved_service_id = await self._resolve_service_id(
                                 conn,
-                                request.doctor_id
+                                request.doctor_id,
+                                request.clinic_id
                             )
                         appointment_payload['service_id'] = resolved_service_id
 
@@ -823,35 +824,58 @@ class UnifiedAppointmentService:
     async def _resolve_service_id(
         self,
         conn: asyncpg.Connection,
-        doctor_id: str
+        doctor_id: str,
+        clinic_id: str
     ) -> Optional[str]:
         """
         Resolve a default service for the doctor when none is provided.
         Prefers preferred/allowed/derived mappings.
         """
+        # 1. Doctor-service mapping (extended tables)
+        doctor_lookup_sql = """
+            SELECT ds.service_id
+            FROM healthcare.doctor_services ds
+            WHERE ds.doctor_id = $1
+            ORDER BY
+                CASE
+                    WHEN ds.status = 'preferred' THEN 1
+                    WHEN ds.status = 'allowed' THEN 2
+                    WHEN ds.status = 'derived' THEN 3
+                    WHEN COALESCE(ds.is_primary, false) THEN 4
+                    ELSE 5
+                END,
+                ds.created_at
+            LIMIT 1
+        """
+
         try:
-            row = await conn.fetchrow(
-                """
-                SELECT ds.service_id
-                FROM healthcare.doctor_services ds
-                WHERE ds.doctor_id = $1
-                  AND ds.status IN ('preferred', 'allowed', 'derived')
-                ORDER BY
-                    CASE ds.status
-                        WHEN 'preferred' THEN 1
-                        WHEN 'allowed' THEN 2
-                        WHEN 'derived' THEN 3
-                        ELSE 4
-                    END,
-                    ds.created_at
-                LIMIT 1
-                """,
-                uuid.UUID(doctor_id)
-            )
+            row = await conn.fetchrow(doctor_lookup_sql, uuid.UUID(doctor_id))
             if row and row.get('service_id'):
                 return str(row['service_id'])
         except Exception as e:
-            logger.warning(f"Unable to resolve service for doctor {doctor_id}: {e}")
+            logger.info(f"Doctor-service lookup failed for {doctor_id}: {e}")
+
+        # 2. Clinic default service fallback
+        clinic_lookup_sql = """
+            SELECT s.id
+            FROM healthcare.services s
+            WHERE s.clinic_id = $1
+              AND COALESCE(s.active, true)
+            ORDER BY s.created_at
+            LIMIT 1
+        """
+        try:
+            row = await conn.fetchrow(clinic_lookup_sql, uuid.UUID(clinic_id))
+            if row and row.get('id'):
+                return str(row['id'])
+        except Exception as e:
+            logger.warning(f"Clinic service lookup failed for clinic {clinic_id}: {e}")
+
+        logger.warning(
+            "Unable to resolve service for doctor %s in clinic %s; appointment will be saved without service_id",
+            doctor_id,
+            clinic_id
+        )
         return None
 
     async def _get_doctor_working_hours(self, doctor_id: str, date: datetime) -> Dict[str, datetime]:

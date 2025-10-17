@@ -100,12 +100,9 @@ class LLMFactory:
 
         # Route to model with tool support
         if not model:
-            capability = await self.capability_matrix.route_by_requirements(
-                requires_tools=True,
-                max_latency_ms=kwargs.get('max_latency_ms', 2000)
-            )
-            model = capability.model_name
-            logger.info(f"Auto-routed to tool-capable model: {model}")
+            # Force GPT-4o-mini for tool calling (supports tool calling properly)
+            model = "gpt-4o-mini"
+            logger.info(f"Using GPT-4o-mini for tool calling (forced default)")
 
         # Get adapter
         adapter = await self.create_adapter(model)
