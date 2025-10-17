@@ -78,10 +78,10 @@ Return ONLY a JSON object:
 }}
 
 Urgency guidelines:
-- urgent: Within 1 hour (medical emergency, pain, immediate need)
-- high: Within 4 hours (important medical question, scheduling conflict)
-- medium: Within 24 hours (general questions, appointment booking)
-- low: Within 48 hours (routine info, non-urgent)
+- urgent: Within 15 minutes (medical emergency, pain, immediate need)
+- high: Within 1 hour (important medical question, scheduling conflict)
+- medium: Within 1-2 hours (general questions, appointment booking)
+- low: Within 4-6 hours (routine info, non-urgent)
 """
 
         try:
@@ -105,15 +105,26 @@ Urgency guidelines:
 
             analysis = json.loads(completion.choices[0].message.content)
 
-            # Calculate followup datetime
+            # Calculate followup datetime with improved urgency mapping
             followup_at = None
             if analysis.get('should_schedule'):
-                hours = analysis.get('hours_until_followup', 24)
+                # OPTIMIZATION: Shorten default delays to prevent user drop-off
+                urgency = analysis.get('urgency', 'medium')
+
+                # Default hours based on urgency (shorter than before!)
+                urgency_hours = {
+                    'urgent': 0.25,   # 15 minutes
+                    'high': 1,        # 1 hour
+                    'medium': 1.5,    # 1.5 hours (was 24!)
+                    'low': 4          # 4 hours (was 48!)
+                }
+
+                hours = analysis.get('hours_until_followup') or urgency_hours.get(urgency, 1.5)
                 followup_at = datetime.now(timezone.utc) + timedelta(hours=hours)
 
                 logger.info(
                     f"📅 Scheduled follow-up for {session_id}: "
-                    f"{followup_at.isoformat()} (urgency: {analysis.get('urgency')})"
+                    f"{followup_at.isoformat()} (urgency: {urgency}, hours: {hours})"
                 )
 
             return {
@@ -128,14 +139,14 @@ Urgency guidelines:
         except Exception as e:
             logger.error(f"Follow-up scheduling analysis failed: {e}", exc_info=True)
 
-            # Default: schedule for 24 hours if agent has pending action
+            # Default: schedule for 2 hours if agent has pending action (was 24h!)
             if last_agent_action:
                 return {
                     'should_schedule': True,
-                    'followup_at': datetime.now(timezone.utc) + timedelta(hours=24),
+                    'followup_at': datetime.now(timezone.utc) + timedelta(hours=2),
                     'urgency': 'medium',
                     'context_summary': f"Agent promised: {last_agent_action}",
-                    'reasoning': 'Default 24-hour follow-up due to analysis failure',
+                    'reasoning': 'Default 2-hour follow-up due to analysis failure',
                     'error': str(e)
                 }
 
@@ -174,3 +185,60 @@ Urgency guidelines:
 
         except Exception as e:
             logger.error(f"Failed to store scheduled follow-up: {e}")
+
+    async def create_user_notification(
+        self,
+        phone_number: str,
+        clinic_id: str,
+        followup_hours: float,
+        urgency: str,
+        language: str = 'en'
+    ) -> str:
+        """
+        Create user-facing notification about follow-up timing
+
+        Args:
+            phone_number: User's phone number
+            clinic_id: Clinic ID
+            followup_hours: Hours until follow-up
+            urgency: Urgency level
+            language: User's language
+
+        Returns:
+            Notification message in user's language
+        """
+        try:
+            from app.services.language_fallback_service import get_language_fallback_service
+
+            # Get language-specific service
+            lang_service = get_language_fallback_service()
+
+            # If language not provided, detect it
+            if language == 'en':
+                from app.memory.conversation_memory import get_memory_manager
+                from app.db.supabase_client import get_supabase_client
+
+                manager = get_memory_manager()
+                language = await lang_service.get_user_language(
+                    phone_number, clinic_id, manager.supabase
+                )
+
+            # Get localized notification
+            notification = lang_service.get_followup_notification(
+                language=language,
+                hours=int(followup_hours),
+                urgency=urgency
+            )
+
+            logger.info(f"Created follow-up notification for {phone_number} in {language}: {notification}")
+            return notification
+
+        except Exception as e:
+            logger.error(f"Failed to create user notification: {e}")
+            # Fallback to English
+            if followup_hours < 1:
+                return "I'll follow up with you within an hour."
+            elif followup_hours <= 2:
+                return f"I'll follow up with you in {int(followup_hours)} hour(s)."
+            else:
+                return f"I'll follow up with you in {int(followup_hours)} hours."

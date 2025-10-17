@@ -186,6 +186,19 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Failed to warm up Redis cache: {e}")
         # Don't fail startup, caching will happen on first request
 
+    # OPTIMIZATION: Warm up WhatsApp→Clinic mapping cache (eliminates DB queries on hot path)
+    try:
+        from app.startup_warmup import warmup_whatsapp_instance_cache
+        whatsapp_stats = await warmup_whatsapp_instance_cache()
+        logger.info(
+            "✅ WhatsApp cache warmed: %s/%s instances cached",
+            whatsapp_stats.get("cached", 0),
+            whatsapp_stats.get("total", 0)
+        )
+    except Exception as e:
+        logger.warning(f"Failed to warm up WhatsApp cache: {e}")
+        # Don't fail startup, will do DB lookups on first request
+
     try:
         from app.startup_warmup import warmup_mem0_vector_indices
         mem0_timeout = float(os.getenv("MEM0_WARMUP_TIMEOUT_SECONDS", "6"))

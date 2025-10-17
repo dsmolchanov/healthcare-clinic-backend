@@ -199,11 +199,61 @@ async def warmup_mem0_vector_indices(
     return summary
 
 
+async def warmup_whatsapp_instance_cache() -> Dict[str, Any]:
+    """
+    Warm up WhatsApp instance → clinic mapping cache
+
+    This eliminates DB queries on every incoming message by preloading
+    all WhatsApp instance configurations into Redis.
+
+    Returns:
+        Dict with warmup statistics
+    """
+    try:
+        from app.services.whatsapp_clinic_cache import get_whatsapp_clinic_cache
+
+        cache = get_whatsapp_clinic_cache()
+        stats = await cache.warmup_all_instances()
+
+        logger.info(
+            f"🎉 WhatsApp cache warmup: {stats.get('cached', 0)}/{stats.get('total', 0)} instances"
+        )
+
+        return stats
+    except Exception as e:
+        logger.error(f"❌ WhatsApp cache warmup failed: {e}")
+        return {"error": str(e), "cached": 0, "total": 0}
+
+
 def warmup_all_clinics_sync():
     """
     Synchronous wrapper for warmup - can be called from FastAPI startup
     """
     try:
         asyncio.run(warmup_clinic_data())
+    except Exception as e:
+        logger.error(f"Warmup error: {e}")
+
+
+def warmup_all_sync():
+    """
+    Comprehensive warmup: clinics data + WhatsApp cache + mem0
+    """
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # Warmup clinic data
+        logger.info("🔥 Starting comprehensive warmup...")
+        loop.run_until_complete(warmup_clinic_data())
+
+        # Warmup WhatsApp cache
+        loop.run_until_complete(warmup_whatsapp_instance_cache())
+
+        # Warmup mem0 (if available)
+        loop.run_until_complete(warmup_mem0_vector_indices())
+
+        logger.info("✅ All warmup tasks completed")
+        loop.close()
     except Exception as e:
         logger.error(f"Warmup error: {e}")

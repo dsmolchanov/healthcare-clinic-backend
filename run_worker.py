@@ -73,10 +73,11 @@ async def main():
                 supabase = get_supabase_client()
 
                 # Get the most recent active Evolution instance
-                result = supabase.table('whatsapp_instances') \
-                    .select('instance_name') \
-                    .eq('status', 'connected') \
-                    .order('updated_at', desc=True) \
+                # NOTE: Use healthcare schema explicitly
+                result = supabase.schema('healthcare').table('whatsapp_instances') \
+                    .select('instance_name, organization_id, clinic_id') \
+                    .eq('status', 'active') \
+                    .order('last_seen_at', desc=True) \
                     .limit(1) \
                     .execute()
 
@@ -84,9 +85,30 @@ async def main():
                     instance_name = result.data[0]['instance_name']
                     logger.info(f"✅ Auto-detected instance: {instance_name}")
                 else:
-                    # Fallback to hardcoded default
-                    instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1759348170665"
-                    logger.warning(f"No active instances found, using fallback: {instance_name}")
+                    # Fallback: Try to get from integrations table
+                    try:
+                        integration_result = supabase.schema('healthcare').table('integrations') \
+                            .select('config') \
+                            .eq('type', 'whatsapp') \
+                            .eq('is_active', True) \
+                            .order('updated_at', desc=True) \
+                            .limit(1) \
+                            .execute()
+
+                        if integration_result.data and len(integration_result.data) > 0:
+                            config = integration_result.data[0].get('config', {})
+                            instance_name = config.get('instance_name')
+                            if instance_name:
+                                logger.info(f"✅ Detected instance from integrations: {instance_name}")
+                        else:
+                            # Final fallback to hardcoded default
+                            instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1759348170665"
+                            logger.warning(f"No active instances found, using fallback: {instance_name}")
+                    except Exception as fallback_error:
+                        logger.error(f"Fallback detection also failed: {fallback_error}")
+                        instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1759348170665"
+                        logger.warning(f"Using hardcoded fallback: {instance_name}")
+
             except Exception as e:
                 logger.error(f"Failed to auto-detect instance: {e}")
                 # Fallback to hardcoded default

@@ -26,9 +26,10 @@ from app.memory.mem0_metrics import get_mem0_metrics_recorder
 
 logger = logging.getLogger(__name__)
 
-# Mem0 operation timeout (configurable via MEM0_TIMEOUT_MS, default 2500ms)
+# Mem0 operation timeout (configurable via MEM0_TIMEOUT_MS, default 6000ms)
+# Increased from 2500ms to 6000ms because mem0 cloud API typically takes 4-5s for add operations.
 # Enforce a floor of 800ms to prevent overly aggressive timeouts.
-MEM0_TIMEOUT_MS = max(int(os.getenv("MEM0_TIMEOUT_MS", "2500")), 800)
+MEM0_TIMEOUT_MS = max(int(os.getenv("MEM0_TIMEOUT_MS", "6000")), 800)
 
 # Module-global in-flight deduplication map
 _inflight: Dict[tuple, asyncio.Task] = {}
@@ -266,9 +267,23 @@ class ConversationMemoryManager:
 
         clean_phone = phone_number.replace("@s.whatsapp.net", "")
         user_ids = self._candidate_mem0_user_ids(clean_phone, clinic_id)
+
+        # Invalidate in-memory cache
         for key in list(self._mem0_lookup_cache.keys()):
             if key[0] in user_ids:
                 self._mem0_lookup_cache.pop(key, None)
+
+        # OPTIMIZATION: Also invalidate Redis cache for consistency
+        try:
+            from app.config import get_redis_client
+            redis = get_redis_client()
+            for user_id in user_ids:
+                # Invalidate both query-specific and "all" caches
+                redis.delete(f"mem0:{user_id}:all")
+                # Pattern-based deletion would be better but requires SCAN
+                # For now, just clear the "all" cache which covers most cases
+        except Exception as e:
+            logger.debug(f"Redis cache invalidation failed (non-critical): {e}")
 
     async def _mem0_writer_loop(self, queue: asyncio.Queue):
         """Background worker that flushes mem0 operations off the critical path."""
@@ -298,60 +313,85 @@ class ConversationMemoryManager:
                 await self._persist_mem0_metrics_snapshot_if_needed()
 
     async def _process_mem0_message_job(self, job: Dict[str, Any]):
-        """Persist a single message to mem0 and backfill Supabase metadata."""
-        message_id = job.get('message_id')
-        phone_number = job.get('phone_number', '')
-        clinic_id = job.get('clinic_id')
-        content = job.get('content', '')
-        base_metadata = dict(job.get('metadata') or {})
-        session_uuid = job.get('session_uuid')
-        external_session_id = job.get('external_session_id')
-        role = job.get('role')
+        """
+        Persist a single message to mem0 and backfill Supabase metadata.
 
-        mem0_metadata = {
-            'role': role,
-            'session_id': session_uuid,
-            'external_session_id': external_session_id,
-            'timestamp': datetime.utcnow().isoformat(),
-            'clinic_id': clinic_id,
-            **base_metadata
-        }
+        This is truly fire-and-forget - spawns a background task and returns immediately,
+        preventing queue buildup from slow mem0 API calls.
+        """
+        # Fire and forget - don't await, let it run in background
+        asyncio.create_task(self._fire_and_forget_mem0_message(job))
 
-        self._invalidate_mem0_lookup_cache(phone_number, clinic_id)
+    async def _fire_and_forget_mem0_message(self, job: Dict[str, Any]):
+        """Execute the actual mem0 add operation without blocking the worker queue."""
+        try:
+            message_id = job.get('message_id')
+            phone_number = job.get('phone_number', '')
+            clinic_id = job.get('clinic_id')
+            content = job.get('content', '')
+            base_metadata = dict(job.get('metadata') or {})
+            session_uuid = job.get('session_uuid')
+            external_session_id = job.get('external_session_id')
+            role = job.get('role')
 
-        result = await self.add_mem0_memory(
-            phone_number=phone_number,
-            content=content,
-            metadata=mem0_metadata,
-            clinic_id=clinic_id
-        )
+            mem0_metadata = {
+                'role': role,
+                'session_id': session_uuid,
+                'external_session_id': external_session_id,
+                'timestamp': datetime.utcnow().isoformat(),
+                'clinic_id': clinic_id,
+                **base_metadata
+            }
 
-        if not message_id or not result or not result.get('summary'):
-            return
+            self._invalidate_mem0_lookup_cache(phone_number, clinic_id)
 
-        updated_metadata = dict(base_metadata)
-        updated_metadata['mem0_summary'] = result['summary']
+            result = await self.add_mem0_memory(
+                phone_number=phone_number,
+                content=content,
+                metadata=mem0_metadata,
+                clinic_id=clinic_id
+            )
 
-        if result.get('memory_id'):
-            updated_metadata['mem0_id'] = result['memory_id']
+            if not message_id or not result or not result.get('summary'):
+                return
 
-        await self._update_message_metadata(message_id, updated_metadata)
+            updated_metadata = dict(base_metadata)
+            updated_metadata['mem0_summary'] = result['summary']
+
+            if result.get('memory_id'):
+                updated_metadata['mem0_id'] = result['memory_id']
+
+            await self._update_message_metadata(message_id, updated_metadata)
+        except Exception as e:
+            logger.error(f"Fire-and-forget mem0 add failed: {e}", exc_info=True)
 
     async def _process_mem0_turn_job(self, job: Dict[str, Any]):
-        """Store aggregated conversation turn in mem0 without touching Supabase."""
-        phone_number = job.get('phone_number', '')
-        clinic_id = job.get('clinic_id')
-        content = job.get('content', '')
-        metadata = job.get('metadata') or {}
+        """
+        Store aggregated conversation turn in mem0 without touching Supabase.
 
-        self._invalidate_mem0_lookup_cache(phone_number, clinic_id)
+        This is truly fire-and-forget - spawns a background task and returns immediately.
+        """
+        # Fire and forget - don't await
+        asyncio.create_task(self._fire_and_forget_mem0_turn(job))
 
-        await self.add_mem0_memory(
-            phone_number=phone_number,
-            content=content,
-            metadata=metadata,
-            clinic_id=clinic_id
-        )
+    async def _fire_and_forget_mem0_turn(self, job: Dict[str, Any]):
+        """Execute the actual mem0 add operation for turn without blocking the worker queue."""
+        try:
+            phone_number = job.get('phone_number', '')
+            clinic_id = job.get('clinic_id')
+            content = job.get('content', '')
+            metadata = job.get('metadata') or {}
+
+            self._invalidate_mem0_lookup_cache(phone_number, clinic_id)
+
+            await self.add_mem0_memory(
+                phone_number=phone_number,
+                content=content,
+                metadata=metadata,
+                clinic_id=clinic_id
+            )
+        except Exception as e:
+            logger.error(f"Fire-and-forget mem0 turn add failed: {e}", exc_info=True)
 
     async def _process_mem0_warmup_job(self, job: Dict[str, Any]):
         """Touch the vector index so mem0 is hot before real traffic arrives."""
@@ -950,6 +990,65 @@ class ConversationMemoryManager:
 
         return results
 
+    async def _get_redis_mem0_cache(self, cache_key: str) -> Optional[List[str]]:
+        """
+        Try to get mem0 results from Redis cache (1h TTL)
+
+        Uses JSON by default, falls back to pickle on decode errors.
+        This ensures cache robustness even if data format changes.
+        """
+        try:
+            from app.config import get_redis_client
+            redis = get_redis_client()
+            cached_bytes = redis.get(f"mem0:{cache_key}")
+            if not cached_bytes:
+                return None
+
+            # Try JSON first (faster, human-readable)
+            try:
+                import json
+                cached_data = json.loads(cached_bytes)
+                logger.debug(f"✅ Redis cache HIT for mem0 key: {cache_key} (JSON)")
+                return cached_data.get("memories", [])
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # Fallback to pickle for binary data
+                import pickle
+                cached_data = pickle.loads(cached_bytes)
+                logger.debug(f"✅ Redis cache HIT for mem0 key: {cache_key} (pickle fallback)")
+                return cached_data.get("memories", [])
+
+        except Exception as e:
+            logger.debug(f"Redis mem0 cache read failed (non-critical): {e}")
+            return None
+
+    async def _set_redis_mem0_cache(self, cache_key: str, memories: List[str], ttl: int = 3600):
+        """
+        Store mem0 results in Redis cache with 1h TTL
+
+        Tries JSON first, falls back to pickle if serialization fails.
+        This ensures all data types can be cached reliably.
+        """
+        try:
+            from app.config import get_redis_client
+            redis = get_redis_client()
+            cache_data = {"memories": memories, "cached_at": perf_counter()}
+
+            # Try JSON first (preferred: human-readable, faster)
+            try:
+                import json
+                serialized = json.dumps(cache_data, ensure_ascii=False)
+                redis.setex(f"mem0:{cache_key}", ttl, serialized)
+                logger.debug(f"✅ Cached mem0 results in Redis: {cache_key} (JSON, TTL={ttl}s)")
+            except (TypeError, ValueError) as json_err:
+                # Fallback to pickle for complex objects
+                import pickle
+                serialized = pickle.dumps(cache_data)
+                redis.setex(f"mem0:{cache_key}", ttl, serialized)
+                logger.debug(f"✅ Cached mem0 results in Redis: {cache_key} (pickle fallback, TTL={ttl}s)")
+
+        except Exception as e:
+            logger.debug(f"Redis mem0 cache write failed (non-critical): {e}")
+
     async def get_memory_context(
         self,
         phone_number: str,
@@ -1007,13 +1106,22 @@ class ConversationMemoryManager:
                 memory_strings: Optional[List[str]] = None
                 used_cache = False
 
-                if self._mem0_lookup_cache_ttl > 0:
+                # OPTIMIZATION 1: Try Redis cache first (1h TTL, survives restarts)
+                redis_cached = await self._get_redis_mem0_cache(f"{user_id}:{query or 'all'}")
+                if redis_cached is not None:
+                    memory_strings = redis_cached
+                    used_cache = True
+                    logger.debug(f"✅ Using Redis-cached mem0 results for {user_id}")
+
+                # OPTIMIZATION 2: Fall back to in-memory cache (75s TTL)
+                if memory_strings is None and self._mem0_lookup_cache_ttl > 0:
                     cached = self._mem0_lookup_cache.get(cache_key)
                     if cached:
                         cached_age = perf_counter() - cached[0]
                         if cached_age <= self._mem0_lookup_cache_ttl:
                             memory_strings = list(cached[1])
                             used_cache = True
+                            logger.debug(f"✅ Using in-memory cached mem0 results for {user_id}")
                         else:
                             self._mem0_lookup_cache.pop(cache_key, None)
 
@@ -1037,33 +1145,44 @@ class ConversationMemoryManager:
                                 timeout=MEM0_TIMEOUT_MS / 1000.0
                             )
                     except asyncio.TimeoutError:
-                        logger.warning("mem0 search timed out for user %s", user_id)
+                        logger.warning("⏱️ mem0 search timed out for user %s - check Redis cache", user_id)
                         await self.mem0_metrics.record_lookup(False, float(MEM0_TIMEOUT_MS))
-                        continue
+                        # Try to return any previously cached data from Redis even if expired
+                        fallback = await self._get_redis_mem0_cache(f"{user_id}:{query or 'all'}")
+                        if fallback:
+                            logger.info(f"✅ Using stale Redis cache as fallback for {user_id}")
+                            memory_strings = fallback
+                        else:
+                            continue
                     except Exception as exc:
                         logger.debug(f"mem0 search failed for user {user_id}: {exc}")
                         await self.mem0_metrics.record_lookup(False, 0.0)
                         continue
 
-                    memory_strings = []
-                    for memory in raw_memories:
-                        if isinstance(memory, dict):
-                            memory_text = memory.get('memory') or memory.get('content') or ''
-                        else:
-                            memory_text = str(memory)
+                    if memory_strings is None:
+                        memory_strings = []
+                        for memory in raw_memories:
+                            if isinstance(memory, dict):
+                                memory_text = memory.get('memory') or memory.get('content') or ''
+                            else:
+                                memory_text = str(memory)
 
-                        if memory_text:
-                            memory_strings.append(memory_text)
+                            if memory_text:
+                                memory_strings.append(memory_text)
 
-                    lookup_latency_ms = (perf_counter() - lookup_start) * 1000.0
+                        lookup_latency_ms = (perf_counter() - lookup_start) * 1000.0
 
-                    if memory_strings and self._mem0_lookup_cache_ttl > 0:
-                        self._mem0_lookup_cache[cache_key] = (perf_counter(), list(memory_strings))
-                    elif not memory_strings and self._mem0_lookup_cache_ttl > 0:
-                        # Cache empty results briefly to avoid hammering mem0 when no data exists
-                        self._mem0_lookup_cache[cache_key] = (perf_counter(), [])
+                        # OPTIMIZATION: Cache in both Redis (1h) and memory (75s)
+                        if memory_strings:
+                            await self._set_redis_mem0_cache(f"{user_id}:{query or 'all'}", memory_strings, ttl=3600)
+                            if self._mem0_lookup_cache_ttl > 0:
+                                self._mem0_lookup_cache[cache_key] = (perf_counter(), list(memory_strings))
+                        elif self._mem0_lookup_cache_ttl > 0:
+                            # Cache empty results briefly to avoid hammering mem0 when no data exists
+                            self._mem0_lookup_cache[cache_key] = (perf_counter(), [])
+                            await self._set_redis_mem0_cache(f"{user_id}:{query or 'all'}", [], ttl=300)
 
-                    await self.mem0_metrics.record_lookup(True, lookup_latency_ms)
+                        await self.mem0_metrics.record_lookup(True, lookup_latency_ms)
 
                 if not memory_strings:
                     continue

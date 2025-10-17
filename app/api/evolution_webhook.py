@@ -241,50 +241,26 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
             print(f"[Background] From: '{from_number}'")
             return
 
-        # MULTI-AGENT SYSTEM: Extract organization ID from instance name
-        organization_id = extract_org_id_from_instance(actual_instance)
-        if not organization_id:
-            print(f"[Background] ❌ Could not extract organization ID from instance: {actual_instance}")
-            print(f"[Background] Using fallback to Shtern Dental")
-            organization_id = "3e411ecb-3411-4add-91e2-8fa897310cb0"  # Fallback to Shtern
+        # OPTIMIZATION: Use prewarm cache to resolve instance → clinic (zero DB queries!)
+        from app.services.whatsapp_clinic_cache import get_whatsapp_clinic_cache
 
-        # CRITICAL FIX: The extracted ID could be clinic_id OR organization_id
-        # Try both lookup strategies to find the correct clinic
-        from app.db.supabase_client import get_supabase_client
-        supabase = get_supabase_client()
-        clinic_id = None
-        actual_organization_id = None
+        cache = get_whatsapp_clinic_cache()
+        clinic_info = await cache.get_or_fetch_clinic_info(actual_instance)
 
-        # Initialize clinic_name
-        clinic_name = None
-
-        try:
-            # Strategy 1: Assume extracted ID is clinic_id (most common case)
-            clinic_result = supabase.table('clinics').select('id, organization_id, name').eq('id', organization_id).limit(1).execute()
-            if clinic_result.data and len(clinic_result.data) > 0:
-                clinic_id = clinic_result.data[0]['id']
-                actual_organization_id = clinic_result.data[0].get('organization_id')
-                clinic_name = clinic_result.data[0].get('name', 'Clinic')
-                print(f"[Background] ✅ Resolved by clinic_id: clinic={clinic_id}, org={actual_organization_id}")
-            else:
-                # Strategy 2: Assume extracted ID is organization_id (fallback)
-                clinic_result = supabase.table('clinics').select('id, organization_id, name').eq('organization_id', organization_id).limit(1).execute()
-                if clinic_result.data and len(clinic_result.data) > 0:
-                    clinic_id = clinic_result.data[0]['id']
-                    actual_organization_id = clinic_result.data[0].get('organization_id')
-                    clinic_name = clinic_result.data[0].get('name', 'Clinic')
-                    print(f"[Background] ✅ Resolved by organization_id: clinic={clinic_id}, org={actual_organization_id}")
-                else:
-                    # Strategy 3: Final fallback - use ID as-is and query first clinic
-                    print(f"[Background] ❌ Could not resolve clinic from ID {organization_id}")
-                    raise ValueError(f"No clinic found for {organization_id}")
-
-        except Exception as e:
-            print(f"[Background] ❌ Clinic lookup failed: {e}, rejecting message")
+        if not clinic_info:
+            print(f"[Background] ❌ Could not resolve clinic for instance: {actual_instance}")
+            print(f"[Background] Cache miss and DB lookup failed - rejecting message")
             return  # Do NOT process message if we can't resolve clinic
 
+        # Extract clinic info from cache
+        clinic_id = clinic_info.get('clinic_id')
+        actual_organization_id = clinic_info.get('organization_id')
+        clinic_name = clinic_info.get('name', 'Clinic')
+
+        print(f"[Background] ✅ Resolved from cache (ZERO DB queries!)")
         print(f"[Background] Organization ID: {actual_organization_id}")
         print(f"[Background] Clinic ID: {clinic_id}")
+        print(f"[Background] Clinic name: {clinic_name}")
 
         print(f"\n[Background] Step 4: Valid message received!")
         print(f"[Background] From: {from_number} ({push_name})")
