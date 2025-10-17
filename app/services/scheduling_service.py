@@ -34,9 +34,12 @@ from .scheduling.escalation_manager import EscalationManager
 from .external_calendar_service import ExternalCalendarService
 from .scheduling.query_profiler import profile_query, PerformanceMonitor
 from .scheduling.cache_monitor import CacheMonitor, global_cache_monitor
-from app.policies import PolicyCompiler
 from app.policies.compiler import RuleEffectType, CompiledPolicy
-from app.policies.starter_pack import get_starter_pack_bundle
+from app.services.policy_manager import PolicyManager, ActivePolicy
+from app.services.policy_adapter import (
+    build_slot_context,
+    context_field_truthy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +88,9 @@ class SchedulingService:
 
         self.constraint_engine = ConstraintEngine(self.db)
         self.escalation_manager = EscalationManager(self.db)
-        self.calendar_service = ExternalCalendarService(self.db)
+        self.calendar_service = ExternalCalendarService(supabase=self.db)
         self.perf_monitor = PerformanceMonitor()
-        self.policy_compiler = PolicyCompiler()
-        self._policy_cache: Dict[str, Dict[str, Any]] = {}
+        self.policy_manager = PolicyManager(self.db)
 
     @profile_query("suggest_slots")
     async def suggest_slots(
@@ -164,14 +166,15 @@ class SchedulingService:
             logger.info(f"{len(valid_slots)} slots passed constraint checks")
 
             # Step 3b: Apply policy constraints
-            policy = await self._get_active_policy(clinic_id)
+            policy_entry = await self.policy_manager.get_active_policy(clinic_id)
+            policy = policy_entry.policy if policy_entry else None
             doctor_appointments = await self._get_doctor_appointments(clinic_id)
 
             valid_slots = await self._apply_policy_constraints(
                 valid_slots,
                 clinic_id,
                 service_id,
-                policy,
+                policy_entry,
                 settings,
                 doctor_appointments,
                 hard_constraints,
@@ -685,46 +688,12 @@ class SchedulingService:
 
         return valid_slots
 
-    async def _get_active_policy(self, clinic_id: UUID) -> Optional[CompiledPolicy]:
-        """Fetch the active policy snapshot for a clinic (with caching)."""
-        cache_key = str(clinic_id)
-        cached = self._policy_cache.get(cache_key)
-        if cached:
-            fetched_at = cached.get("fetched_at")
-            if fetched_at and datetime.utcnow() - fetched_at < timedelta(minutes=5):
-                return cached.get("policy")
-
-        try:
-            result = self.db.table("policy_snapshots")\
-                .select("bundle")\
-                .eq("clinic_id", str(clinic_id))\
-                .eq("active", True)\
-                .limit(1)\
-                .execute()
-
-            if result.data:
-                bundle = result.data[0].get("bundle") or {}
-            else:
-                bundle = get_starter_pack_bundle(bundle_id=f"{clinic_id}-starter")
-
-            policy = self.policy_compiler.get_or_compile(bundle)
-            self._policy_cache[cache_key] = {
-                "policy": policy,
-                "fetched_at": datetime.utcnow()
-            }
-            return policy
-        except Exception as exc:
-            logger.warning(f"Failed to load policy snapshot for clinic {clinic_id}: {exc}")
-            if cached:
-                return cached.get("policy")
-            return None
-
     async def _apply_policy_constraints(
         self,
         slots: List[Dict[str, Any]],
         clinic_id: UUID,
         service_id: UUID,
-        policy: Optional[CompiledPolicy],
+        policy_entry: Optional[ActivePolicy],
         settings: Dict[str, Any],
         doctor_appointments: Dict[UUID, List[Dict]],
         hard_constraints: Optional[HardConstraints],
@@ -733,13 +702,14 @@ class SchedulingService:
         patient_id: Optional[UUID]
     ) -> List[Dict[str, Any]]:
         """Filter slots by policy hard rules."""
+        policy = policy_entry.policy if policy_entry else None
         if not policy or not policy.hard_rules:
             return slots
 
         filtered: List[Dict[str, Any]] = []
 
         for slot in slots:
-            context = self._build_policy_context(
+            context = build_slot_context(
                 slot,
                 settings,
                 doctor_appointments,
@@ -782,7 +752,7 @@ class SchedulingService:
 
                 if rule.effect_type == RuleEffectType.REQUIRE_FIELD:
                     required_field = effect.get("field")
-                    if required_field and not self._context_field_truthy(context, required_field):
+                    if required_field and not context_field_truthy(context, required_field):
                         deny_slot = True
                         if explanation:
                             policy_notes.append(explanation)
@@ -840,130 +810,6 @@ class SchedulingService:
                     explanations.append(explanation)
 
         return explanations
-
-    def _build_policy_context(
-        self,
-        slot: Dict[str, Any],
-        settings: Dict[str, Any],
-        doctor_appointments: Dict[UUID, List[Dict]],
-        patient_preferences: Optional[Dict[str, Any]],
-        hard_constraints: Optional[HardConstraints]
-    ) -> Dict[str, Any]:
-        """Construct context dictionary used by policy rules."""
-        start_time = slot["start_time"]
-        end_time = slot["end_time"]
-        duration = slot.get("duration_minutes") or int((end_time - start_time).total_seconds() / 60)
-
-        minutes_since_prev, minutes_until_next = self._compute_slot_adjacency(
-            slot["doctor_id"],
-            start_time,
-            duration,
-            doctor_appointments
-        )
-
-        context = {
-            "clinic": {
-                "hours": {
-                    "open_hour": settings.get("open_hour", 8),
-                    "close_hour": settings.get("close_hour", 20)
-                }
-            },
-            "appointment": {
-                "start_time": start_time.isoformat(),
-                "end_time": end_time.isoformat(),
-                "within_working_hours": self._within_working_hours(start_time, end_time, settings),
-                "duration_minutes": duration
-            },
-            "slot": {
-                "minutes_since_previous": minutes_since_prev,
-                "minutes_until_next": minutes_until_next
-            },
-            "request": {
-                "is_emergency": self._is_emergency_request(patient_preferences),
-                "human_override": bool(patient_preferences.get("human_override")) if patient_preferences else False,
-                "preferred_doctor_id": str(hard_constraints.doctor_id) if hard_constraints and hard_constraints.doctor_id else None
-            },
-            "doctor": {
-                "id": str(slot["doctor_id"]),
-                "is_least_busy": self._is_least_busy(slot["doctor_id"], start_time, doctor_appointments),
-            }
-        }
-
-        return context
-
-    @staticmethod
-    def _context_field_truthy(context: Dict[str, Any], field_path: str) -> bool:
-        value = context
-        for part in field_path.split("."):
-            if isinstance(value, dict):
-                value = value.get(part)
-            else:
-                return False
-        return bool(value)
-
-    @staticmethod
-    def _within_working_hours(start: datetime, end: datetime, settings: Dict[str, Any]) -> bool:
-        open_hour = settings.get("open_hour", 8)
-        close_hour = settings.get("close_hour", 20)
-        start_boundary = time(hour=open_hour)
-        end_boundary = time(hour=close_hour)
-        return start.time() >= start_boundary and end.time() <= end_boundary
-
-    def _is_emergency_request(self, patient_preferences: Optional[Dict[str, Any]]) -> bool:
-        if not patient_preferences:
-            return False
-        if patient_preferences.get("is_emergency"):
-            return True
-        return patient_preferences.get("urgency") == "emergency"
-
-    def _is_least_busy(
-        self,
-        doctor_id: UUID,
-        slot_time: datetime,
-        doctor_appointments: Dict[UUID, List[Dict]]
-    ) -> bool:
-        slot_date = slot_time.date()
-        min_count = None
-        doctor_count = 0
-
-        for doc_id, appointments in doctor_appointments.items():
-            count = sum(
-                1
-                for apt in appointments
-                if datetime.fromisoformat(apt["start_time"]).date() == slot_date
-            )
-            if doc_id == doctor_id:
-                doctor_count = count
-            min_count = count if min_count is None else min(min_count, count)
-
-        return doctor_count <= (min_count if min_count is not None else doctor_count)
-
-    @staticmethod
-    def _compute_slot_adjacency(
-        doctor_id: UUID,
-        slot_start: datetime,
-        duration_minutes: int,
-        doctor_appointments: Dict[UUID, List[Dict]]
-    ) -> Tuple[Optional[float], Optional[float]]:
-        appointments = doctor_appointments.get(doctor_id, [])
-        prev_diff = None
-        next_diff = None
-        slot_end = slot_start + timedelta(minutes=duration_minutes)
-
-        for apt in appointments:
-            apt_start = datetime.fromisoformat(apt["start_time"])
-            apt_end = datetime.fromisoformat(apt["end_time"])
-
-            if apt_end <= slot_start:
-                diff = (slot_start - apt_end).total_seconds() / 60
-                if prev_diff is None or diff < prev_diff:
-                    prev_diff = diff
-            elif apt_start >= slot_end:
-                diff = (apt_start - slot_end).total_seconds() / 60
-                if next_diff is None or diff < next_diff:
-                    next_diff = diff
-
-        return prev_diff, next_diff
 
     @profile_query("score_preferences")
     async def _score_soft_preferences(
@@ -1028,7 +874,7 @@ class SchedulingService:
             slot["explanations"] = scorer.generate_explanations(components)
 
             if policy:
-                context = self._build_policy_context(
+                context = build_slot_context(
                     slot,
                     settings,
                     doctor_appointments,

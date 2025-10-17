@@ -9,8 +9,14 @@ from datetime import datetime, date, time
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
+from uuid import UUID
 
 from supabase import create_client, Client
+
+from app.models.scheduling import HardConstraints
+from app.policies.compiler import RuleEffectType
+from app.services.policy_manager import PolicyManager, ActivePolicy
+from app.services.policy_adapter import build_slot_context, context_field_truthy
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +74,14 @@ class ReservationResult:
     data: Optional[Dict[str, Any]] = None
 
 
+class PolicyViolationError(Exception):
+    """Raised when a reservation violates clinic policy."""
+
+    def __init__(self, message: str, messages: Optional[List[str]] = None):
+        super().__init__(message)
+        self.messages = messages or []
+
+
 class ResourceService:
     """
     Unified resource reservation service using the new resource model.
@@ -82,6 +96,7 @@ class ResourceService:
                 os.environ.get("SUPABASE_URL"),
                 os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
             )
+        self.policy_manager = PolicyManager(self.supabase)
 
     async def get_available_combinations(
         self,
@@ -164,7 +179,50 @@ class ResourceService:
         try:
             logger.info(f"Creating reservation for patient {request.patient_id} on {request.reservation_date}")
 
-            # Call RPC function
+            clinic_uuid = UUID(request.clinic_id)
+            doctor_uuid = UUID(request.doctor_resource_id)
+            room_uuid = UUID(request.room_resource_id) if request.room_resource_id else None
+
+            policy_entry = await self.policy_manager.get_active_policy(clinic_uuid)
+            settings = await self._get_clinic_hours(clinic_uuid)
+            doctor_appointments = await self._get_doctor_reservations(clinic_uuid)
+
+            hard_constraints = HardConstraints(doctor_id=doctor_uuid)
+            patient_preferences = {
+                "is_emergency": request.appointment_type.lower() == "emergency",
+                "preferred_doctors": [request.doctor_resource_id],
+                "notes": request.notes
+            }
+
+            start_dt = datetime.combine(request.reservation_date, request.start_time)
+            end_dt = datetime.combine(request.reservation_date, request.end_time)
+
+            slot = {
+                "doctor_id": doctor_uuid,
+                "room_id": room_uuid,
+                "start_time": start_dt,
+                "end_time": end_dt,
+                "duration_minutes": int((end_dt - start_dt).total_seconds() / 60) or 1,
+                "score": 0.0
+            }
+
+            try:
+                policy_info = await self._validate_policy_for_reservation(
+                    policy_entry,
+                    slot,
+                    settings,
+                    doctor_appointments,
+                    patient_preferences,
+                    hard_constraints
+                )
+            except PolicyViolationError as exc:
+                logger.info("Reservation blocked by policy: %s", exc)
+                return ReservationResult(
+                    success=False,
+                    error=str(exc),
+                    data={"policy_messages": exc.messages}
+                )
+
             result = self.supabase.rpc(
                 'create_resource_reservation',
                 {
@@ -195,6 +253,40 @@ class ResourceService:
                 reservation_id = response.get('reservation_id')
                 logger.info(f"Reservation created successfully: {reservation_id}")
 
+                try:
+                    await self._validate_policy_for_reservation(
+                        policy_entry,
+                        slot,
+                        settings,
+                        doctor_appointments,
+                        patient_preferences,
+                        hard_constraints
+                    )
+                except PolicyViolationError as exc:
+                    logger.warning("Post-insert policy validation failed: %s", exc)
+
+                if reservation_id and policy_entry.snapshot_id:
+                    try:
+                        self.supabase.table("resource_reservations")\
+                            .update({
+                                "policy_snapshot_id": str(policy_entry.snapshot_id),
+                                "policy_version": policy_entry.version,
+                                "policy_bundle_sha256": policy_entry.bundle_sha
+                            })\
+                            .eq("id", reservation_id)\
+                            .execute()
+                    except Exception as exc:
+                        logger.warning("Failed to persist policy metadata: %s", exc)
+
+                response = response if isinstance(response, dict) else {}
+                if policy_entry.snapshot_id:
+                    response.setdefault("policy_snapshot_id", str(policy_entry.snapshot_id))
+                if policy_entry.version is not None:
+                    response.setdefault("policy_version", policy_entry.version)
+                response.setdefault("policy_bundle_sha256", policy_entry.bundle_sha)
+                if policy_info.get("messages"):
+                    response.setdefault("policy_messages", policy_info["messages"])
+
                 return ReservationResult(
                     success=True,
                     reservation_id=reservation_id,
@@ -215,6 +307,98 @@ class ResourceService:
                 success=False,
                 error=str(e)
             )
+
+    async def _validate_policy_for_reservation(
+        self,
+        policy_entry: ActivePolicy,
+        slot: Dict[str, Any],
+        settings: Dict[str, Any],
+        doctor_appointments: Dict[UUID, List[Dict]],
+        patient_preferences: Dict[str, Any],
+        hard_constraints: HardConstraints
+    ) -> Dict[str, Any]:
+        policy = policy_entry.policy if policy_entry else None
+        if not policy or not policy.hard_rules:
+            return {"messages": []}
+
+        context = build_slot_context(
+            slot,
+            settings,
+            doctor_appointments,
+            patient_preferences,
+            hard_constraints
+        )
+
+        notes: List[str] = []
+
+        for rule in policy.hard_rules:
+            try:
+                if not rule.matches(context):
+                    continue
+            except Exception as exc:
+                logger.warning(f"Error evaluating reservation rule {rule.rule_id}: {exc}")
+                continue
+
+            effect = rule.effect_payload
+            explanation = effect.get("explain_template") or rule.metadata.get("explain_template")
+
+            if rule.effect_type == RuleEffectType.DENY:
+                raise PolicyViolationError(explanation or "Reservation blocked by policy.", notes)
+
+            if rule.effect_type == RuleEffectType.ESCALATE:
+                raise PolicyViolationError(explanation or "Reservation requires manual approval.", notes)
+
+            if rule.effect_type == RuleEffectType.REQUIRE_FIELD:
+                required_field = effect.get("field")
+                if required_field and not context_field_truthy(context, required_field):
+                    raise PolicyViolationError(explanation or "Reservation missing required data.", notes)
+
+            if rule.effect_type == RuleEffectType.LIMIT_OCCURRENCE:
+                if explanation:
+                    notes.append(explanation)
+
+        return {"messages": notes}
+
+    async def _get_clinic_hours(self, clinic_id: UUID) -> Dict[str, int]:
+        try:
+            result = self.supabase.table("sched_settings")\
+                .select("open_hour, close_hour")\
+                .eq("clinic_id", str(clinic_id))\
+                .limit(1)\
+                .execute()
+        except Exception as exc:
+            logger.warning(f"Failed to fetch clinic hours for {clinic_id}: {exc}")
+            result = None
+
+        if result and result.data:
+            row = result.data[0]
+            return {
+                "open_hour": row.get("open_hour", 8),
+                "close_hour": row.get("close_hour", 20)
+            }
+
+        return {"open_hour": 8, "close_hour": 20}
+
+    async def _get_doctor_reservations(self, clinic_id: UUID) -> Dict[UUID, List[Dict]]:
+        try:
+            result = self.supabase.table("resource_reservations")\
+                .select("doctor_resource_id, start_time, end_time")\
+                .eq("clinic_id", str(clinic_id))\
+                .neq("status", "cancelled")\
+                .execute()
+        except Exception as exc:
+            logger.warning(f"Failed to fetch doctor reservations for {clinic_id}: {exc}")
+            return {}
+
+        appointments: Dict[UUID, List[Dict]] = {}
+        for row in result.data or []:
+            try:
+                doctor_id = UUID(row["doctor_resource_id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            appointments.setdefault(doctor_id, []).append(row)
+
+        return appointments
 
     async def update_reservation(
         self,
