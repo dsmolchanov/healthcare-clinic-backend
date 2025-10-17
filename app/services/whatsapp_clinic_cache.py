@@ -144,8 +144,8 @@ class WhatsAppClinicCache:
         try:
             # Query healthcare.integrations for WhatsApp configurations
             result = supabase.schema('healthcare').table('integrations').select(
-                'id, organization_id, type, config, is_active'
-            ).eq('type', 'whatsapp').eq('is_active', True).execute()
+                'id, organization_id, type, config, enabled'
+            ).eq('type', 'whatsapp').eq('enabled', True).execute()
 
             integrations = result.data if result.data else []
             stats["total"] = len(integrations)
@@ -245,7 +245,7 @@ class WhatsAppClinicCache:
             # Look up integration by instance name
             result = supabase.schema('healthcare').table('integrations').select(
                 'organization_id, config'
-            ).eq('type', 'whatsapp').eq('is_active', True).execute()
+            ).eq('type', 'whatsapp').eq('enabled', True).execute()
 
             # Find matching instance
             for integration in (result.data or []):
