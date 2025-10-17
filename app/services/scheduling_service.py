@@ -35,6 +35,8 @@ from .external_calendar_service import ExternalCalendarService
 from .scheduling.query_profiler import profile_query, PerformanceMonitor
 from .scheduling.cache_monitor import CacheMonitor, global_cache_monitor
 from app.policies.compiler import RuleEffectType, CompiledPolicy
+from app.services.limit_counter import LimitCounterStore, LimitReservationToken
+from app.services.policy_errors import PolicyViolationError
 from app.services.policy_manager import PolicyManager, ActivePolicy
 from app.services.policy_adapter import (
     build_slot_context,
@@ -91,6 +93,7 @@ class SchedulingService:
         self.calendar_service = ExternalCalendarService(supabase=self.db)
         self.perf_monitor = PerformanceMonitor()
         self.policy_manager = PolicyManager(self.db)
+        self.limit_counter = LimitCounterStore()
 
     @profile_query("suggest_slots")
     async def suggest_slots(
@@ -365,6 +368,8 @@ class SchedulingService:
             HoldNotFoundError: If hold doesn't exist
             HoldExpiredError: If hold has expired
         """
+        limit_tokens: List[LimitReservationToken] = []
+
         try:
             logger.info(f"Confirming hold {hold_id} for patient {patient_id}")
 
@@ -385,6 +390,31 @@ class SchedulingService:
             if datetime.utcnow() > expires_at:
                 raise HoldExpiredError(f"Hold {hold_id} has expired")
 
+            clinic_uuid = UUID(hold["clinic_id"])
+            policy_entry = await self.policy_manager.get_active_policy(clinic_uuid)
+
+            slot_for_policy = {
+                "doctor_id": UUID(hold["doctor_id"]),
+                "room_id": UUID(hold["room_id"]) if hold.get("room_id") else None,
+                "start_time": datetime.fromisoformat(hold["start_time"]),
+                "end_time": datetime.fromisoformat(hold["end_time"]),
+                "duration_minutes": max(1, int((datetime.fromisoformat(hold["end_time"]) - datetime.fromisoformat(hold["start_time"])).total_seconds() / 60)),
+                "score": 0.0
+            }
+
+            patient_preferences = metadata.copy() if isinstance(metadata, dict) else {}
+
+            try:
+                limit_tokens = await self._reserve_limit_counters(
+                    clinic_uuid,
+                    policy_entry,
+                    slot_for_policy,
+                    patient_id,
+                    patient_preferences
+                )
+            except PolicyViolationError as exc:
+                raise InvalidConstraintsError(str(exc)) from exc
+
             # Create appointment
             appointment_id = uuid4()
             appointment_data = {
@@ -401,9 +431,14 @@ class SchedulingService:
                 "metadata": metadata or {}
             }
 
-            apt_result = self.db.table("appointments")\
-                .insert(appointment_data)\
-                .execute()
+            try:
+                apt_result = self.db.table("appointments")\
+                    .insert(appointment_data)\
+                    .execute()
+            except Exception:
+                for token in limit_tokens:
+                    self.limit_counter.release(token)
+                raise
 
             # Delete hold
             self.db.table("appointment_holds")\
@@ -458,8 +493,12 @@ class SchedulingService:
             )
 
         except (HoldNotFoundError, HoldExpiredError):
+            for token in limit_tokens:
+                self.limit_counter.release(token)
             raise
         except Exception as e:
+            for token in limit_tokens:
+                self.limit_counter.release(token)
             logger.error(f"Error confirming hold: {e}", exc_info=True)
             raise
 
@@ -709,12 +748,19 @@ class SchedulingService:
         filtered: List[Dict[str, Any]] = []
 
         for slot in slots:
+            tenant_id = None
+            if policy_entry and policy_entry.bundle:
+                tenant_id = policy_entry.bundle.get("tenant_id")
+
             context = build_slot_context(
                 slot,
                 settings,
                 doctor_appointments,
                 patient_preferences,
-                hard_constraints
+                hard_constraints,
+                clinic_id=clinic_id,
+                patient_id=patient_id,
+                tenant_id=tenant_id
             )
 
             deny_slot = False
@@ -811,6 +857,122 @@ class SchedulingService:
 
         return explanations
 
+    async def _reserve_limit_counters(
+        self,
+        clinic_id: UUID,
+        policy_entry: ActivePolicy,
+        slot: Dict[str, Any],
+        patient_id: Optional[UUID],
+        patient_preferences: Optional[Dict[str, Any]]
+    ) -> List[LimitReservationToken]:
+        tokens: List[LimitReservationToken] = []
+        policy = policy_entry.policy if policy_entry else None
+        if not policy or not policy.hard_rules:
+            return tokens
+
+        settings = await self._get_settings(clinic_id)
+        doctor_appointments = await self._get_doctor_appointments(clinic_id)
+        tenant_id = policy_entry.bundle.get("tenant_id") if policy_entry.bundle else None
+
+        context = build_slot_context(
+            slot,
+            settings,
+            doctor_appointments,
+            patient_preferences or {},
+            HardConstraints(doctor_id=slot["doctor_id"]),
+            clinic_id=clinic_id,
+            patient_id=patient_id,
+            tenant_id=tenant_id
+        )
+
+        for rule in policy.hard_rules:
+            if rule.effect_type != RuleEffectType.LIMIT_OCCURRENCE:
+                continue
+
+            try:
+                if not rule.matches(context):
+                    continue
+            except Exception as exc:
+                logger.warning(f"Error evaluating limit rule {rule.rule_id}: {exc}")
+                continue
+
+            metadata = self._compute_limit_metadata(
+                rule,
+                policy_entry,
+                context
+            )
+
+            if not metadata:
+                continue
+
+            key, window_seconds, max_n = metadata
+            allowed, token, count = self.limit_counter.reserve(key, window_seconds, max_n)
+            if not allowed:
+                explanation = (
+                    rule.effect_payload.get("explain_template")
+                    or rule.metadata.get("explain_template")
+                    or "Reservation limit reached."
+                )
+                details = [
+                    f"{rule.effect_payload.get('dimension')} limit reached ({count}/{max_n})"
+                ]
+                raise PolicyViolationError(explanation, details)
+
+            if token:
+                tokens.append(token)
+
+        return tokens
+
+    def _compute_limit_metadata(
+        self,
+        rule,
+        policy_entry: ActivePolicy,
+        context: Dict[str, Any]
+    ) -> Optional[Tuple[str, int, int]]:
+        effect = rule.effect_payload or {}
+        dimension = effect.get("dimension")
+        max_n = effect.get("max_n")
+        if not dimension or max_n is None:
+            return None
+
+        window_hours_override = effect.get("window_hours")
+        if window_hours_override is not None:
+            window_hours = float(window_hours_override)
+        else:
+            if dimension.endswith("week"):
+                window_hours = 24 * 7
+            elif dimension.endswith("day"):
+                window_hours = 24
+            else:
+                window_hours = 1
+
+        entity = None
+        if dimension.startswith("tenant"):
+            entity = (
+                context.get("tenant", {}).get("id")
+                or context.get("clinic", {}).get("id")
+                or str(policy_entry.clinic_id)
+            )
+        elif dimension.startswith("clinic"):
+            entity = context.get("clinic", {}).get("id") or str(policy_entry.clinic_id)
+        elif dimension.startswith("provider"):
+            entity = context.get("doctor", {}).get("id")
+        elif dimension.startswith("patient"):
+            entity = context.get("patient", {}).get("id")
+
+        if not entity:
+            return None
+
+        bundle_prefix = (
+            policy_entry.bundle_sha
+            or policy_entry.bundle.get("bundle_id")
+            or str(policy_entry.clinic_id)
+        )
+
+        window_seconds = max(1, int(window_hours * 3600))
+        key = f"policy:{bundle_prefix}:{dimension}:{entity}"
+        return key, window_seconds, int(max_n)
+
     @profile_query("score_preferences")
     async def _score_soft_preferences(
         self,
@@ -879,7 +1041,10 @@ class SchedulingService:
                     settings,
                     doctor_appointments,
                     patient_preferences,
-                    hard_constraints
+                    hard_constraints,
+                    clinic_id=clinic_id,
+                    patient_id=None,
+                    tenant_id=None
                 )
                 policy_explanations = self._apply_policy_soft_rules(
                     slot,

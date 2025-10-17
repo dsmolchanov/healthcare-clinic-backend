@@ -91,7 +91,11 @@ def build_slot_context(
     settings: Dict[str, Any],
     doctor_appointments: Dict[UUID, Any],
     patient_preferences: Optional[Dict[str, Any]],
-    hard_constraints: Optional[HardConstraints]
+    hard_constraints: Optional[HardConstraints],
+    *,
+    clinic_id: Optional[UUID] = None,
+    patient_id: Optional[UUID] = None,
+    tenant_id: Optional[str] = None
 ) -> Dict[str, Any]:
     start_time = slot["start_time"]
     end_time = slot["end_time"]
@@ -106,10 +110,14 @@ def build_slot_context(
 
     context = {
         "clinic": {
+            "id": str(clinic_id) if clinic_id else None,
             "hours": {
                 "open_hour": settings.get("open_hour", 8),
                 "close_hour": settings.get("close_hour", 20)
             }
+        },
+        "tenant": {
+            "id": tenant_id
         },
         "appointment": {
             "start_time": start_time.isoformat(),
@@ -129,6 +137,9 @@ def build_slot_context(
         "doctor": {
             "id": str(slot["doctor_id"]),
             "is_least_busy": is_least_busy(slot["doctor_id"], start_time, doctor_appointments),
+        },
+        "patient": {
+            "id": str(patient_id) if patient_id else None
         }
     }
 

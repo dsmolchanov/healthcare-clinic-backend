@@ -6,7 +6,7 @@ Implements unified resource reservation system using the new schema
 import os
 import logging
 from datetime import datetime, date, time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
 from uuid import UUID
@@ -15,6 +15,8 @@ from supabase import create_client, Client
 
 from app.models.scheduling import HardConstraints
 from app.policies.compiler import RuleEffectType
+from app.services.limit_counter import LimitCounterStore, LimitReservationToken
+from app.services.policy_errors import PolicyViolationError
 from app.services.policy_manager import PolicyManager, ActivePolicy
 from app.services.policy_adapter import build_slot_context, context_field_truthy
 
@@ -97,6 +99,7 @@ class ResourceService:
                 os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
             )
         self.policy_manager = PolicyManager(self.supabase)
+        self.limit_counter = LimitCounterStore()
 
     async def get_available_combinations(
         self,
@@ -176,10 +179,13 @@ class ResourceService:
         Returns:
             ReservationResult with success/failure status
         """
+        limit_tokens: List[LimitReservationToken] = []
+
         try:
             logger.info(f"Creating reservation for patient {request.patient_id} on {request.reservation_date}")
 
             clinic_uuid = UUID(request.clinic_id)
+            patient_uuid = UUID(request.patient_id)
             doctor_uuid = UUID(request.doctor_resource_id)
             room_uuid = UUID(request.room_resource_id) if request.room_resource_id else None
 
@@ -208,6 +214,8 @@ class ResourceService:
 
             try:
                 policy_info = await self._validate_policy_for_reservation(
+                    clinic_uuid,
+                    patient_uuid,
                     policy_entry,
                     slot,
                     settings,
@@ -222,6 +230,8 @@ class ResourceService:
                     error=str(exc),
                     data={"policy_messages": exc.messages}
                 )
+
+            limit_tokens = policy_info.get("tokens", [])
 
             result = self.supabase.rpc(
                 'create_resource_reservation',
@@ -241,6 +251,8 @@ class ResourceService:
             ).execute()
 
             if not result.data:
+                for token in limit_tokens:
+                    self.limit_counter.release(token)
                 return ReservationResult(
                     success=False,
                     error="RPC function returned no data"
@@ -252,18 +264,6 @@ class ResourceService:
             if response.get('success'):
                 reservation_id = response.get('reservation_id')
                 logger.info(f"Reservation created successfully: {reservation_id}")
-
-                try:
-                    await self._validate_policy_for_reservation(
-                        policy_entry,
-                        slot,
-                        settings,
-                        doctor_appointments,
-                        patient_preferences,
-                        hard_constraints
-                    )
-                except PolicyViolationError as exc:
-                    logger.warning("Post-insert policy validation failed: %s", exc)
 
                 if reservation_id and policy_entry.snapshot_id:
                     try:
@@ -296,6 +296,9 @@ class ResourceService:
                 error = response.get('error', 'Unknown error')
                 logger.error(f"Reservation creation failed: {error}")
 
+                for token in limit_tokens:
+                    self.limit_counter.release(token)
+
                 return ReservationResult(
                     success=False,
                     error=error
@@ -303,6 +306,8 @@ class ResourceService:
 
         except Exception as e:
             logger.error(f"Failed to create reservation: {e}")
+            for token in limit_tokens:
+                self.limit_counter.release(token)
             return ReservationResult(
                 success=False,
                 error=str(e)
@@ -310,6 +315,8 @@ class ResourceService:
 
     async def _validate_policy_for_reservation(
         self,
+        clinic_id: UUID,
+        patient_id: Optional[UUID],
         policy_entry: ActivePolicy,
         slot: Dict[str, Any],
         settings: Dict[str, Any],
@@ -319,17 +326,23 @@ class ResourceService:
     ) -> Dict[str, Any]:
         policy = policy_entry.policy if policy_entry else None
         if not policy or not policy.hard_rules:
-            return {"messages": []}
+            return {"messages": [], "tokens": []}
+
+        tenant_id = policy_entry.bundle.get("tenant_id") if policy_entry.bundle else None
 
         context = build_slot_context(
             slot,
             settings,
             doctor_appointments,
             patient_preferences,
-            hard_constraints
+            hard_constraints,
+            clinic_id=clinic_id,
+            patient_id=patient_id,
+            tenant_id=tenant_id
         )
 
         notes: List[str] = []
+        tokens: List[LimitReservationToken] = []
 
         for rule in policy.hard_rules:
             try:
@@ -354,10 +367,71 @@ class ResourceService:
                     raise PolicyViolationError(explanation or "Reservation missing required data.", notes)
 
             if rule.effect_type == RuleEffectType.LIMIT_OCCURRENCE:
+                metadata = self._compute_limit_metadata(rule, policy_entry, context)
+                if metadata:
+                    key, window_seconds, max_n = metadata
+                    allowed, token, count = self.limit_counter.reserve(key, window_seconds, max_n)
+                    if not allowed:
+                        details = [
+                            f"{effect.get('dimension')} limit reached ({count}/{max_n})"
+                        ]
+                        raise PolicyViolationError(explanation or "Reservation limit reached.", details)
+                    if token:
+                        tokens.append(token)
                 if explanation:
                     notes.append(explanation)
 
-        return {"messages": notes}
+        return {"messages": notes, "tokens": tokens}
+
+    def _compute_limit_metadata(
+        self,
+        rule,
+        policy_entry: ActivePolicy,
+        context: Dict[str, Any]
+    ) -> Optional[Tuple[str, int, int]]:
+        effect = rule.effect_payload or {}
+        dimension = effect.get("dimension")
+        max_n = effect.get("max_n")
+        if not dimension or max_n is None:
+            return None
+
+        window_hours_override = effect.get("window_hours")
+        if window_hours_override is not None:
+            window_hours = float(window_hours_override)
+        else:
+            if dimension.endswith("week"):
+                window_hours = 24 * 7
+            elif dimension.endswith("day"):
+                window_hours = 24
+            else:
+                window_hours = 1
+
+        entity = None
+        if dimension.startswith("tenant"):
+            entity = (
+                context.get("tenant", {}).get("id")
+                or context.get("clinic", {}).get("id")
+                or str(policy_entry.clinic_id)
+            )
+        elif dimension.startswith("clinic"):
+            entity = context.get("clinic", {}).get("id") or str(policy_entry.clinic_id)
+        elif dimension.startswith("provider"):
+            entity = context.get("doctor", {}).get("id")
+        elif dimension.startswith("patient"):
+            entity = context.get("patient", {}).get("id")
+
+        if not entity:
+            return None
+
+        bundle_prefix = (
+            policy_entry.bundle_sha
+            or policy_entry.bundle.get("bundle_id")
+            or str(policy_entry.clinic_id)
+        )
+
+        window_seconds = max(1, int(window_hours * 3600))
+        key = f"policy:{bundle_prefix}:{dimension}:{entity}"
+        return key, window_seconds, int(max_n)
 
     async def _get_clinic_hours(self, clinic_id: UUID) -> Dict[str, int]:
         try:
