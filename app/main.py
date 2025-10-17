@@ -43,28 +43,8 @@ async def warmup_services(client: httpx.AsyncClient):
     """Warm up external services on startup with timeouts to prevent blocking"""
     warmup_tasks = []
 
-    # Warm OpenAI (tiny prompt) - with timeout
-    if os.getenv("OPENAI_API_KEY"):
-        async def warmup_openai():
-            try:
-                from openai import AsyncOpenAI
-                openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-                await asyncio.wait_for(
-                    openai_client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": "warmup"}],
-                        max_tokens=1
-                    ),
-                    timeout=3.0
-                )
-                logger.info("✅ OpenAI warmed up")
-            except Exception as e:
-                logger.warning(f"OpenAI warmup failed: {e}")
-        warmup_tasks.append(warmup_openai())
-
-    # Skip Supabase warmup - it's causing SSL timeouts
-    # Supabase will be lazily initialized on first real request
-
+    # OpenAI warmup removed - llm_factory handles lazy initialization with adapter caching
+    # Supabase warmup skipped - it's causing SSL timeouts, will be lazily initialized
     # Pinecone removed - no longer needed (Phase 3)
 
     # Run all warmups concurrently with 5s total timeout
