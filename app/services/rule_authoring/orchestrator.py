@@ -44,6 +44,9 @@ class RuleAuthoringSessionState:
     input_tokens_total: int = 0
     output_tokens_total: int = 0
     config: RuleAuthoringLLMConfig = field(default_factory=get_default_rule_authoring_llm_config)
+    session_id: Optional[str] = None
+    stored_messages: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class RuleAuthoringOrchestrator:
@@ -93,6 +96,7 @@ class RuleAuthoringOrchestrator:
             tenant_id=tenant_id,
             administrator_name=administrator_name,
             config=config or self.default_config,
+            stored_messages=len(prompt_messages)
         )
 
     async def process_user_message(

@@ -14,6 +14,8 @@ from .orchestrator import (
     RuleAuthoringSessionState,
     RuleAuthoringGuardrailError,
 )
+from .storage import RuleAuthoringTranscriptRepository
+from .chat_service import RuleAuthoringChatService
 
 __all__ = [
     "build_rule_authoring_prompt",
@@ -24,4 +26,6 @@ __all__ = [
     "RuleAuthoringOrchestrator",
     "RuleAuthoringSessionState",
     "RuleAuthoringGuardrailError",
+    "RuleAuthoringTranscriptRepository",
+    "RuleAuthoringChatService",
 ]
