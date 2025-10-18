@@ -95,7 +95,8 @@ async def process_with_fsm(
             return {"response": cached_response, "cached": True}
 
         # Step 2: Load FSM state
-        clinic_id = await get_clinic_id_from_number(conversation_id)
+        # Check if clinic_id is provided in context, otherwise lookup
+        clinic_id = context.get("clinic_id") or await get_clinic_id_from_number(conversation_id)
         state = await fsm_manager.load_state(conversation_id, clinic_id)
         logger.info(f"Loaded state: {state.current_state}, version: {state.version}")
 

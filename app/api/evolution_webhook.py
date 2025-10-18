@@ -391,8 +391,8 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
                     message_sid=key.get("id"),
                     conversation_id=from_number,
                     message=text,
-                    clinic_id=clinic_id,
                     context={
+                        "clinic_id": clinic_id,
                         "instance_name": actual_instance,
                         "user_name": push_name,
                         "session_id": session_id
