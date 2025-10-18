@@ -377,8 +377,11 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
 
         ai_start = datetime.datetime.now()
 
+        # Use local variable to track if we should use FSM for this message
+        use_fsm = FSM_ENABLED
+
         # Check if FSM is enabled
-        if FSM_ENABLED:
+        if use_fsm:
             print(f"[Background] 🔄 Routing to FSM processing")
             try:
                 # Process through FSM
@@ -406,9 +409,9 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
                 print(f"[Background] ❌ FSM processing failed: {fsm_error}")
                 print(f"[Background] 🔄 Falling back to multilingual processor")
                 # Fallback to multilingual processor on FSM error
-                FSM_ENABLED = False  # Temporarily disable for this message
+                use_fsm = False  # Disable for this message only
 
-        if not FSM_ENABLED:
+        if not use_fsm:
             print(f"[Background] 🔄 Processing with multilingual processor (with memory support)...")
             try:
                 # Use the NEW message processor with RouterService and FastPathService
