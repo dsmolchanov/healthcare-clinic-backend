@@ -142,6 +142,17 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to start calendar sync worker: {str(e)}")
         # Don't fail startup, but log the issue
 
+    # Initialize Redis for FSM (if FSM is enabled)
+    fsm_enabled = os.getenv('ENABLE_FSM', 'false').lower() == 'true'
+    if fsm_enabled:
+        try:
+            from app.fsm.redis_client import redis_client
+            await redis_client.connect()
+            logger.info("✅ Redis client connected for FSM")
+        except Exception as e:
+            logger.error(f"Failed to connect Redis for FSM: {str(e)}")
+            logger.warning("FSM will not be available")
+
     # Initialize shared HTTP client without HTTP/2 (causes SSL issues)
     try:
         app.state.http_client = httpx.AsyncClient(
@@ -202,6 +213,15 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down services...")
+
+    # Disconnect Redis if FSM was enabled
+    if fsm_enabled:
+        try:
+            from app.fsm.redis_client import redis_client
+            await redis_client.disconnect()
+            logger.info("✅ Redis client disconnected")
+        except Exception as e:
+            logger.error(f"Error disconnecting Redis: {e}")
 
     # Stop calendar sync worker
     try:
