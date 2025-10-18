@@ -16,6 +16,12 @@ from .orchestrator import (
 )
 from .storage import RuleAuthoringTranscriptRepository
 from .chat_service import RuleAuthoringChatService
+from .analysis import (
+    GuardrailUsage,
+    diff_against_starter_pack,
+    summarise_guardrail_usage,
+)
+from .rules_repository import RuleBundleRPC
 
 __all__ = [
     "build_rule_authoring_prompt",
@@ -28,4 +34,8 @@ __all__ = [
     "RuleAuthoringGuardrailError",
     "RuleAuthoringTranscriptRepository",
     "RuleAuthoringChatService",
+    "GuardrailUsage",
+    "diff_against_starter_pack",
+    "summarise_guardrail_usage",
+    "RuleBundleRPC",
 ]

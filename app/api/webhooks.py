@@ -1,19 +1,400 @@
 """
-Webhook endpoints for real-time status updates
+Webhook endpoints for real-time status updates and WhatsApp message handling
 """
 from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 import json
 import asyncio
+import os
+import logging
 from datetime import datetime
-from ..main import supabase
+from supabase import create_client, Client
+from supabase.client import ClientOptions
 import uuid
+
+# FSM imports
+from ..fsm.manager import FSMManager
+from ..fsm.intent_router import IntentRouter
+from ..fsm.slot_manager import SlotManager
+from ..fsm.state_handlers import StateHandler
+from ..fsm.redis_client import redis_client
+from ..fsm.models import FSMState, ConversationState
+from ..services.appointment_booking_service import AppointmentBookingService
+
+logger = logging.getLogger(__name__)
+
+# Initialize Supabase client for webhooks
+options = ClientOptions(
+    schema='healthcare',
+    auto_refresh_token=True,
+    persist_session=False
+)
+supabase: Client = create_client(
+    os.environ.get("SUPABASE_URL"),
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY"),
+    options=options
+)
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 # Store active SSE connections
 active_connections: Dict[str, asyncio.Queue] = {}
+
+# Initialize FSM components
+fsm_manager = FSMManager()
+intent_router = IntentRouter()
+slot_manager = SlotManager()
+state_handler = StateHandler(fsm_manager, intent_router, slot_manager)
+booking_service = AppointmentBookingService(supabase_client=supabase)
+
+# Feature flag - default disabled for safe rollout
+FSM_ENABLED = os.getenv('ENABLE_FSM', 'false').lower() == 'true'
+
+logger.info(f"FSM feature flag: {'ENABLED' if FSM_ENABLED else 'DISABLED'}")
+
+
+# ============================================================================
+# FSM Processing Functions
+# ============================================================================
+
+async def process_with_fsm(
+    message_sid: str,
+    conversation_id: str,
+    message: str,
+    context: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Process message through FSM pipeline.
+
+    8-step processing flow:
+    1. Check idempotency (prevent duplicate processing)
+    2. Load FSM state
+    3. Detect intent
+    4. Call appropriate state handler
+    5. Handle BOOKING state (execute booking)
+    6. Save new state (with CAS retry)
+    7. Cache response for idempotency
+    8. Return response
+
+    Args:
+        message_sid: Unique message identifier (e.g., Twilio MessageSid)
+        conversation_id: Unique conversation identifier (e.g., phone number)
+        message: User message text
+        context: Full webhook payload for additional context
+
+    Returns:
+        Response dictionary with message and state info
+    """
+    try:
+        # Step 1: Check idempotency
+        logger.info(f"Processing message {message_sid} for conversation {conversation_id}")
+        cached_response = await fsm_manager.check_idempotency(message_sid)
+        if cached_response:
+            logger.info(f"Returning cached response for message {message_sid}")
+            return {"response": cached_response, "cached": True}
+
+        # Step 2: Load FSM state
+        clinic_id = await get_clinic_id_from_number(conversation_id)
+        state = await fsm_manager.load_state(conversation_id, clinic_id)
+        logger.info(f"Loaded state: {state.current_state}, version: {state.version}")
+
+        # Step 3: Detect intent
+        intent = intent_router.detect_intent(message, state.current_state)
+        logger.info(f"Detected intent: {intent}")
+
+        # Step 4: Handle based on current state
+        if state.current_state == ConversationState.GREETING:
+            new_state, response = await state_handler.handle_greeting(
+                state, message, intent
+            )
+        elif state.current_state == ConversationState.COLLECTING_SLOTS:
+            new_state, response = await state_handler.handle_collecting_slots(
+                state, message, intent
+            )
+        elif state.current_state == ConversationState.AWAITING_CONFIRMATION:
+            new_state, response = await state_handler.handle_awaiting_confirmation(
+                state, message, intent
+            )
+        elif state.current_state == ConversationState.DISAMBIGUATING:
+            new_state, response = await state_handler.handle_disambiguating(
+                state, message, intent
+            )
+        elif state.current_state == ConversationState.AWAITING_CLARIFICATION:
+            new_state, response = await state_handler.handle_awaiting_clarification(
+                state, message, intent
+            )
+        elif state.current_state == ConversationState.BOOKING:
+            # BOOKING state should not receive user input - immediate execution
+            new_state = state
+            response = "Оформляю запись..."
+        elif state.current_state in [ConversationState.COMPLETED, ConversationState.FAILED]:
+            # Terminal states - start new conversation
+            logger.info(f"Terminal state {state.current_state}, starting new conversation")
+            new_state = await fsm_manager.load_state(conversation_id, clinic_id)
+            new_state, response = await state_handler.handle_greeting(
+                new_state, message, intent
+            )
+        else:
+            # Fallback
+            logger.warning(f"Unexpected state: {state.current_state}")
+            new_state = state
+            response = "Извините, произошла ошибка. Попробуйте ещё раз."
+
+        # Step 5: Handle BOOKING state (execute actual booking)
+        if new_state.current_state == ConversationState.BOOKING:
+            logger.info("Executing booking...")
+            booking_result = await execute_booking(new_state)
+
+            if booking_result['success']:
+                new_state = await fsm_manager.transition_state(
+                    new_state,
+                    ConversationState.COMPLETED
+                )
+                response = f"✅ Запись создана! Номер: {booking_result['booking_id']}"
+                logger.info(f"Booking successful: {booking_result['booking_id']}")
+            else:
+                new_state = await fsm_manager.transition_state(
+                    new_state,
+                    ConversationState.FAILED
+                )
+                response = f"❌ Ошибка бронирования: {booking_result['error']}"
+                logger.error(f"Booking failed: {booking_result['error']}")
+
+        # Step 6: Save new state (with CAS retry)
+        save_success = await fsm_manager.save_state(new_state)
+        if not save_success:
+            # CAS conflict - state was modified by another request
+            logger.error(f"CAS conflict saving state for conversation {conversation_id}")
+            response = "Произошла ошибка. Пожалуйста, повторите запрос."
+        else:
+            logger.info(f"State saved successfully: {new_state.current_state}, version: {new_state.version}")
+
+        # Step 7: Cache response for idempotency
+        await fsm_manager.cache_response(message_sid, response)
+
+        # Step 8: Return response
+        state_value = new_state.current_state.value if hasattr(new_state.current_state, 'value') else str(new_state.current_state)
+        return {
+            "response": response,
+            "state": state_value,
+            "cached": False
+        }
+
+    except Exception as e:
+        logger.exception(f"Error processing message with FSM: {e}")
+        return {
+            "response": "Произошла ошибка. Пожалуйста, попробуйте позже.",
+            "error": str(e)
+        }
+
+
+async def execute_booking(state: FSMState) -> Dict[str, Any]:
+    """
+    Execute actual booking in database.
+
+    Extracts slot values from FSM state and calls the appointment booking service.
+
+    Args:
+        state: FSM state with confirmed slots
+
+    Returns:
+        Dictionary with success status and booking_id or error message
+    """
+    try:
+        # Extract confirmed slots
+        doctor = state.get_slot_value("doctor")
+        date = state.get_slot_value("date")
+        time_slot = state.get_slot_value("time")
+        patient_name = state.get_slot_value("patient_name")
+
+        if not all([doctor, date, time_slot]):
+            logger.error("Missing required slots for booking")
+            return {
+                "success": False,
+                "error": "Отсутствуют обязательные данные для записи"
+            }
+
+        logger.info(f"Executing booking: doctor={doctor}, date={date}, time={time_slot}")
+
+        # Prepare appointment details
+        appointment_details = {
+            "doctor_id": doctor,  # Assuming doctor slot contains doctor_id
+            "date": date,
+            "time": time_slot,
+            "patient_name": patient_name or "WhatsApp User",
+            "service_type": state.get_slot_value("service") or "Консультация"
+        }
+
+        # Call booking service
+        result = await booking_service.book_appointment(
+            patient_phone=state.conversation_id,
+            clinic_id=state.clinic_id,
+            appointment_details=appointment_details,
+            idempotency_key=f"{state.conversation_id}_{state.version}"
+        )
+
+        if result.get('success'):
+            return {
+                "success": True,
+                "booking_id": result.get('appointment_id', 'N/A')
+            }
+        else:
+            return {
+                "success": False,
+                "error": result.get('reason', 'Неизвестная ошибка')
+            }
+
+    except Exception as e:
+        logger.exception(f"Error executing booking: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+async def get_clinic_id_from_number(phone_number: str) -> str:
+    """
+    Lookup clinic_id from phone number.
+
+    This function maps a phone number to a clinic ID. In production, this would
+    query a database or configuration service. For now, returns default clinic ID.
+
+    Args:
+        phone_number: Phone number to lookup
+
+    Returns:
+        Clinic ID string
+    """
+    # TODO: Implement actual lookup from database
+    # For now, return default clinic ID from environment
+    default_clinic_id = os.getenv("DEFAULT_CLINIC_ID", "default_clinic")
+
+    # Future implementation could look like:
+    # result = supabase.table('clinic_phone_mappings').select('clinic_id').eq('phone_number', phone_number).execute()
+    # if result.data:
+    #     return result.data[0]['clinic_id']
+
+    logger.info(f"Using default clinic_id: {default_clinic_id} for number: {phone_number}")
+    return default_clinic_id
+
+
+async def handle_message_legacy(body: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Legacy message handling (preserved for rollback).
+
+    This is the existing webhook logic before FSM integration.
+    Kept for safe rollback if FSM_ENABLED=false.
+
+    Args:
+        body: Webhook payload
+
+    Returns:
+        Response dictionary
+    """
+    # TODO: Implement legacy handling if there was existing logic
+    # For now, return a simple acknowledgment
+    logger.info("Processing with legacy handler")
+
+    return {
+        "response": "Спасибо за сообщение. Наш администратор скоро с вами свяжется.",
+        "legacy": True
+    }
+
+
+# ============================================================================
+# WhatsApp Webhook Endpoints
+# ============================================================================
+
+@router.post("/whatsapp")
+async def whatsapp_webhook(request: Request):
+    """
+    Twilio WhatsApp webhook handler.
+
+    Processes incoming WhatsApp messages via Twilio.
+    Routes to FSM processing if FSM_ENABLED=true, otherwise uses legacy handler.
+    """
+    try:
+        body = await request.json()
+        logger.info(f"Received WhatsApp webhook: {body}")
+
+        # Extract webhook data (Twilio format)
+        message_sid = body.get('MessageSid')
+        from_number = body.get('From')  # conversation_id
+        message_text = body.get('Body', '')
+
+        if not message_sid or not from_number:
+            logger.error("Missing MessageSid or From in webhook payload")
+            raise HTTPException(status_code=400, detail="Invalid webhook payload")
+
+        # Route based on feature flag
+        if FSM_ENABLED:
+            logger.info("Routing to FSM processing")
+            result = await process_with_fsm(
+                message_sid=message_sid,
+                conversation_id=from_number,
+                message=message_text,
+                context=body
+            )
+        else:
+            logger.info("Routing to legacy processing")
+            result = await handle_message_legacy(body)
+
+        return result
+
+    except Exception as e:
+        logger.exception(f"Error in WhatsApp webhook: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/evolution")
+async def evolution_webhook(request: Request):
+    """
+    Evolution API WhatsApp webhook handler.
+
+    Processes incoming WhatsApp messages via Evolution API.
+    Routes to FSM processing if FSM_ENABLED=true, otherwise uses legacy handler.
+    """
+    try:
+        body = await request.json()
+        logger.info(f"Received Evolution webhook: {body}")
+
+        # Extract webhook data (Evolution format)
+        message_sid = body.get('key', {}).get('id')
+        from_number = body.get('key', {}).get('remoteJid')
+        message_text = body.get('message', {}).get('conversation', '')
+
+        # Alternative Evolution format for text messages
+        if not message_text:
+            message_text = body.get('message', {}).get('extendedTextMessage', {}).get('text', '')
+
+        if not message_sid or not from_number:
+            logger.error("Missing key.id or key.remoteJid in webhook payload")
+            raise HTTPException(status_code=400, detail="Invalid webhook payload")
+
+        # Route based on feature flag
+        if FSM_ENABLED:
+            logger.info("Routing to FSM processing")
+            result = await process_with_fsm(
+                message_sid=message_sid,
+                conversation_id=from_number,
+                message=message_text,
+                context=body
+            )
+        else:
+            logger.info("Routing to legacy processing")
+            result = await handle_message_legacy(body)
+
+        return result
+
+    except Exception as e:
+        logger.exception(f"Error in Evolution webhook: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Integration Status Endpoints (existing SSE endpoints)
+# ============================================================================
 
 @router.get("/integration-status/{integration_id}")
 async def integration_status_stream(integration_id: str, request: Request):

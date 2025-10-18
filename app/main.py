@@ -298,6 +298,8 @@ from app.api import evolution_webhook
 app.include_router(evolution_webhook.router)
 
 # Include Rule Engine routes
+from app.api import rule_authoring_api
+app.include_router(rule_authoring_api.router)
 
 # Include Scheduling API for intelligent scheduling system
 from app.api import scheduling_routes
@@ -340,6 +342,10 @@ app.include_router(smart_scheduling_api.router)
 # Include HIPAA Compliance API for Security and Audit Management (Phase 5)
 from app.api import hipaa_compliance_api
 app.include_router(hipaa_compliance_api.router)
+
+# Include Metrics Endpoint for Prometheus scraping
+from app.api import metrics_endpoint
+app.include_router(metrics_endpoint.router)
 
 # Include Healthcare API for direct doctor specialties endpoints
 from app.api import healthcare_api
