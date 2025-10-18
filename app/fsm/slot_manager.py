@@ -315,7 +315,7 @@ class SlotManager:
         self,
         doctor_name: str,
         clinic_id: str
-    ) -> Tuple[bool, Optional[str]]:
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Validate doctor name against clinic's doctor list.
 
@@ -327,22 +327,23 @@ class SlotManager:
             clinic_id: Clinic identifier for doctor lookup
 
         Returns:
-            Tuple of (is_valid, error_message). If valid, error_message is None.
-            If invalid, error_message contains available doctors.
+            Tuple of (is_valid, error_message, doctor_id).
+            If valid: (True, None, doctor_uuid)
+            If invalid: (False, error_message_with_suggestions, None)
 
         Example:
-            >>> is_valid, error = await manager.validate_doctor_name("Иванов", "clinic_123")
-            >>> print(is_valid, error)
-            True, None
-            >>> is_valid, error = await manager.validate_doctor_name("Неизвестный", "clinic_123")
-            >>> print(is_valid, error)
-            False, "Доктор 'Неизвестный' не найден. Доступны: Иванов, Петров, Сидоров"
+            >>> is_valid, error, doctor_id = await manager.validate_doctor_name("Иванов", "clinic_123")
+            >>> print(is_valid, error, doctor_id)
+            True, None, "550e8400-e29b-41d4-a716-446655440000"
+            >>> is_valid, error, doctor_id = await manager.validate_doctor_name("Неизвестный", "clinic_123")
+            >>> print(is_valid, error, doctor_id)
+            False, "Доктор 'Неизвестный' не найден. Доступны: Иванов, Петров, Сидоров", None
         """
         start_time = time.time()
 
         try:
-            # Fetch doctors from database
-            result = self.supabase.table('doctors').select('name').eq('clinic_id', clinic_id).execute()
+            # Fetch doctors from database with both name and id
+            result = self.supabase.table('doctors').select('id, name').eq('clinic_id', clinic_id).execute()
 
             if not result.data:
                 duration_seconds = time.time() - start_time
@@ -362,14 +363,13 @@ class SlotManager:
                 )
 
                 logger.warning(f"No doctors found for clinic {clinic_id}")
-                return False, error_msg
-
-            doctor_names = [d['name'].lower() for d in result.data]
+                return False, error_msg, None
 
             # Fuzzy match (case-insensitive, partial match)
             doctor_name_lower = doctor_name.lower()
-            for db_name in doctor_names:
-                if doctor_name_lower in db_name or db_name in doctor_name_lower:
+            for doctor in result.data:
+                db_name_lower = doctor['name'].lower()
+                if doctor_name_lower in db_name_lower or db_name_lower in doctor_name_lower:
                     duration_seconds = time.time() - start_time
 
                     # Record successful validation
@@ -384,8 +384,8 @@ class SlotManager:
                         duration_ms=duration_seconds * 1000
                     )
 
-                    logger.info(f"Doctor {doctor_name} validated successfully for clinic {clinic_id}")
-                    return True, None
+                    logger.info(f"Doctor {doctor_name} validated successfully for clinic {clinic_id}, id={doctor['id']}")
+                    return True, None, doctor['id']  # Return doctor UUID
 
             # Not found - return list of available doctors (up to 5)
             duration_seconds = time.time() - start_time
@@ -406,7 +406,7 @@ class SlotManager:
             )
 
             logger.warning(f"Doctor {doctor_name} not found for clinic {clinic_id}")
-            return False, error_msg
+            return False, error_msg, None
 
         except Exception as e:
             duration_seconds = time.time() - start_time
@@ -425,7 +425,7 @@ class SlotManager:
             )
 
             logger.error(f"Error validating doctor name for clinic {clinic_id}: {e}", exc_info=True)
-            return False, error_msg
+            return False, error_msg, None
 
     def add_slot(
         self,

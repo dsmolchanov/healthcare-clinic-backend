@@ -142,22 +142,30 @@ class StateHandler:
         doctor_name = self.slots.extract_doctor_name(message)
 
         if doctor_name:
-            # Validate doctor name
-            is_valid, error = await self.slots.validate_doctor_name(
+            # Validate doctor name and get doctor_id
+            is_valid, error, doctor_id = await self.slots.validate_doctor_name(
                 doctor_name,
                 state.clinic_id
             )
 
-            if is_valid:
-                # Add validated doctor slot
+            if is_valid and doctor_id:
+                # Add validated doctor slot with UUID (not name)
                 state = self.slots.add_slot(
                     state,
                     "doctor",
+                    doctor_id,  # Store UUID instead of name
+                    SlotSource.LLM_EXTRACT,
+                    confidence=0.9
+                )
+                # Also store the name for display purposes
+                state = self.slots.add_slot(
+                    state,
+                    "doctor_name",
                     doctor_name,
                     SlotSource.LLM_EXTRACT,
                     confidence=0.9
                 )
-                logger.info(f"Conversation {state.conversation_id}: Extracted doctor={doctor_name}")
+                logger.info(f"Conversation {state.conversation_id}: Extracted doctor={doctor_name} (id={doctor_id})")
             else:
                 # Invalid doctor, ask for clarification
                 new_state = await self.fsm.transition_state(

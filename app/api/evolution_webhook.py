@@ -26,6 +26,26 @@ EVOLUTION_API_URL = os.getenv("EVOLUTION_SERVER_URL", "https://evolution-api-pro
 # Initialize message processor with RAG
 message_processor = MultilingualMessageProcessor()
 
+# FSM Feature Flag
+FSM_ENABLED = os.getenv('ENABLE_FSM', 'false').lower() == 'true'
+
+logger.info(f"Evolution webhook - FSM feature flag: {'ENABLED' if FSM_ENABLED else 'DISABLED'}")
+
+# FSM imports (only if enabled)
+if FSM_ENABLED:
+    from ..fsm.manager import FSMManager
+    from ..fsm.intent_router import IntentRouter
+    from ..fsm.slot_manager import SlotManager
+    from ..fsm.state_handlers import StateHandler
+    from ..fsm.redis_client import redis_client
+    from ..fsm.models import FSMState, ConversationState
+
+    # Initialize FSM components
+    fsm_manager = FSMManager()
+    intent_router = IntentRouter()
+    slot_manager = SlotManager()
+    state_handler = StateHandler(fsm_manager, intent_router, slot_manager)
+
 @router.post("/{instance_name}")
 async def evolution_webhook(
     request: Request,
@@ -350,45 +370,78 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
         # Create session ID from phone number
         session_id = f"whatsapp_{from_number}_{actual_instance}"
 
-        # Route message through NEW multilingual processor with RouterService + FastPathService
-        print(f"\n[Background] Step 5: Processing with multilingual processor (with memory support)...")
+        # Route message through FSM or multilingual processor
+        print(f"\n[Background] Step 5: Processing message...")
         print(f"[Background] Message type: {message_type.value}")
         print(f"[Background] Session ID: {session_id}")
 
         ai_start = datetime.datetime.now()
 
-        try:
-            # Use the NEW message processor with RouterService and FastPathService
-            # This includes memory retrieval and fast-path routing
-            request_obj = MessageRequest(
-                from_phone=from_number,
-                to_phone=actual_instance,  # Use instance as "to" identifier
-                body=text,
-                message_sid=key.get("id"),
-                clinic_id=clinic_id,
-                clinic_name=clinic_name or "Clinic",
-                channel="whatsapp",
-                profile_name=push_name,
-                metadata={
-                    "instance_name": actual_instance,
-                    "user_name": push_name,
-                    "whatsapp_message_id": key.get("id"),
-                    "session_id": session_id
-                }
-            )
+        # Check if FSM is enabled
+        if FSM_ENABLED:
+            print(f"[Background] 🔄 Routing to FSM processing")
+            try:
+                # Process through FSM
+                from app.api.webhooks import process_with_fsm
 
-            # Process with timeout
-            message_response = await asyncio.wait_for(
-                message_processor.process_message(request_obj),
-                timeout=30.0  # 30 second max for AI processing
-            )
+                fsm_result = await process_with_fsm(
+                    message_sid=key.get("id"),
+                    conversation_id=from_number,
+                    message=text,
+                    clinic_id=clinic_id,
+                    context={
+                        "instance_name": actual_instance,
+                        "user_name": push_name,
+                        "session_id": session_id
+                    }
+                )
 
-            # Extract response from MessageResponse object
-            ai_response = message_response.message
-            routing_path = message_response.metadata.get("routing_path", "multilingual_processor")
-            latency_ms = message_response.metadata.get("processing_time_ms", 0)
+                ai_response = fsm_result.get("response", "")
+                routing_path = "fsm"
+                latency_ms = fsm_result.get("processing_time_ms", 0)
 
-            print(f"[Background] ✅ Message processed successfully via {routing_path}")
+                print(f"[Background] ✅ Message processed successfully via FSM")
+
+            except Exception as fsm_error:
+                print(f"[Background] ❌ FSM processing failed: {fsm_error}")
+                print(f"[Background] 🔄 Falling back to multilingual processor")
+                # Fallback to multilingual processor on FSM error
+                FSM_ENABLED = False  # Temporarily disable for this message
+
+        if not FSM_ENABLED:
+            print(f"[Background] 🔄 Processing with multilingual processor (with memory support)...")
+            try:
+                # Use the NEW message processor with RouterService and FastPathService
+                # This includes memory retrieval and fast-path routing
+                request_obj = MessageRequest(
+                    from_phone=from_number,
+                    to_phone=actual_instance,  # Use instance as "to" identifier
+                    body=text,
+                    message_sid=key.get("id"),
+                    clinic_id=clinic_id,
+                    clinic_name=clinic_name or "Clinic",
+                    channel="whatsapp",
+                    profile_name=push_name,
+                    metadata={
+                        "instance_name": actual_instance,
+                        "user_name": push_name,
+                        "whatsapp_message_id": key.get("id"),
+                        "session_id": session_id
+                    }
+                )
+
+                # Process with timeout
+                message_response = await asyncio.wait_for(
+                    message_processor.process_message(request_obj),
+                    timeout=30.0  # 30 second max for AI processing
+                )
+
+                # Extract response from MessageResponse object
+                ai_response = message_response.message
+                routing_path = message_response.metadata.get("routing_path", "multilingual_processor")
+                latency_ms = message_response.metadata.get("processing_time_ms", 0)
+
+                print(f"[Background] ✅ Message processed successfully via {routing_path}")
         except asyncio.TimeoutError:
             print(f"[Background] ⏰ Processing timed out after 30s - using fallback response")
             # Use fallback response on timeout
