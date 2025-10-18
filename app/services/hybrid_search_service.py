@@ -68,7 +68,8 @@ class HybridSearchService:
         entity_type: EntityType,
         language: Optional[str] = None,
         limit: int = 10,
-        phone_hash: Optional[str] = None
+        phone_hash: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Universal search method with multi-stage strategy
@@ -79,6 +80,7 @@ class HybridSearchService:
             language: Optional language hint (auto-detected if None)
             limit: Maximum number of results
             phone_hash: Optional phone hash for language caching
+            session_id: Optional session ID for FTS search personalization
 
         Returns:
             Dict with results, metadata, and telemetry
@@ -106,7 +108,7 @@ class HybridSearchService:
 
         # Route to entity-specific search
         if entity_type == EntityType.SERVICE:
-            results, stage = await self._search_services(normalized_query, language, limit)
+            results, stage = await self._search_services(normalized_query, language, limit, session_id)
         elif entity_type == EntityType.FAQ:
             results, stage = await self._search_faqs(normalized_query, language, limit)
         elif entity_type == EntityType.DOCTOR:
@@ -139,7 +141,8 @@ class HybridSearchService:
         self,
         normalized_query: str,
         language: str,
-        limit: int
+        limit: int,
+        session_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], SearchStage]:
         """
         Multi-stage service search
@@ -179,7 +182,7 @@ class HybridSearchService:
                 return fuzzy_matches[:limit], SearchStage.CACHE_FUZZY
 
         # Stage 3: FTS search (database)
-        fts_results = await self._fts_search_services(normalized_query, language, limit)
+        fts_results = await self._fts_search_services(normalized_query, limit, session_id)
         if fts_results:
             logger.info(f"📊 FTS match: {len(fts_results)} results")
             return fts_results, SearchStage.FTS
@@ -251,22 +254,25 @@ class HybridSearchService:
     async def _fts_search_services(
         self,
         query: str,
-        language: str,
-        limit: int
+        limit: int,
+        session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Full-text search using language-specific vectors
+
+        Note: Updated to use new function signature without p_language parameter.
+        The database function now uses p_session_id for personalization instead.
         """
         try:
-            # Map language to search RPC (reuse existing infrastructure)
+            # Use new function signature (removed p_language, added p_session_id)
             response = self.supabase.rpc(
                 'search_services_v1',
                 {
                     'p_clinic_id': self.clinic_id,
-                    'p_query': query,
-                    'p_language': language,
                     'p_limit': limit,
-                    'p_min_score': 0.01
+                    'p_min_score': 0.01,
+                    'p_query': query,
+                    'p_session_id': session_id or ''  # Use empty string if no session_id
                 }
             ).execute()
 

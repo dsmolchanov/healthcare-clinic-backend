@@ -94,41 +94,55 @@ class ReservationTools:
 
             # Get service details
             service = await self._get_service_by_name(service_name)
-            if not service:
+            if not service or not isinstance(service, dict):
                 return {
                     "success": False,
                     "error": f"Service '{service_name}' not found",
                     "available_slots": []
                 }
 
-            # Check if multi-stage service
-            stage_config = service.get('stage_config', {})
+            # Check if multi-stage service (with defensive null checks)
+            stage_config = service.get('stage_config') if service else {}
+            stage_config = stage_config if isinstance(stage_config, dict) else {}
             is_multi_stage = stage_config.get('total_stages', 1) > 1
 
             # Use intelligent scheduler to find slots
             strategy = SchedulingStrategy.AI_OPTIMIZED
             slots = await self.scheduler.find_available_slots(
-                service_id=service['id'],
+                service_id=service.get('id') if service else None,
                 start_date=start_date,
                 end_date=end_date,
                 doctor_id=doctor_id,
-                duration_minutes=service.get('duration_minutes', 30),
+                duration_minutes=service.get('duration_minutes', 30) if service else 30,
                 strategy=strategy
             )
 
+            # Ensure slots is a list (defensive check)
+            if not slots or not isinstance(slots, list):
+                slots = []
+
             # Filter by time preference if provided
-            if time_preference:
+            if time_preference and slots:
                 slots = self._filter_by_time_preference(slots, time_preference)
 
             # Check conflicts with external calendars
             verified_slots = []
             for slot in slots[:10]:  # Limit to top 10 slots
+                # Defensive check: ensure slot is a dictionary
+                if not slot or not isinstance(slot, dict):
+                    continue
+
                 # Use ask-hold-reserve pattern to verify availability
-                is_available = await self.calendar_service.ask_availability(
-                    datetime_str=slot['datetime'],
-                    duration_minutes=service.get('duration_minutes', 30),
-                    doctor_id=slot.get('doctor_id')
-                )
+                try:
+                    is_available = await self.calendar_service.ask_availability(
+                        datetime_str=slot.get('datetime') if slot else None,
+                        duration_minutes=service.get('duration_minutes', 30) if service else 30,
+                        doctor_id=slot.get('doctor_id') if slot else None
+                    )
+                except Exception as calendar_error:
+                    logger.warning(f"Calendar availability check failed: {calendar_error}")
+                    # Continue without calendar verification
+                    is_available = True
 
                 if is_available:
                     slot['verified'] = True

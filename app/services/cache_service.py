@@ -189,13 +189,28 @@ class CacheService:
 
             if cached_data:
                 try:
+                    # Validate cache data format
+                    if not isinstance(cached_data, bytes) or len(cached_data) < 2:
+                        raise ValueError(f"Invalid cache data format: type={type(cached_data)}, len={len(cached_data) if cached_data else 0}")
+
                     # Parse metadata (first byte indicates if compressed)
                     is_compressed = cached_data[0] == 1
                     data_bytes = cached_data[1:]
 
-                    # Decompress if needed
-                    decompressed = self._decompress(data_bytes, is_compressed)
-                    bundle = json.loads(decompressed.decode('utf-8'))
+                    # Decompress if needed (with better error handling)
+                    try:
+                        decompressed = self._decompress(data_bytes, is_compressed)
+                    except zstd.ZstdError as zstd_err:
+                        raise ValueError(f"Decompression failed: {zstd_err}")
+
+                    # Decode UTF-8
+                    try:
+                        decoded_str = decompressed.decode('utf-8')
+                    except UnicodeDecodeError as unicode_err:
+                        raise ValueError(f"UTF-8 decode failed: {unicode_err} (data_len={len(decompressed)}, first_bytes={decompressed[:10].hex() if len(decompressed) >= 10 else 'N/A'})")
+
+                    # Parse JSON
+                    bundle = json.loads(decoded_str)
 
                     # Validate generation
                     cached_gen = int(cached_gen_str) if cached_gen_str else None
@@ -205,11 +220,12 @@ class CacheService:
                     else:
                         logger.debug(f"🔄 Cache STALE: invalidating bundle for clinic {clinic_id}")
                         self.redis.delete(cache_key, gen_key)
-                except (UnicodeDecodeError, json.JSONDecodeError, zstd.ZstdError) as decode_error:
-                    logger.warning(f"Cache data corrupted, deleting: {decode_error}")
+                except (ValueError, json.JSONDecodeError) as decode_error:
+                    logger.warning(f"Cache data corrupted for {clinic_id}, deleting and rebuilding: {decode_error}")
                     self.redis.delete(cache_key, gen_key)
+                    # Continue to rebuild cache below
         except Exception as e:
-            logger.warning(f"Cache read error: {e}")
+            logger.warning(f"Cache read error for {clinic_id}: {type(e).__name__}: {e}")
 
         # Cache miss - acquire lock to prevent stampede
         logger.debug(f"❌ Cache MISS: fetching bundle for clinic {clinic_id}")
