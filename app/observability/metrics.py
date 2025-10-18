@@ -331,29 +331,59 @@ def get_metrics() -> tuple:
 
 def get_metrics_summary() -> dict:
     """Get human-readable metrics summary"""
+
+    # Helper to sum all label combinations for a Counter
+    def sum_counter(counter):
+        total = 0
+        try:
+            for metric in counter.collect()[0].samples:
+                if metric.name.endswith('_total'):
+                    total += metric.value
+        except Exception:
+            pass
+        return total
+
+    # Helper to get Gauge value
+    def get_gauge(gauge):
+        try:
+            return gauge._value.get()
+        except Exception:
+            return 0
+
+    # Helper to get labeled Gauge value
+    def get_labeled_gauge(gauge, labels_dict):
+        try:
+            return gauge.labels(**labels_dict)._value.get()
+        except Exception:
+            return 0
+
+    cache_hits = sum_counter(CACHE_HITS)
+    cache_misses = sum_counter(CACHE_MISSES)
+    cache_total = max(cache_hits + cache_misses, 1)
+
     return {
         'requests': {
-            'total': REQUEST_COUNTER._value.sum(),
+            'total': sum_counter(REQUEST_COUNTER),
         },
         'cache': {
-            'hits': CACHE_HITS._value.sum(),
-            'misses': CACHE_MISSES._value.sum(),
-            'hit_rate': CACHE_HITS._value.sum() / max(CACHE_HITS._value.sum() + CACHE_MISSES._value.sum(), 1) * 100
+            'hits': cache_hits,
+            'misses': cache_misses,
+            'hit_rate': cache_hits / cache_total * 100
         },
         'mem0': {
-            'queue_size': MEM0_QUEUE_SIZE._value.get(),
-            'writes': MEM0_WRITES._value.sum(),
+            'queue_size': get_gauge(MEM0_QUEUE_SIZE),
+            'writes': sum_counter(MEM0_WRITES),
         },
         'lanes': {
-            'faq': LANE_CLASSIFICATION.labels(lane='faq')._value.get(),
-            'price': LANE_CLASSIFICATION.labels(lane='price')._value.get(),
-            'scheduling': LANE_CLASSIFICATION.labels(lane='scheduling')._value.get(),
-            'complex': LANE_CLASSIFICATION.labels(lane='complex')._value.get(),
+            'faq': get_labeled_gauge(LANE_CLASSIFICATION, {'lane': 'faq'}),
+            'price': get_labeled_gauge(LANE_CLASSIFICATION, {'lane': 'price'}),
+            'scheduling': get_labeled_gauge(LANE_CLASSIFICATION, {'lane': 'scheduling'}),
+            'complex': get_labeled_gauge(LANE_CLASSIFICATION, {'lane': 'complex'}),
         },
         'errors': {
-            'total': ERRORS._value.sum(),
+            'total': sum_counter(ERRORS),
         },
         'duplicates': {
-            'total': DUPLICATE_MESSAGES._value.get(),
+            'total': get_gauge(DUPLICATE_MESSAGES),
         }
     }
