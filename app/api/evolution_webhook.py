@@ -442,21 +442,22 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
                 latency_ms = message_response.metadata.get("processing_time_ms", 0)
 
                 print(f"[Background] ✅ Message processed successfully via {routing_path}")
-        except asyncio.TimeoutError:
-            print(f"[Background] ⏰ Processing timed out after 30s - using fallback response")
-            # Use fallback response on timeout
-            ai_response = "Thank you for your message. We're processing your request and will respond shortly."
-            routing_path = "timeout_fallback"
-            latency_ms = 30000
-            # Continue to send this fallback message
-        except Exception as routing_error:
-            print(f"[Background] ❌ Processing error: {routing_error}")
-            import traceback
-            print(f"[Background] Processing traceback:\n{traceback.format_exc()}")
-            # Use error fallback
-            ai_response = "We received your message. Please try again or contact us directly."
-            routing_path = "error_fallback"
-            latency_ms = 0
+
+            except asyncio.TimeoutError:
+                print(f"[Background] ⏰ Processing timed out after 30s - using fallback response")
+                # Use fallback response on timeout
+                ai_response = "Thank you for your message. We're processing your request and will respond shortly."
+                routing_path = "timeout_fallback"
+                latency_ms = 30000
+                # Continue to send this fallback message
+            except Exception as routing_error:
+                print(f"[Background] ❌ Processing error: {routing_error}")
+                import traceback
+                print(f"[Background] Processing traceback:\n{traceback.format_exc()}")
+                # Use error fallback
+                ai_response = "We received your message. Please try again or contact us directly."
+                routing_path = "error_fallback"
+                latency_ms = 0
 
         ai_end = datetime.datetime.now()
         ai_duration = (ai_end - ai_start).total_seconds()
