@@ -56,6 +56,177 @@ if FSM_ENABLED:
     answer_service = AnswerService(fsm_supabase)
     state_handler = StateHandler(fsm_manager, intent_router, slot_manager, answer_service)
 
+@router.post("/whatsapp/{webhook_token}")
+async def whatsapp_webhook_v2(
+    request: Request,
+    webhook_token: str = Path(..., description="Webhook routing token"),
+    body: Dict[str, Any] = Body(..., description="Webhook payload from Evolution API")
+):
+    """
+    NEW: Token-based webhook endpoint for WhatsApp messages
+
+    Evolution API sends to: /webhooks/evolution/whatsapp/{webhook_token}
+
+    Benefits:
+    - Zero DB queries on cache hit (Redis lookup: token → clinic_id)
+    - Secure token-based routing (no instance name exposure)
+    - Single indexed query on cache miss
+
+    CRITICAL: Must return IMMEDIATELY to avoid Evolution timeout
+    """
+    import datetime
+    timestamp = datetime.datetime.now().isoformat()
+
+    print(f"\n{'='*80}")
+    print(f"[{timestamp}] TOKEN-BASED WEBHOOK RECEIVED")
+    print(f"[WhatsApp Webhook V2] Token: {webhook_token[:8]}...")
+    print(f"[WhatsApp Webhook V2] Body type: {type(body)}")
+    print(f"[WhatsApp Webhook V2] Body keys: {list(body.keys()) if body else 'None'}")
+
+    # Verify webhook signature
+    evolution_webhook_secret = os.getenv("EVOLUTION_WEBHOOK_SECRET", "")
+
+    if not evolution_webhook_secret:
+        logger.error("EVOLUTION_WEBHOOK_SECRET not configured")
+        raise HTTPException(status_code=503, detail="Webhook secret not configured")
+
+    signature = request.headers.get("X-Webhook-Signature")
+    if not signature:
+        print(f"[WhatsApp Webhook V2] ❌ No signature header")
+        raise HTTPException(status_code=401, detail="Webhook signature required")
+
+    # Convert body to JSON bytes for signature verification
+    body_bytes = json.dumps(body, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+
+    if not verify_webhook_signature('evolution', body=body_bytes, signature=signature):
+        print(f"[WhatsApp Webhook V2] ❌ Invalid signature")
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    print(f"[WhatsApp Webhook V2] ✅ Signature verified")
+
+    # Create background task for processing (CRITICAL: return immediately)
+    asyncio.create_task(process_webhook_by_token(webhook_token, body_bytes))
+
+    print(f"[WhatsApp Webhook V2] 🏁 Returning response immediately")
+
+    # IMMEDIATE response (Evolution timeout is ~5 seconds)
+    return {"status": "ok", "token": webhook_token[:8] + "..."}
+
+
+async def process_webhook_by_token(webhook_token: str, body_bytes: bytes):
+    """
+    Process webhook using token-based routing (background task)
+
+    This is the NEW processing path with zero-DB-query cache hits.
+    """
+    import datetime
+    timestamp = datetime.datetime.now().isoformat()
+
+    print(f"\n{'='*80}")
+    print(f"[{timestamp}] TOKEN-BASED ASYNC PROCESSING STARTED")
+    print(f"[Token Async] Token: {webhook_token[:8]}...")
+    print(f"[Token Async] Processing {len(body_bytes)} bytes")
+    print(f"{'='*80}")
+
+    try:
+        # Parse webhook body
+        data = json.loads(body_bytes)
+        message_data = data.get("message", {})
+
+        if not message_data:
+            print(f"[Token Async] ⚠️  No message data, ignoring")
+            return
+
+        # Idempotency check (same as existing flow)
+        message_id = message_data.get("key", {}).get("id")
+        if not message_id:
+            print(f"[Token Async] ⚠️  No message ID, cannot check idempotency")
+            return
+
+        # Redis SETNX for idempotency
+        from app.config import get_redis_client
+        redis_client = get_redis_client()
+        idempotency_key = f"webhook:msg:{message_id}"
+
+        is_first_time = redis_client.set(idempotency_key, "1", nx=True, ex=3600)
+
+        if not is_first_time:
+            print(f"[Token Async] ⏭️  Duplicate message {message_id}, skipping")
+            return
+
+        print(f"[Token Async] ✅ Idempotency check passed: {message_id}")
+
+        # ZERO-QUERY LOOKUP via token cache
+        from app.services.whatsapp_clinic_cache import get_whatsapp_clinic_cache
+        cache = get_whatsapp_clinic_cache()
+
+        clinic_info = await cache.get_or_fetch_clinic_info_by_token(webhook_token)
+
+        if not clinic_info:
+            print(f"[Token Async] ❌ No clinic found for token {webhook_token[:8]}...")
+            return
+
+        clinic_id = clinic_info['clinic_id']
+        organization_id = clinic_info['organization_id']
+        clinic_name = clinic_info.get('name', 'Unknown')
+
+        print(f"[Token Async] ✅ Resolved: token → clinic {clinic_name} ({clinic_id[:8]}...)")
+
+        # Extract message details
+        from_number = message_data.get("key", {}).get("remoteJid", "").split("@")[0]
+        message_text = message_data.get("message", {}).get("conversation", "")
+
+        # Also try other message formats
+        if not message_text:
+            nested_message = message_data.get("message", {})
+            message_text = (
+                nested_message.get("extendedTextMessage", {}).get("text") or
+                nested_message.get("imageMessage", {}).get("caption") or
+                nested_message.get("videoMessage", {}).get("caption") or
+                ""
+            )
+
+        print(f"[Token Async] From: {from_number}")
+        print(f"[Token Async] Message: {message_text[:100]}...")
+
+        # Route to FSM or multilingual processor (same as existing flow)
+        if FSM_ENABLED:
+            from app.api.webhooks import process_with_fsm
+            ai_response = await process_with_fsm(
+                clinic_id=clinic_id,
+                message=message_text,
+                from_number=from_number,
+                message_sid=message_id
+            )
+        else:
+            # Multilingual processor fallback
+            processor = MultilingualMessageProcessor()
+
+            request_obj = MessageRequest(
+                session_id=f"whatsapp_{from_number}_{clinic_id[:8]}",
+                message=message_text,
+                clinic_id=clinic_id,
+                from_phone=from_number,
+                channel="whatsapp",
+                language=None
+            )
+
+            response_obj = await asyncio.wait_for(processor.process_message(request_obj), timeout=30.0)
+            ai_response = response_obj.response
+
+        print(f"[Token Async] ✅ AI response: {ai_response[:100]}...")
+
+        # Send response via Evolution API (use instance_name from config)
+        instance_name = clinic_info.get('instance_name')
+        if instance_name:
+            await send_whatsapp_via_evolution(instance_name, from_number, ai_response)
+        else:
+            print(f"[Token Async] ⚠️  No instance_name in clinic_info, cannot send response")
+
+    except Exception as e:
+        logger.error(f"[Token Async] ❌ Error processing webhook: {e}", exc_info=True)
+
+
 @router.post("/{instance_name}")
 async def evolution_webhook(
     request: Request,
