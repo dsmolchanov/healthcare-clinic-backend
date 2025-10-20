@@ -72,47 +72,55 @@ async def main():
                 from app.db.supabase_client import get_supabase_client
                 supabase = get_supabase_client()
 
-                # Get the most recent active Evolution instance
-                # NOTE: Use healthcare schema explicitly
-                result = supabase.schema('healthcare').table('whatsapp_instances') \
-                    .select('instance_name, organization_id, clinic_id') \
-                    .eq('status', 'active') \
-                    .order('last_seen_at', desc=True) \
-                    .limit(1) \
+                # Get ALL active Evolution instances from integrations (more reliable)
+                integration_result = supabase.schema('healthcare').table('integrations') \
+                    .select('config, enabled, organization_id') \
+                    .eq('type', 'whatsapp') \
+                    .eq('enabled', True) \
                     .execute()
 
-                if result.data and len(result.data) > 0:
-                    instance_name = result.data[0]['instance_name']
-                    logger.info(f"✅ Auto-detected instance: {instance_name}")
-                else:
-                    # Fallback: Try to get from integrations table
-                    try:
-                        integration_result = supabase.schema('healthcare').table('integrations') \
-                            .select('config') \
-                            .eq('type', 'whatsapp') \
-                            .eq('is_active', True) \
-                            .order('updated_at', desc=True) \
-                            .limit(1) \
-                            .execute()
+                if integration_result.data and len(integration_result.data) > 0:
+                    # Log all found instances
+                    logger.info(f"Found {len(integration_result.data)} active WhatsApp integration(s)")
+                    for idx, integration in enumerate(integration_result.data):
+                        config = integration.get('config', {})
+                        inst = config.get('instance')
+                        logger.info(f"  [{idx}] Instance: {inst}, Org: {integration.get('organization_id')}")
 
-                        if integration_result.data and len(integration_result.data) > 0:
-                            config = integration_result.data[0].get('config', {})
-                            instance_name = config.get('instance_name')
-                            if instance_name:
-                                logger.info(f"✅ Detected instance from integrations: {instance_name}")
-                        else:
-                            # Final fallback to hardcoded default
-                            instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1759348170665"
-                            logger.warning(f"No active instances found, using fallback: {instance_name}")
-                    except Exception as fallback_error:
-                        logger.error(f"Fallback detection also failed: {fallback_error}")
-                        instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1759348170665"
-                        logger.warning(f"Using hardcoded fallback: {instance_name}")
+                    # Use the first enabled integration
+                    config = integration_result.data[0].get('config', {})
+                    instance_name = config.get('instance')
+                    if instance_name:
+                        logger.info(f"✅ Selected instance: {instance_name}")
+                    else:
+                        logger.warning("⚠️ Instance config missing 'instance' field, checking fallback...")
+                        instance_name = None
+
+                # Fallback to whatsapp_instances table
+                if not instance_name:
+                    result = supabase.schema('healthcare').table('whatsapp_instances') \
+                        .select('instance_name, organization_id, clinic_id, last_seen_at') \
+                        .eq('status', 'active') \
+                        .order('last_seen_at', desc=True) \
+                        .limit(5) \
+                        .execute()
+
+                    if result.data and len(result.data) > 0:
+                        logger.info(f"Found {len(result.data)} instance(s) in whatsapp_instances:")
+                        for idx, inst_data in enumerate(result.data):
+                            logger.info(f"  [{idx}] {inst_data.get('instance_name')} (last_seen: {inst_data.get('last_seen_at')})")
+
+                        instance_name = result.data[0]['instance_name']
+                        logger.info(f"✅ Selected most recent: {instance_name}")
+                    else:
+                        # Final fallback to hardcoded default
+                        instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1760994893945"
+                        logger.warning(f"⚠️ No active instances found, using current fallback: {instance_name}")
 
             except Exception as e:
-                logger.error(f"Failed to auto-detect instance: {e}")
-                # Fallback to hardcoded default
-                instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1759348170665"
+                logger.error(f"Failed to auto-detect instance: {e}", exc_info=True)
+                # Fallback to current default (updated)
+                instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1760994893945"
                 logger.warning(f"Using fallback instance: {instance_name}")
 
     logger.info("="*80)

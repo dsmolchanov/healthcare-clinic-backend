@@ -13,12 +13,13 @@ Key Features:
 - Ambiguity detection for short/unclear responses
 - Topic change detection for clinic info queries
 - Supports confirmation/denial detection with disambiguation
+- Returns structured IntentResult with topic/entities
 """
 
 import re
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from .models import ConversationState
+from .models import ConversationState, IntentResult
 
 
 class Intent:
@@ -68,41 +69,57 @@ class IntentRouter:
     def detect_intent(
         self,
         message: str,
-        current_state: ConversationState
-    ) -> str:
+        current_state: ConversationState,
+        last_prompt: Optional[Dict[str, Any]] = None
+    ) -> IntentResult:
         """
-        Detect user intent from message.
+        Detect user intent from message with context awareness.
 
-        Context-aware intent detection that considers the current conversation state.
-        Greetings are only treated as GREETING intent in the GREETING state;
-        otherwise they're treated as casual acknowledgment.
+        Context-aware intent detection that considers the current conversation state
+        and last prompt. Returns structured IntentResult with topic and entities.
 
         Args:
             message: User's message text
             current_state: Current FSM conversation state
+            last_prompt: Context from last question asked (optional)
 
         Returns:
-            str: Detected intent (one of Intent constants)
+            IntentResult: Structured intent with label, topic, and entities
 
         Example:
             >>> router = IntentRouter()
-            >>> intent = router.detect_intent("да", ConversationState.COLLECTING_SLOTS)
-            >>> print(intent)  # Intent.DISAMBIGUATE (ambiguous "да" outside confirmation)
+            >>> intent = router.detect_intent("сколько стоят виниры", ConversationState.GREETING)
+            >>> print(intent.label)  # Intent.TOPIC_CHANGE
+            >>> print(intent.topic)  # "pricing"
+            >>> print(intent.entities)  # {"service": "veneers"}
         """
         msg_lower = message.lower().strip()
+
+        # Context-aware confirmation/denial (if last_prompt set)
+        if last_prompt and last_prompt.get("kind") == "yes_no":
+            if self._is_confirmation(msg_lower):
+                return IntentResult(
+                    label=Intent.CONFIRM,
+                    entities={"prompt_context": last_prompt["question"]}
+                )
+            elif self._is_negation(msg_lower):
+                return IntentResult(
+                    label=Intent.DENY,
+                    entities={"prompt_context": last_prompt["question"]}
+                )
 
         # Greeting detection (context-aware)
         if self._is_greeting(msg_lower):
             # Only treat as greeting if in GREETING state
             # Otherwise it's just casual acknowledgment
             if current_state == ConversationState.GREETING:
-                return Intent.GREETING
+                return IntentResult(label=Intent.GREETING)
             else:
-                return Intent.ACKNOWLEDGMENT
+                return IntentResult(label=Intent.ACKNOWLEDGMENT)
 
         # Booking intent
         if self._is_booking_intent(msg_lower):
-            return Intent.BOOKING_INTENT
+            return IntentResult(label=Intent.BOOKING_INTENT)
 
         # Confirmation (context-dependent)
         if self._is_confirmation(msg_lower):
@@ -111,23 +128,29 @@ class IntentRouter:
                 ConversationState.AWAITING_CONFIRMATION,
                 ConversationState.DISAMBIGUATING
             ]:
-                return Intent.DISAMBIGUATE
-            return Intent.CONFIRM
+                return IntentResult(label=Intent.DISAMBIGUATE)
+            return IntentResult(label=Intent.CONFIRM)
 
         # Negation
         if self._is_negation(msg_lower):
-            return Intent.DENY
+            return IntentResult(label=Intent.DENY)
 
         # Topic change (user asking about clinic info, not booking)
         if self._is_topic_change(msg_lower):
-            return Intent.TOPIC_CHANGE
+            topic = self._classify_topic(msg_lower)
+            entities = self._extract_entities(msg_lower, topic)
+            return IntentResult(
+                label=Intent.TOPIC_CHANGE,
+                topic=topic,
+                entities=entities
+            )
 
         # Ambiguous short responses
         if len(msg_lower) <= 3 or msg_lower in ["да", "нет", "ok", "ок"]:
-            return Intent.DISAMBIGUATE
+            return IntentResult(label=Intent.DISAMBIGUATE)
 
         # Default: user providing information
-        return Intent.INFORMATION
+        return IntentResult(label=Intent.INFORMATION)
 
     def _is_greeting(self, msg: str) -> bool:
         """
@@ -255,3 +278,73 @@ class IntentRouter:
             r'\b(address|location|phone|hours|price|cost)\b'
         ]
         return any(re.search(p, msg, re.IGNORECASE) for p in patterns)
+
+    def _classify_topic(self, msg: str) -> str:
+        """
+        Classify topic for TOPIC_CHANGE intents.
+
+        Args:
+            msg: Lowercase message text
+
+        Returns:
+            str: Topic type (pricing, hours, address, phone, services, general)
+
+        Example:
+            >>> router = IntentRouter()
+            >>> router._classify_topic("сколько стоят виниры")
+            'pricing'
+            >>> router._classify_topic("когда вы работаете")
+            'hours'
+        """
+        if re.search(r'\b(цена|стоимость|сколько стоит|прайс|price|cost)\b', msg, re.I):
+            return "pricing"
+
+        if re.search(r'\b(часы работы|когда открыто|график|расписание|hours)\b', msg, re.I):
+            return "hours"
+
+        if re.search(r'\b(адрес|где находится|как добраться|location|address)\b', msg, re.I):
+            return "address"
+
+        if re.search(r'\b(телефон|контакт|связаться|phone|contact)\b', msg, re.I):
+            return "phone"
+
+        if re.search(r'\b(услуги|что делаете|чем занимаетесь|services)\b', msg, re.I):
+            return "services"
+
+        return "general"
+
+    def _extract_entities(self, msg: str, topic: str) -> Dict[str, Any]:
+        """
+        Extract entities based on topic.
+
+        Args:
+            msg: Lowercase message text
+            topic: Classified topic
+
+        Returns:
+            dict: Extracted entities
+
+        Example:
+            >>> router = IntentRouter()
+            >>> router._extract_entities("сколько стоят виниры", "pricing")
+            {'service': 'veneers'}
+        """
+        entities = {}
+
+        if topic == "pricing":
+            # Extract service name
+            service_patterns = {
+                "veneers": r'\b(винир|veneer)',
+                "cleaning": r'\b(чистк|cleaning)',
+                "filling": r'\b(пломб|filling)',
+                "implant": r'\b(имплант|implant)',
+                "crown": r'\b(корон|crown)',
+                "whitening": r'\b(отбелива|whitening)',
+            }
+
+            for service, pattern in service_patterns.items():
+                if re.search(pattern, msg, re.I):
+                    entities["service"] = service
+                    break
+
+        return entities

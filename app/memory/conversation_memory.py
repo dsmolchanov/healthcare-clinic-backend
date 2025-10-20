@@ -77,8 +77,48 @@ class ConversationMemoryManager:
         self._mem0_lookup_cache_ttl = max(int(os.getenv("MEM0_LOOKUP_CACHE_TTL_SECONDS", "75")), 0)
         self.strict_logging = os.getenv("CONVERSATION_LOG_FAIL_FAST", "false").lower() == "true"
 
+        # Circuit breaker for mem0 operations
+        self._mem0_circuit_breaker_failures = 0
+        self._mem0_circuit_breaker_threshold = 5  # Open circuit after 5 consecutive failures
+        self._mem0_circuit_breaker_reset_time: Optional[float] = None
+        self._mem0_circuit_breaker_timeout = 60.0  # Reset after 60 seconds
+
         if not MEM0_AVAILABLE:
             logger.info("mem0 not installed, using Supabase for memory storage")
+
+    def _is_mem0_circuit_breaker_open(self) -> bool:
+        """Check if circuit breaker is open (too many failures)"""
+        # If reset time is set, check if we should close the circuit
+        if self._mem0_circuit_breaker_reset_time is not None:
+            if perf_counter() >= self._mem0_circuit_breaker_reset_time:
+                # Reset circuit breaker
+                logger.info("🔄 mem0 circuit breaker reset - attempting to reconnect")
+                self._mem0_circuit_breaker_failures = 0
+                self._mem0_circuit_breaker_reset_time = None
+                return False
+
+        # Check if we've exceeded threshold
+        if self._mem0_circuit_breaker_failures >= self._mem0_circuit_breaker_threshold:
+            # Set reset time if not already set
+            if self._mem0_circuit_breaker_reset_time is None:
+                self._mem0_circuit_breaker_reset_time = perf_counter() + self._mem0_circuit_breaker_timeout
+                logger.warning(
+                    f"⚡ mem0 circuit breaker OPENED after {self._mem0_circuit_breaker_failures} failures. "
+                    f"Will retry in {self._mem0_circuit_breaker_timeout}s"
+                )
+            return True
+
+        return False
+
+    def _record_mem0_success(self):
+        """Record successful mem0 operation"""
+        self._mem0_circuit_breaker_failures = 0
+        self._mem0_circuit_breaker_reset_time = None
+
+    def _record_mem0_failure(self):
+        """Record failed mem0 operation"""
+        self._mem0_circuit_breaker_failures += 1
+        logger.debug(f"mem0 failure count: {self._mem0_circuit_breaker_failures}/{self._mem0_circuit_breaker_threshold}")
 
     @staticmethod
     def _extract_mem0_summary(mem0_result: Any) -> tuple[Optional[str], Optional[str]]:
@@ -555,6 +595,11 @@ class ConversationMemoryManager:
         if not self.mem0_available or not self.memory:
             return None
 
+        # Check circuit breaker - skip if open
+        if self._is_mem0_circuit_breaker_open():
+            logger.debug("⚡ mem0 circuit breaker OPEN - skipping operation")
+            return None
+
         clean_phone = phone_number.replace("@s.whatsapp.net", "")
         resolved_clinic = clinic_id or (metadata or {}).get('clinic_id')
         metadata_payload = dict(metadata or {})
@@ -586,6 +631,9 @@ class ConversationMemoryManager:
                 timeout=MEM0_TIMEOUT_MS / 1000.0
             )
 
+            # Success - reset circuit breaker
+            self._record_mem0_success()
+
             summary, memory_id = self._extract_mem0_summary(result)
 
             return {
@@ -595,12 +643,14 @@ class ConversationMemoryManager:
             }
 
         except asyncio.TimeoutError:
+            self._record_mem0_failure()
             logger.warning(
-                f"⏱️ mem0 add timed out after {MEM0_TIMEOUT_MS}ms (non-critical)"
+                f"⏱️ mem0 add timed out after {MEM0_TIMEOUT_MS}ms (non-critical, failure {self._mem0_circuit_breaker_failures}/{self._mem0_circuit_breaker_threshold})"
             )
             return None
         except Exception as e:
-            logger.warning(f"Failed to store in mem0: {e}")
+            self._record_mem0_failure()
+            logger.warning(f"Failed to store in mem0: {e} (failure {self._mem0_circuit_breaker_failures}/{self._mem0_circuit_breaker_threshold})")
             return None
 
     async def get_or_create_session(

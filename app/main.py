@@ -321,6 +321,10 @@ app.include_router(evolution_webhook.router)
 from app.api import rule_authoring_api
 app.include_router(rule_authoring_api.router)
 
+# Include chat-based scheduling rule creation API
+from app.api import scheduling_rule_chat_api
+app.include_router(scheduling_rule_chat_api.router)
+
 # Include Scheduling API for intelligent scheduling system
 from app.api import scheduling_routes
 app.include_router(scheduling_routes.router)

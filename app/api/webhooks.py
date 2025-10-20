@@ -18,6 +18,7 @@ from ..fsm.manager import FSMManager
 from ..fsm.intent_router import IntentRouter
 from ..fsm.slot_manager import SlotManager
 from ..fsm.state_handlers import StateHandler
+from ..fsm.answer_service import AnswerService
 from ..fsm.redis_client import redis_client
 from ..fsm.models import FSMState, ConversationState
 from ..services.appointment_booking_service import AppointmentBookingService
@@ -45,7 +46,8 @@ active_connections: Dict[str, asyncio.Queue] = {}
 fsm_manager = FSMManager()
 intent_router = IntentRouter()
 slot_manager = SlotManager()
-state_handler = StateHandler(fsm_manager, intent_router, slot_manager)
+answer_service = AnswerService(supabase_client=supabase)
+state_handler = StateHandler(fsm_manager, intent_router, slot_manager, answer_service)
 booking_service = AppointmentBookingService(supabase_client=supabase)
 
 # Feature flag - default disabled for safe rollout
@@ -100,9 +102,17 @@ async def process_with_fsm(
         state = await fsm_manager.load_state(conversation_id, clinic_id)
         logger.info(f"Loaded state: {state.current_state}, version: {state.version}")
 
-        # Step 3: Detect intent
-        intent = intent_router.detect_intent(message, state.current_state)
-        logger.info(f"Detected intent: {intent}")
+        # Step 3: Detect intent (with context)
+        intent = intent_router.detect_intent(
+            message,
+            state.current_state,
+            last_prompt=state.last_prompt
+        )
+        logger.info(
+            f"Detected intent: {intent.label}, "
+            f"topic: {intent.topic}, "
+            f"entities: {intent.entities}"
+        )
 
         # Step 4: Handle based on current state
         if state.current_state == ConversationState.GREETING:

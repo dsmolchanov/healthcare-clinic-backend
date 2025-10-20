@@ -5,6 +5,7 @@ This module defines type-safe data models for the Finite State Machine (FSM) sys
 All models use Pydantic V2 for validation and serialization.
 
 Models:
+- IntentResult: Structured intent detection result with topic/entities
 - SlotEvidence: Tracks slot values with provenance and staleness detection
 - FSMState: Complete FSM state with version tracking for optimistic locking
 - IdempotencyRecord: Cached webhook responses for deduplication
@@ -12,10 +13,33 @@ Models:
 
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from dataclasses import dataclass, field as dataclass_field
 
 from pydantic import BaseModel, Field, field_validator, ValidationInfo
 
 from .constants import ConversationState, SlotSource, SLOT_STALENESS_THRESHOLD
+
+
+@dataclass
+class IntentResult:
+    """
+    Structured intent detection result.
+
+    Attributes:
+        label: Intent type (Intent.TOPIC_CHANGE, Intent.GREETING, etc.)
+        topic: Specific topic for TOPIC_CHANGE intents (pricing, hours, address, etc.)
+        entities: Extracted entities (service names, dates, etc.)
+        confidence: Detection confidence (1.0 for regex, 0.0-1.0 for ML)
+
+    Examples:
+        >>> IntentResult(label="topic_change", topic="pricing", entities={"service": "veneers"})
+        >>> IntentResult(label="greeting", confidence=1.0)
+        >>> IntentResult(label="deny", entities={"prompt_context": "booking_offer"})
+    """
+    label: str
+    topic: Optional[str] = None
+    entities: Dict[str, Any] = dataclass_field(default_factory=dict)
+    confidence: float = 1.0
 
 
 class SlotEvidence(BaseModel):
@@ -101,6 +125,9 @@ class FSMState(BaseModel):
         failure_count: Number of consecutive failures (for retry logic)
         created_at: UTC timestamp when state was first created
         updated_at: UTC timestamp of last update
+        last_prompt: Last question/offer made to user (for context-aware YES/NO)
+        inquiry_topic: Current inquiry topic (pricing, hours, etc.)
+        inquiry_entities: Entities related to current inquiry
     """
     conversation_id: str = Field(..., min_length=1)
     clinic_id: str = Field(..., min_length=1)
@@ -110,6 +137,11 @@ class FSMState(BaseModel):
     failure_count: int = Field(default=0, ge=0)
     created_at: datetime
     updated_at: datetime
+
+    # Context tracking fields (NEW - Task #69)
+    last_prompt: Optional[Dict[str, Any]] = Field(default=None)
+    inquiry_topic: Optional[str] = Field(default=None)
+    inquiry_entities: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator('created_at', 'updated_at')
     @classmethod
@@ -176,8 +208,65 @@ class FSMState(BaseModel):
         )
         self.updated_at = datetime.now(timezone.utc)
 
+    # Context tracking methods (NEW - Task #69)
+    def set_last_prompt(
+        self,
+        kind: str,
+        question: str,
+        **kwargs
+    ) -> None:
+        """
+        Set the last prompt for context tracking.
+
+        Args:
+            kind: Type of prompt (yes_no, confirmation, clarification)
+            question: Semantic identifier (booking_offer, slot_confirmation, etc.)
+            **kwargs: Additional context (text, slots, options, etc.)
+        """
+        self.last_prompt = {
+            "kind": kind,
+            "question": question,
+            "asked_at": datetime.now(timezone.utc).isoformat(),
+            **kwargs
+        }
+        self.updated_at = datetime.now(timezone.utc)
+
+    def clear_last_prompt(self) -> None:
+        """Clear last prompt context."""
+        self.last_prompt = None
+        self.updated_at = datetime.now(timezone.utc)
+
+    def get_prompt_kind(self) -> Optional[str]:
+        """Get the kind of last prompt (yes_no, confirmation, etc.)."""
+        return self.last_prompt.get("kind") if self.last_prompt else None
+
+    def get_prompt_question(self) -> Optional[str]:
+        """Get the semantic identifier of last question."""
+        return self.last_prompt.get("question") if self.last_prompt else None
+
+    def set_inquiry_context(
+        self,
+        topic: str,
+        entities: Dict[str, Any]
+    ) -> None:
+        """
+        Set inquiry context (when in information mode).
+
+        Args:
+            topic: Inquiry topic (pricing, hours, address, etc.)
+            entities: Extracted entities (service, etc.)
+        """
+        self.inquiry_topic = topic
+        self.inquiry_entities = entities
+        self.updated_at = datetime.now(timezone.utc)
+
+    def clear_inquiry_context(self) -> None:
+        """Clear inquiry context."""
+        self.inquiry_topic = None
+        self.inquiry_entities = {}
+        self.updated_at = datetime.now(timezone.utc)
+
     model_config = {
-        "use_enum_values": True,
         "json_schema_extra": {
             "examples": [
                 {

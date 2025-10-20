@@ -272,7 +272,7 @@ class HybridSearchService:
                     'p_limit': limit,
                     'p_min_score': 0.01,
                     'p_query': query,
-                    'p_session_id': session_id or ''  # Use empty string if no session_id
+                    'p_session_id': session_id  # Pass None instead of empty string to avoid UUID cast error
                 }
             ).execute()
 

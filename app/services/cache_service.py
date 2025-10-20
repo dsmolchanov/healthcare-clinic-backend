@@ -226,6 +226,11 @@ class CacheService:
                     # Continue to rebuild cache below
         except Exception as e:
             logger.warning(f"Cache read error for {clinic_id}: {type(e).__name__}: {e}")
+            # Delete potentially corrupted cache to force rebuild
+            try:
+                self.redis.delete(cache_key, gen_key)
+            except:
+                pass  # Ignore deletion errors
 
         # Cache miss - acquire lock to prevent stampede
         logger.debug(f"❌ Cache MISS: fetching bundle for clinic {clinic_id}")

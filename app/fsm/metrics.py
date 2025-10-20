@@ -133,6 +133,49 @@ fsm_slot_extraction_duration_seconds = Histogram(
 )
 
 # ==============================================================================
+# FALLBACK TRACKING METRICS (Task #74)
+# ==============================================================================
+
+fsm_fallback_total = Counter(
+    'fsm_fallback_total',
+    'Total fallback responses (should be 0 for known intents)',
+    ['state', 'intent', 'clinic_id'],
+    registry=fsm_registry
+)
+
+fsm_known_intent_fallback = Counter(
+    'fsm_known_intent_fallback',
+    'Known intents that fell to fallback (CRITICAL - should be 0)',
+    ['state', 'intent', 'clinic_id'],
+    registry=fsm_registry
+)
+
+# Intent distribution
+fsm_intent_detected = Counter(
+    'fsm_intent_detected',
+    'Total intents detected',
+    ['state', 'intent', 'topic', 'clinic_id'],
+    registry=fsm_registry
+)
+
+# Response type tracking
+fsm_response_type = Counter(
+    'fsm_response_type',
+    'Response generation method',
+    ['type', 'state', 'clinic_id'],  # type: template, fallback, llm, state_specific
+    registry=fsm_registry
+)
+
+# Response quality
+fsm_response_latency = Histogram(
+    'fsm_response_latency_seconds',
+    'Time to generate response',
+    ['response_type', 'state'],
+    registry=fsm_registry,
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0)
+)
+
+# ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
 
@@ -324,6 +367,108 @@ def record_intent_accuracy(intent: str, correct: bool, clinic_id: str):
     ).inc()
 
 
+def record_fallback_hit(state: str, intent: str, clinic_id: str):
+    """
+    Record when fallback response is used (Task #74).
+
+    Args:
+        state: Current conversation state
+        intent: Intent that triggered fallback
+        clinic_id: Clinic identifier
+
+    Example:
+        >>> record_fallback_hit("greeting", "unknown", "clinic_123")
+    """
+    fsm_fallback_total.labels(
+        state=state,
+        intent=intent,
+        clinic_id=clinic_id
+    ).inc()
+
+
+def record_known_intent_fallback(state: str, intent: str, clinic_id: str):
+    """
+    Record CRITICAL: Known intent fell to fallback (Task #74).
+
+    This should NEVER happen after Task #71. If this metric increases,
+    it indicates a regression.
+
+    Args:
+        state: Current conversation state
+        intent: Known intent that fell to fallback
+        clinic_id: Clinic identifier
+
+    Example:
+        >>> record_known_intent_fallback("greeting", "booking_intent", "clinic_123")
+    """
+    fsm_known_intent_fallback.labels(
+        state=state,
+        intent=intent,
+        clinic_id=clinic_id
+    ).inc()
+    logger.error(
+        f"🚨 CRITICAL: Known intent {intent} fell to fallback in state {state}! "
+        f"(clinic={clinic_id})"
+    )
+
+
+def record_intent_detection(
+    state: str,
+    intent: str,
+    topic: Optional[str],
+    clinic_id: str
+):
+    """
+    Record intent detection for distribution analysis (Task #74).
+
+    Args:
+        state: Current conversation state
+        intent: Detected intent
+        topic: Topic (for topic_change intents)
+        clinic_id: Clinic identifier
+
+    Example:
+        >>> record_intent_detection("greeting", "topic_change", "pricing", "clinic_123")
+    """
+    fsm_intent_detected.labels(
+        state=state,
+        intent=intent,
+        topic=topic or "none",
+        clinic_id=clinic_id
+    ).inc()
+
+
+def record_response_type(
+    response_type: str,
+    state: str,
+    clinic_id: str,
+    duration_seconds: Optional[float] = None
+):
+    """
+    Record how response was generated (Task #74).
+
+    Args:
+        response_type: One of: template, fallback, llm, state_specific
+        state: Current conversation state
+        clinic_id: Clinic identifier
+        duration_seconds: Response generation duration (optional)
+
+    Example:
+        >>> record_response_type("template", "greeting", "clinic_123", 0.05)
+    """
+    fsm_response_type.labels(
+        type=response_type,
+        state=state,
+        clinic_id=clinic_id
+    ).inc()
+
+    if duration_seconds is not None:
+        fsm_response_latency.labels(
+            response_type=response_type,
+            state=state
+        ).observe(duration_seconds)
+
+
 # ==============================================================================
 # METRICS EXPORT
 # ==============================================================================
@@ -379,6 +524,23 @@ def get_metrics_summary() -> dict:
             sample.value for sample in fsm_escalations_total.collect()[0].samples
         )
 
+        # Task #74 metrics
+        fallback_total = sum(
+            sample.value for sample in fsm_fallback_total.collect()[0].samples
+        )
+
+        known_intent_fallback_total = sum(
+            sample.value for sample in fsm_known_intent_fallback.collect()[0].samples
+        )
+
+        intent_detected_total = sum(
+            sample.value for sample in fsm_intent_detected.collect()[0].samples
+        )
+
+        response_type_total = sum(
+            sample.value for sample in fsm_response_type.collect()[0].samples
+        )
+
         return {
             'transitions': {
                 'total': int(transitions_total)
@@ -393,6 +555,16 @@ def get_metrics_summary() -> dict:
             },
             'escalations': {
                 'total': int(escalations_total)
+            },
+            'fallbacks': {
+                'total': int(fallback_total),
+                'known_intent_fallback': int(known_intent_fallback_total)  # Should be 0!
+            },
+            'intents': {
+                'detected': int(intent_detected_total)
+            },
+            'responses': {
+                'total': int(response_type_total)
             }
         }
     except Exception as e:

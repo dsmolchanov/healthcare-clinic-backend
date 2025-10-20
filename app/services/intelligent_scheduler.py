@@ -784,6 +784,79 @@ class IntelligentScheduler:
     async def _calculate_workload_balance_score(self, slot: TimeSlot, constraints: DoctorConstraints) -> float:
         return 0.6
 
+    async def find_available_slots(
+        self,
+        service_id: Optional[str] = None,
+        start_date: datetime = None,
+        end_date: datetime = None,
+        doctor_id: Optional[str] = None,
+        duration_minutes: int = 30,
+        strategy: SchedulingStrategy = SchedulingStrategy.AI_OPTIMIZED
+    ) -> List[Dict[str, Any]]:
+        """
+        Find available time slots for a service within a date range.
+        This method is called by ReservationTools and returns simple slot dictionaries.
+
+        Args:
+            service_id: Optional service ID (currently unused, for future use)
+            start_date: Start date for availability search
+            end_date: End date for availability search
+            doctor_id: Optional specific doctor ID
+            duration_minutes: Duration of the appointment in minutes
+            strategy: Scheduling strategy to use
+
+        Returns:
+            List of slot dictionaries with 'datetime', 'doctor_id', etc.
+        """
+        try:
+            if not start_date:
+                start_date = datetime.now()
+            if not end_date:
+                end_date = start_date + timedelta(days=7)
+
+            # Calculate days to search
+            days_to_search = (end_date - start_date).days + 1
+            days_to_search = min(days_to_search, 14)  # Limit to 2 weeks
+
+            # Get available slots using the unified appointment service
+            slots = []
+            for day_offset in range(days_to_search):
+                check_date = (start_date + timedelta(days=day_offset)).strftime('%Y-%m-%d')
+                try:
+                    # Use the appointment service directly
+                    day_slots = await self.appointment_service.get_available_slots(
+                        doctor_id=doctor_id,  # Pass None if not specified, not 'any'
+                        date=check_date,
+                        duration_minutes=duration_minutes
+                    )
+
+                    # Convert TimeSlot objects to dictionaries if needed
+                    for slot in day_slots:
+                        if hasattr(slot, 'start_time'):
+                            # It's a TimeSlot object
+                            slot_dict = {
+                                'datetime': slot.start_time.isoformat(),
+                                'doctor_id': slot.doctor_id if hasattr(slot, 'doctor_id') else doctor_id,
+                                'duration_minutes': duration_minutes,
+                                'available': True
+                            }
+                        elif isinstance(slot, dict):
+                            # Already a dictionary
+                            slot_dict = slot
+                        else:
+                            continue
+
+                        slots.append(slot_dict)
+                except Exception as e:
+                    logger.warning(f"Failed to get slots for {check_date}: {e}")
+                    continue
+
+            return slots
+
+        except Exception as e:
+            logger.error(f"Failed to find available slots: {e}")
+            return []
+
     async def get_smart_recommendations(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """
         Get smart scheduling recommendations for testing and direct API access

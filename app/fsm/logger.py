@@ -538,6 +538,94 @@ def log_booking_success(
 
 
 # ==============================================================================
+# FALLBACK LOGGING (Task #74)
+# ==============================================================================
+
+def log_fallback_hit(
+    conversation_id: str,
+    clinic_id: str,
+    state: str,
+    intent: str,
+    is_known_intent: bool
+):
+    """
+    Log fallback hit with structured data (Task #74).
+
+    Args:
+        conversation_id: Conversation identifier
+        clinic_id: Clinic identifier
+        state: Current state
+        intent: Intent that fell to fallback
+        is_known_intent: Whether this was a known intent (CRITICAL if True)
+
+    Example:
+        >>> log_fallback_hit(
+        ...     conversation_id="conv_123",
+        ...     clinic_id="clinic_001",
+        ...     state="greeting",
+        ...     intent="unknown_mumble",
+        ...     is_known_intent=False
+        ... )
+    """
+    severity = "ERROR" if is_known_intent else "WARNING"
+
+    log_data = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_type": "fsm_fallback",
+        "conversation_id_hash": hash_conversation_id(conversation_id),
+        "clinic_id": clinic_id,
+        "state": state,
+        "intent": intent,
+        "is_known_intent": is_known_intent,
+        "severity": severity
+    }
+
+    if is_known_intent:
+        logger.error(f"FSM Fallback: {json.dumps(log_data)}")
+    else:
+        logger.warning(f"FSM Fallback: {json.dumps(log_data)}")
+
+
+def log_response_type(
+    conversation_id: str,
+    clinic_id: str,
+    state: str,
+    response_type: str,
+    latency_ms: float
+):
+    """
+    Log response generation type and latency (Task #74).
+
+    Args:
+        conversation_id: Conversation identifier
+        clinic_id: Clinic identifier
+        state: Current state
+        response_type: One of: template, fallback, llm, state_specific
+        latency_ms: Response generation latency in milliseconds
+
+    Example:
+        >>> log_response_type(
+        ...     conversation_id="conv_123",
+        ...     clinic_id="clinic_001",
+        ...     state="greeting",
+        ...     response_type="template",
+        ...     latency_ms=52.3
+        ... )
+    """
+    log_data = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_type": "fsm_response",
+        "conversation_id_hash": hash_conversation_id(conversation_id),
+        "clinic_id": clinic_id,
+        "state": state,
+        "response_type": response_type,
+        "latency_ms": round(latency_ms, 2)
+    }
+
+    logger.info(f"FSM Response: {json.dumps(log_data)}")
+
+
+# ==============================================================================
 # SUMMARY LOGGING
 # ==============================================================================
 

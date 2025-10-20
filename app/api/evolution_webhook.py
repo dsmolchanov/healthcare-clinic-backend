@@ -37,14 +37,24 @@ if FSM_ENABLED:
     from ..fsm.intent_router import IntentRouter
     from ..fsm.slot_manager import SlotManager
     from ..fsm.state_handlers import StateHandler
+    from ..fsm.answer_service import AnswerService
     from ..fsm.redis_client import redis_client
     from ..fsm.models import FSMState, ConversationState
+    from supabase import create_client
+    from supabase.client import ClientOptions
+
+    # Get Supabase client for FSM components
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+    options = ClientOptions(schema='healthcare', auto_refresh_token=True, persist_session=False)
+    fsm_supabase = create_client(supabase_url, supabase_key, options=options)
 
     # Initialize FSM components
     fsm_manager = FSMManager()
     intent_router = IntentRouter()
     slot_manager = SlotManager()
-    state_handler = StateHandler(fsm_manager, intent_router, slot_manager)
+    answer_service = AnswerService(fsm_supabase)
+    state_handler = StateHandler(fsm_manager, intent_router, slot_manager, answer_service)
 
 @router.post("/{instance_name}")
 async def evolution_webhook(

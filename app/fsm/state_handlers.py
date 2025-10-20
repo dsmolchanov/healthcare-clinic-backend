@@ -11,6 +11,7 @@ Key Features:
 - Slot extraction and validation integration
 - Context-aware response generation
 - Immutable state updates using deep copy
+- Answer service integration for information queries
 
 State Flow:
     GREETING → COLLECTING_SLOTS → AWAITING_CONFIRMATION → BOOKING → COMPLETED
@@ -20,13 +21,21 @@ State Flow:
 from typing import Tuple
 import logging
 
-from .models import FSMState, ConversationState
+from .models import FSMState, ConversationState, IntentResult
 from .intent_router import Intent, IntentRouter
 from .slot_manager import SlotManager
 from .manager import FSMManager
+from .answer_service import AnswerService
 from .constants import SlotSource
-from .metrics import record_escalation
-from .logger import log_auto_escalation
+from .metrics import (
+    record_escalation,
+    record_fallback_hit,
+    record_known_intent_fallback,
+    record_intent_detection,
+    record_response_type
+)
+from .logger import log_auto_escalation, log_fallback_hit, log_response_type
+from .coverage import validate_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +61,8 @@ class StateHandler:
         self,
         fsm_manager: FSMManager,
         intent_router: IntentRouter,
-        slot_manager: SlotManager
+        slot_manager: SlotManager,
+        answer_service: AnswerService
     ):
         """
         Initialize StateHandler with dependencies.
@@ -61,55 +71,238 @@ class StateHandler:
             fsm_manager: FSM orchestration manager
             intent_router: Intent detection router
             slot_manager: Slot validation and evidence tracking
+            answer_service: Answer service for information queries
         """
         self.fsm = fsm_manager
         self.intent = intent_router
         self.slots = slot_manager
+        self.answers = answer_service
 
     async def handle_greeting(
         self,
         state: FSMState,
         message: str,
-        intent: str
+        intent: IntentResult
     ) -> Tuple[FSMState, str]:
         """
-        Handle GREETING state.
+        Handle GREETING state with full intent coverage.
 
-        Transitions to COLLECTING_SLOTS on booking intent or information.
-        Returns greeting response if user just says hello.
+        Supported intents:
+        - GREETING: Welcome message with booking offer
+        - BOOKING_INTENT/INFORMATION: Transition to COLLECTING_SLOTS
+        - TOPIC_CHANGE: Answer query via AnswerService
+        - DENY: Show help menu
+        - CONFIRM: Context-aware confirmation (if last_prompt set)
+        - Fallback: Only for truly unknown intents
 
         Args:
             state: Current FSM state
             message: User's message
-            intent: Detected intent
+            intent: Detected intent with topic/entities
 
         Returns:
             Tuple of (new_state, response_message)
-
-        Example:
-            >>> state, response = await handler.handle_greeting(
-            ...     state, "записаться", Intent.BOOKING_INTENT
-            ... )
-            >>> print(state.current_state)  # ConversationState.COLLECTING_SLOTS
         """
-        if intent == Intent.BOOKING_INTENT or intent == Intent.INFORMATION:
-            # User wants to book
+        # Record intent detection (Task #74)
+        record_intent_detection(
+            state=state.current_state.value,
+            intent=intent.label,
+            topic=intent.topic if hasattr(intent, 'topic') else None,
+            clinic_id=state.clinic_id
+        )
+
+        # 1) Handle TOPIC_CHANGE (pricing, hours, address, etc.)
+        if intent.label == Intent.TOPIC_CHANGE:
+            logger.info(
+                f"[Greeting] TOPIC_CHANGE detected: topic={intent.topic}, "
+                f"entities={intent.entities}"
+            )
+
+            # Store inquiry context for follow-up handling
+            state.set_inquiry_context(intent.topic, intent.entities)
+
+            # Route to appropriate AnswerService method
+            if intent.topic == "pricing":
+                response = await self.answers.answer_pricing(
+                    state.clinic_id,
+                    intent.entities
+                )
+            elif intent.topic == "hours":
+                response = await self.answers.answer_hours(state.clinic_id)
+            elif intent.topic == "address":
+                response = await self.answers.answer_address(state.clinic_id)
+            elif intent.topic == "phone":
+                response = await self.answers.answer_phone(state.clinic_id)
+            elif intent.topic == "services":
+                response = await self.answers.answer_services(state.clinic_id)
+            else:
+                # Unclassified topic
+                response = await self.answers.answer_general(
+                    state.clinic_id,
+                    message
+                )
+
+            # Set last_prompt for follow-up YES/NO
+            state.set_last_prompt(
+                kind="yes_no",
+                question="booking_after_info",
+                context={
+                    "topic": intent.topic,
+                    "entities": intent.entities
+                }
+            )
+
+            logger.info(
+                f"[Greeting] Answered {intent.topic} query, "
+                f"set prompt context for follow-up"
+            )
+
+            # Record response type: template (from AnswerService)
+            record_response_type("template", state.current_state.value, state.clinic_id)
+
+            return state, response
+
+        # 2) Handle DENY (user says "no" to implicit booking offer)
+        elif intent.label == Intent.DENY:
+            logger.info("[Greeting] DENY detected - showing help menu")
+
+            # Clear any previous prompt context
+            state.clear_last_prompt()
+
+            response = (
+                "Понятно. С чем могу помочь?\n\n"
+                "• Узнать цены на услуги\n"
+                "• Адрес и график работы\n"
+                "• Записаться на приём\n\n"
+                "Просто напишите, что вас интересует."
+            )
+
+            return state, response
+
+        # 3) Handle CONFIRM (context-aware)
+        elif intent.label == Intent.CONFIRM:
+            prompt_context = state.get_prompt_question()
+
+            if prompt_context == "booking_offer":
+                # User confirmed they want to book
+                logger.info("[Greeting] CONFIRM → booking_offer, transitioning to COLLECTING_SLOTS")
+
+                new_state = await self.fsm.transition_state(
+                    state,
+                    ConversationState.COLLECTING_SLOTS,
+                    intent="booking_intent"
+                )
+
+                state.clear_last_prompt()
+
+                return new_state, "Отлично! К какому доктору хотите записаться?"
+
+            elif prompt_context == "booking_after_info":
+                # User confirmed after getting info (pricing, hours, etc.)
+                logger.info(
+                    f"[Greeting] CONFIRM → booking_after_info "
+                    f"(after {state.inquiry_topic} query)"
+                )
+
+                new_state = await self.fsm.transition_state(
+                    state,
+                    ConversationState.COLLECTING_SLOTS,
+                    intent="booking_intent"
+                )
+
+                state.clear_last_prompt()
+                state.clear_inquiry_context()
+
+                return new_state, "Отлично! К какому доктору хотите записаться?"
+
+            else:
+                # Confirmation without clear context
+                logger.warning(
+                    f"[Greeting] CONFIRM without clear context: "
+                    f"prompt_context={prompt_context}"
+                )
+
+                response = "На что вы ответили 'да'? Уточните, пожалуйста."
+                return state, response
+
+        # 4) Handle BOOKING_INTENT or INFORMATION (existing logic)
+        elif intent.label == Intent.BOOKING_INTENT or intent.label == Intent.INFORMATION:
+            logger.info("[Greeting] BOOKING_INTENT detected, transitioning to COLLECTING_SLOTS")
+
             new_state = await self.fsm.transition_state(
                 state,
-                ConversationState.COLLECTING_SLOTS
+                ConversationState.COLLECTING_SLOTS,
+                intent="booking_intent"
             )
+
             response = "Хорошо! К какому доктору вы хотите записаться?"
-            logger.info(f"Conversation {state.conversation_id}: GREETING → COLLECTING_SLOTS")
             return new_state, response
-        elif intent == Intent.GREETING:
-            # Just greeting, ask what they want
+
+        # 5) Handle GREETING (existing logic with prompt tracking)
+        elif intent.label == Intent.GREETING:
+            logger.debug("[Greeting] Greeting acknowledged, offering help")
+
+            # Set last_prompt so follow-up YES/NO is understood
+            state.set_last_prompt(
+                kind="yes_no",
+                question="booking_offer",
+                text="Хотите записаться на приём?"
+            )
+
             response = "Здравствуйте! Чем могу помочь? Хотите записаться на приём?"
-            logger.debug(f"Conversation {state.conversation_id}: Greeting acknowledged")
             return state, response
+
+        # 6) Fallback (ONLY for truly unknown intents)
         else:
-            # Unclear, ask for clarification
-            response = "Извините, я не понял. Вы хотите записаться на приём к доктору?"
-            logger.debug(f"Conversation {state.conversation_id}: Unclear greeting intent")
+            logger.warning(
+                f"[Greeting] Unknown intent: {intent.label}, "
+                f"falling back to help menu"
+            )
+
+            # Record fallback metrics (Task #74)
+            record_fallback_hit(
+                state=state.current_state.value,
+                intent=intent.label,
+                clinic_id=state.clinic_id
+            )
+
+            # Check if this was a KNOWN intent that fell to fallback (CRITICAL)
+            if validate_coverage(state.current_state, intent.label):
+                record_known_intent_fallback(
+                    state=state.current_state.value,
+                    intent=intent.label,
+                    clinic_id=state.clinic_id
+                )
+                # Structured logging
+                log_fallback_hit(
+                    conversation_id=state.conversation_id,
+                    clinic_id=state.clinic_id,
+                    state=state.current_state.value,
+                    intent=intent.label,
+                    is_known_intent=True
+                )
+            else:
+                # Unknown intent fallback (acceptable)
+                log_fallback_hit(
+                    conversation_id=state.conversation_id,
+                    clinic_id=state.clinic_id,
+                    state=state.current_state.value,
+                    intent=intent.label,
+                    is_known_intent=False
+                )
+
+            # Response type: fallback
+            record_response_type("fallback", state.current_state.value, state.clinic_id)
+
+            # Even unknown intents get a helpful menu, not "didn't understand"
+            response = (
+                "Могу помочь с:\n"
+                "• Ценами на услуги\n"
+                "• Графиком работы и адресом\n"
+                "• Записью на приём\n\n"
+                "Что вас интересует?"
+            )
+
             return state, response
 
     async def handle_collecting_slots(
