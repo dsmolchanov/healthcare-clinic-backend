@@ -250,7 +250,7 @@ class WhatsAppClinicCache:
                 clinic_id=clinic_id,
                 organization_id=integration['organization_id'],
                 name=clinic_name,
-                instance_name=config.get('instance'),  # For backwards compat
+                instance_name=config.get('instance_name'),  # Use standard key
                 phone_number=integration.get('phone_number')
             )
 
@@ -258,7 +258,7 @@ class WhatsAppClinicCache:
                 "clinic_id": clinic_id,
                 "organization_id": integration['organization_id'],
                 "name": clinic_name,
-                "instance_name": config.get('instance'),
+                "instance_name": config.get('instance_name'),
                 "phone_number": integration.get('phone_number'),
                 "webhook_token": webhook_token
             }
@@ -309,7 +309,7 @@ class WhatsAppClinicCache:
                     clinic_id = integration.get('clinic_id')
                     org_id = integration.get('organization_id')
                     config = integration.get('config', {})
-                    instance_name = config.get('instance')
+                    instance_name = config.get('instance_name')
                     webhook_token = integration.get('webhook_token')
 
                     if not webhook_token:

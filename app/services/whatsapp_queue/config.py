@@ -28,6 +28,10 @@ BUCKET_CAPACITY = int(os.getenv("WA_BUCKET_CAPACITY", "5"))  # allow burst of 5 
 # HTTP timeouts
 EVOLUTION_HTTP_TIMEOUT = float(os.getenv("WA_EVOLUTION_HTTP_TIMEOUT", "15.0"))  # seconds
 
+# Instance change notification channels
+INSTANCE_ADDED_CHANNEL = "wa:instances:added"
+INSTANCE_REMOVED_CHANNEL = "wa:instances:removed"
+
 # Logging configuration
 logger = logging.getLogger("whatsapp_queue")
 logger.setLevel(logging.INFO)

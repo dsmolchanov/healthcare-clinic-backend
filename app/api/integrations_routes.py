@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ..database import get_db_connection
 from ..evolution_api import EvolutionAPIClient
+from ..services.whatsapp_queue.pubsub import InstanceNotifier
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 
@@ -71,6 +72,43 @@ async def list_integrations(
             all_integrations.extend(result.data)
         except Exception as e:
             print(f"Public integrations query error (non-fatal): {e}")
+
+        # Get WhatsApp/Evolution integrations from healthcare schema
+        try:
+            healthcare_options = ClientOptions(schema='healthcare')
+            healthcare_supabase = create_client(
+                os.getenv("SUPABASE_URL"),
+                os.getenv("SUPABASE_SERVICE_ROLE_KEY"),
+                healthcare_options
+            )
+
+            # Get WhatsApp integrations
+            query = healthcare_supabase.from_('integrations').select('*')
+            if organization_id:
+                query = query.eq("organization_id", organization_id)
+            query = query.eq("type", "whatsapp")
+
+            result = query.execute()
+
+            # Add WhatsApp integrations to list
+            for integration in result.data:
+                all_integrations.append({
+                    'id': integration.get('id'),
+                    'organization_id': integration.get('organization_id'),
+                    'integration_type': 'whatsapp',
+                    'provider': integration.get('provider', 'evolution'),
+                    'status': integration.get('status', 'pending'),
+                    'display_name': 'WhatsApp Integration',
+                    'description': 'Evolution API WhatsApp integration',
+                    'is_enabled': integration.get('enabled', False),
+                    'config': integration.get('config', {}),
+                    'webhook_token': integration.get('webhook_token'),
+                    'webhook_url': integration.get('webhook_url'),
+                    'created_at': integration.get('created_at'),
+                    'updated_at': integration.get('updated_at')
+                })
+        except Exception as e:
+            print(f"Healthcare WhatsApp integrations query error (non-fatal): {e}")
 
         # Get calendar integrations ONLY from healthcare schema
         try:
@@ -202,10 +240,32 @@ async def update_integration(integration_id: str, update: IntegrationUpdate):
         if update.status is not None:
             data["status"] = update.status
 
+        # Get integration before update to check if it's being disabled
+        integration_before = public_supabase.table("integrations").select("*").eq("id", integration_id).execute()
+        if not integration_before.data:
+            raise HTTPException(status_code=404, detail="Integration not found")
+
         result = public_supabase.table("integrations").update(data).eq("id", integration_id).execute()
         if not result.data:
             raise HTTPException(status_code=404, detail="Integration not found")
-        return result.data[0]
+
+        # Notify workers if WhatsApp integration was disabled
+        updated_integration = result.data[0]
+        if (update.enabled is False and
+            updated_integration.get('type') == 'whatsapp' and
+            updated_integration.get('provider') == 'evolution'):
+            try:
+                config = updated_integration.get('config', {})
+                instance_name = config.get('instance_name')
+                org_id = updated_integration.get('organization_id')
+
+                if instance_name and org_id:
+                    notifier = InstanceNotifier()
+                    notifier.notify_removed(instance_name, org_id)
+            except Exception as notify_error:
+                print(f"Warning: Failed to notify workers about disabled instance: {notify_error}")
+
+        return updated_integration
     except Exception as e:
         print(f"Error updating integration: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -243,6 +303,9 @@ async def test_integration(integration_id: str):
 async def create_evolution_instance(data: EvolutionInstanceCreate):
     """Create a new Evolution API instance for WhatsApp"""
     try:
+        from ..main import supabase
+        import uuid as uuid_lib
+
         # Initialize Evolution API client using async context manager
         async with EvolutionAPIClient() as evolution_client:
             # Create the instance
@@ -251,12 +314,37 @@ async def create_evolution_instance(data: EvolutionInstanceCreate):
                 instance_name=data.instance_name
             )
 
-            # The QR code is now included in the create_instance response
-            # No need for a separate call
+            # Save integration to database immediately using RPC
+            if result.get("success"):
+                try:
+                    webhook_url = result.get("webhook_url", f"{os.getenv('EVOLUTION_SERVER_URL', 'https://evolution-api-prod.fly.dev')}/webhook/{data.instance_name}")
+
+                    db_result = supabase.rpc('save_evolution_integration', {
+                        'p_organization_id': data.organization_id,
+                        'p_instance_name': data.instance_name,
+                        'p_phone_number': None,  # Not connected yet
+                        'p_webhook_url': webhook_url
+                    }).execute()
+
+                    print(f"Created database record for {data.instance_name}: {db_result.data}")
+                    result["integration_saved"] = True
+
+                    # Notify workers about new instance
+                    try:
+                        notifier = InstanceNotifier()
+                        notifier.notify_added(data.instance_name, data.organization_id)
+                    except Exception as notify_error:
+                        print(f"Warning: Failed to notify workers about new instance: {notify_error}")
+
+                except Exception as db_error:
+                    print(f"Warning: Failed to save integration to database: {db_error}")
+                    result["integration_saved"] = False
 
             return result
     except Exception as e:
         print(f"Error creating Evolution instance: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/evolution/status/{instance_name}")
@@ -270,23 +358,31 @@ async def get_evolution_status(instance_name: str):
         # Use our more reliable connection detection
         status = await get_real_connection_status(instance_name)
 
-        # Only save integration if truly connected with a phone number
+        # Update database if connected
         if status.get("is_truly_connected"):
-            # Extract organization_id from instance_name (format: clinic-{org_id}-{timestamp})
-            parts = instance_name.split('-')
-            if len(parts) >= 2:
-                # Get organization_id from the instance name
-                org_id = '-'.join(parts[1:-1])  # Extract UUID portion
+            try:
+                # Find existing integration by instance name
+                result = supabase.schema("healthcare").table("integrations").select("*").eq(
+                    "config->>instance_name", instance_name
+                ).eq("type", "whatsapp").execute()
 
-                # Use RPC function to save Evolution integration
-                result = supabase.rpc('save_evolution_integration', {
-                    'p_organization_id': org_id,
-                    'p_instance_name': instance_name,
-                    'p_phone_number': status.get('phone_number'),
-                    'p_webhook_url': f"{os.getenv('EVOLUTION_SERVER_URL', 'https://evolution-api-prod.fly.dev')}/webhook/{instance_name}"
-                }).execute()
+                # If found, update it
+                if result.data and len(result.data) > 0:
+                    org_id = result.data[0]["organization_id"]
 
-                print(f"Saved WhatsApp integration for organization {org_id}: {result.data}")
+                    # Use RPC to update
+                    supabase.rpc('save_evolution_integration', {
+                        'p_organization_id': org_id,
+                        'p_instance_name': instance_name,
+                        'p_phone_number': status.get('phone_number'),
+                        'p_webhook_url': f"{os.getenv('EVOLUTION_SERVER_URL', 'https://evolution-api-prod.fly.dev')}/webhook/{instance_name}"
+                    }).execute()
+
+                    print(f"Updated WhatsApp integration for organization {org_id}")
+            except Exception as db_error:
+                print(f"Warning: Failed to update database: {db_error}")
+                import traceback
+                traceback.print_exc()
 
         return status
     except Exception as e:

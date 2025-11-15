@@ -84,12 +84,12 @@ async def main():
                     logger.info(f"Found {len(integration_result.data)} active WhatsApp integration(s)")
                     for idx, integration in enumerate(integration_result.data):
                         config = integration.get('config', {})
-                        inst = config.get('instance')
+                        inst = config.get('instance_name')
                         logger.info(f"  [{idx}] Instance: {inst}, Org: {integration.get('organization_id')}")
 
                     # Use the first enabled integration
                     config = integration_result.data[0].get('config', {})
-                    instance_name = config.get('instance')
+                    instance_name = config.get('instance_name')
                     if instance_name:
                         logger.info(f"✅ Selected instance: {instance_name}")
                     else:
@@ -113,14 +113,14 @@ async def main():
                         instance_name = result.data[0]['instance_name']
                         logger.info(f"✅ Selected most recent: {instance_name}")
                     else:
-                        # Final fallback to hardcoded default
-                        instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1760994893945"
+                        # Final fallback to hardcoded default (updated to current instance)
+                        instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1763141478931"
                         logger.warning(f"⚠️ No active instances found, using current fallback: {instance_name}")
 
             except Exception as e:
                 logger.error(f"Failed to auto-detect instance: {e}", exc_info=True)
-                # Fallback to current default (updated)
-                instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1760994893945"
+                # Fallback to current default (updated to current instance)
+                instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1763141478931"
                 logger.warning(f"Using fallback instance: {instance_name}")
 
     logger.info("="*80)
