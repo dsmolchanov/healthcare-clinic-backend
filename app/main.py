@@ -297,6 +297,10 @@ app.include_router(knowledge_routes.router)
 from app.api import integrations_routes
 app.include_router(integrations_routes.router)
 
+# Include maintenance routes for system cleanup and health checks
+from app.api import maintenance_routes
+app.include_router(maintenance_routes.router)
+
 # Include Evolution mock for testing (temporary until Evolution API is deployed)
 from app.api import evolution_mock
 

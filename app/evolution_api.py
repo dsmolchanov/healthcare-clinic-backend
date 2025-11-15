@@ -169,6 +169,48 @@ class EvolutionAPIClient:
             logger.error(f"Failed to get QR code: {e}")
             return None
 
+    async def fetch_all_instances(self) -> List[Dict[str, Any]]:
+        """
+        Fetch all Evolution instances
+
+        Returns:
+            List of instance objects
+        """
+        try:
+            result = await self._make_request("GET", "/instance/fetchInstances")
+            # Evolution returns array of instance objects
+            return result if result else []
+
+        except Exception as e:
+            logger.error(f"Failed to fetch all instances: {e}")
+            return []
+
+    async def get_instance_status(self, instance_name: str) -> Dict[str, Any]:
+        """
+        Check if an instance exists in Evolution API
+
+        Returns:
+            dict with 'exists' boolean and optionally 'status' info
+        """
+        try:
+            result = await self._make_request("GET", f"/instance/fetchInstances?instanceName={instance_name}")
+
+            # Evolution returns array of instances
+            if result and len(result) > 0:
+                instance_info = result[0].get("instance", {})
+                return {
+                    "exists": True,
+                    "instance_name": instance_info.get("instanceName", instance_name),
+                    "status": instance_info.get("status", "unknown")
+                }
+            else:
+                return {"exists": False}
+
+        except Exception as e:
+            logger.error(f"Failed to check instance status: {e}")
+            # If we can't check, assume it doesn't exist
+            return {"exists": False, "error": str(e)}
+
     async def get_connection_status(self, instance_name: str) -> Dict[str, Any]:
         """Check connection status of an instance"""
         try:

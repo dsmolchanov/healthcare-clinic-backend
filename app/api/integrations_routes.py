@@ -296,22 +296,43 @@ async def delete_integration(integration_id: str):
             # It's a healthcare integration (WhatsApp/Evolution)
             integration = healthcare_result.data[0]
 
-            # Notify workers if it's a WhatsApp integration
+            # PREVENTION STRATEGY 1: Delete Evolution instance before deleting database record
             if integration.get('type') == 'whatsapp' and integration.get('provider') == 'evolution':
-                try:
-                    config = integration.get('config', {})
-                    instance_name = config.get('instance_name')
-                    org_id = integration.get('organization_id')
+                config = integration.get('config', {})
+                instance_name = config.get('instance_name')
+                org_id = integration.get('organization_id')
 
-                    if instance_name and org_id:
-                        notifier = InstanceNotifier()
-                        notifier.notify_removed(instance_name, org_id)
-                except Exception as notify_error:
-                    print(f"Warning: Failed to notify workers about deleted instance: {notify_error}")
+                if instance_name:
+                    # Step 1: Delete Evolution instance first
+                    try:
+                        async with EvolutionAPIClient() as evolution_client:
+                            await evolution_client.delete_instance(instance_name)
+                            print(f"✅ Deleted Evolution instance: {instance_name}")
+                    except Exception as evolution_error:
+                        print(f"⚠️  Warning: Failed to delete Evolution instance {instance_name}: {evolution_error}")
+                        # Continue with database deletion even if Evolution deletion fails
 
-            # Delete from healthcare schema
+                    # Step 2: Notify workers about removal
+                    try:
+                        if org_id:
+                            notifier = InstanceNotifier()
+                            notifier.notify_removed(instance_name, org_id)
+                            print(f"✅ Notified workers about instance removal: {instance_name}")
+                    except Exception as notify_error:
+                        print(f"⚠️  Warning: Failed to notify workers: {notify_error}")
+
+                    # Step 3: Invalidate cache
+                    try:
+                        from ..services.whatsapp_clinic_cache import get_whatsapp_clinic_cache
+                        cache = get_whatsapp_clinic_cache()
+                        await cache.invalidate_instance(instance_name)
+                        print(f"✅ Invalidated cache for instance: {instance_name}")
+                    except Exception as cache_error:
+                        print(f"⚠️  Warning: Failed to invalidate cache: {cache_error}")
+
+            # Step 4: Delete from healthcare schema
             delete_result = healthcare_supabase.from_('integrations').delete().eq('id', integration_id).execute()
-            return {"deleted": True, "schema": "healthcare"}
+            return {"deleted": True, "schema": "healthcare", "instance_cleaned_up": True}
 
         # Try public schema if not found in healthcare
         result = public_supabase.table("integrations").delete().eq("id", integration_id).execute()
@@ -337,6 +358,54 @@ async def create_evolution_instance(data: EvolutionInstanceCreate):
     try:
         from ..main import supabase
         import uuid as uuid_lib
+
+        # PREVENTION STRATEGY 2: Check for existing integration and orphaned instances
+        try:
+            existing = supabase.schema("healthcare").table("integrations").select("*").eq(
+                "organization_id", data.organization_id
+            ).eq("type", "whatsapp").eq("provider", "evolution").eq("enabled", True).execute()
+
+            if existing.data and len(existing.data) > 0:
+                existing_instance = existing.data[0]
+                instance_name = existing_instance.get("config", {}).get("instance_name")
+
+                # Check if the instance still exists in Evolution
+                async with EvolutionAPIClient() as evolution_client:
+                    try:
+                        status = await evolution_client.get_instance_status(instance_name)
+
+                        if status.get("exists"):
+                            # Instance exists in both DB and Evolution - return existing
+                            print(f"✅ Found existing instance in DB and Evolution: {instance_name}")
+                            return {
+                                "success": True,
+                                "instance_name": instance_name,
+                                "reused": True,
+                                "status": existing_instance.get("status"),
+                                "message": "Reusing existing WhatsApp integration",
+                                "qrcode": None  # Frontend will call /status to get QR if needed
+                            }
+                        else:
+                            # Instance in DB but not in Evolution (orphaned DB record)
+                            print(f"⚠️  Found orphaned DB record for {instance_name} - cleaning up")
+                            supabase.schema("healthcare").table("integrations").delete().eq(
+                                "id", existing_instance["id"]
+                            ).execute()
+                            print(f"✅ Cleaned up orphaned database record")
+                            # Continue to create new instance
+                    except Exception as evolution_check_error:
+                        print(f"Warning: Failed to check Evolution status: {evolution_check_error}")
+                        # If we can't check Evolution, assume existing instance is valid
+                        return {
+                            "success": False,
+                            "error": "WhatsApp integration already exists for this organization",
+                            "existing_instance": instance_name,
+                            "existing_status": existing_instance.get("status"),
+                            "message": "Please delete the existing integration before creating a new one"
+                        }
+        except Exception as check_error:
+            print(f"Warning: Failed to check for existing integration: {check_error}")
+            # Continue anyway - RPC has its own check
 
         # Initialize Evolution API client using async context manager
         async with EvolutionAPIClient() as evolution_client:
@@ -507,12 +576,89 @@ async def update_evolution_organization(integration_id: str, new_organization_id
 
 @router.delete("/evolution/{instance_name}")
 async def delete_evolution_instance(instance_name: str):
-    """Delete an Evolution instance"""
+    """Delete an Evolution instance completely from all storage locations"""
+    import logging
+    logger = logging.getLogger(__name__)
+
     try:
-        async with EvolutionAPIClient() as evolution_client:
-            result = await evolution_client.delete_instance(instance_name)
-            return result
+        from ..main import supabase
+        from ..services.whatsapp_clinic_cache import WhatsAppClinicCache
+
+        # Initialize results
+        results = {
+            "success": True,
+            "instance": instance_name,
+            "evolution_deleted": False,
+            "database_deleted": False,
+            "cache_invalidated": False,
+            "workers_notified": False,
+            "errors": []
+        }
+
+        # 1. Get integration info from database (before deleting)
+        organization_id = None
+        try:
+            db_query = supabase.schema("healthcare").table("integrations").select("*").eq(
+                "config->>instance_name", instance_name
+            ).eq("type", "whatsapp").execute()
+
+            if db_query.data and len(db_query.data) > 0:
+                organization_id = db_query.data[0].get("organization_id")
+                logger.info(f"Found integration for instance {instance_name}, org: {organization_id}")
+        except Exception as e:
+            logger.error(f"Error querying integration: {e}")
+            results["errors"].append(f"Database query error: {str(e)}")
+
+        # 2. Delete from Evolution API
+        try:
+            async with EvolutionAPIClient() as evolution_client:
+                evo_result = await evolution_client.delete_instance(instance_name)
+                results["evolution_deleted"] = evo_result.get("success", False)
+                logger.info(f"Evolution API delete result: {evo_result}")
+        except Exception as e:
+            logger.error(f"Error deleting from Evolution API: {e}")
+            results["errors"].append(f"Evolution API error: {str(e)}")
+            results["success"] = False
+
+        # 3. Delete from database
+        try:
+            db_delete = supabase.schema("healthcare").table("integrations").delete().eq(
+                "config->>instance_name", instance_name
+            ).eq("type", "whatsapp").execute()
+
+            results["database_deleted"] = db_delete.data and len(db_delete.data) > 0
+            logger.info(f"Database delete result: deleted {len(db_delete.data) if db_delete.data else 0} records")
+        except Exception as e:
+            logger.error(f"Error deleting from database: {e}")
+            results["errors"].append(f"Database delete error: {str(e)}")
+
+        # 4. Invalidate Redis cache
+        try:
+            cache = WhatsAppClinicCache()
+            await cache.invalidate_instance(instance_name)
+            results["cache_invalidated"] = True
+            logger.info(f"Invalidated cache for instance {instance_name}")
+        except Exception as e:
+            logger.error(f"Error invalidating cache: {e}")
+            results["errors"].append(f"Cache invalidation error: {str(e)}")
+
+        # 5. Notify workers about instance removal
+        try:
+            notifier = InstanceNotifier()
+            if organization_id:
+                notifier.notify_removed(instance_name, organization_id)
+                results["workers_notified"] = True
+                logger.info(f"Notified workers about instance removal: {instance_name}")
+        except Exception as e:
+            logger.error(f"Error notifying workers: {e}")
+            results["errors"].append(f"Worker notification error: {str(e)}")
+
+        return results
+
     except Exception as e:
+        logger.error(f"Unexpected error deleting instance {instance_name}: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/calendar/{integration_id}/sync")
