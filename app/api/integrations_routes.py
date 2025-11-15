@@ -272,10 +272,9 @@ async def update_integration(integration_id: str, update: IntegrationUpdate):
 
 @router.delete("/{integration_id}")
 async def delete_integration(integration_id: str):
-    """Delete an integration"""
+    """Delete an integration (checks both public and healthcare schemas)"""
     try:
-        # Create a public schema client for integrations table
-        from supabase import create_client
+        from supabase import create_client, ClientOptions
         import os
 
         public_supabase = create_client(
@@ -283,8 +282,41 @@ async def delete_integration(integration_id: str):
             os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         )
 
+        healthcare_options = ClientOptions(schema='healthcare')
+        healthcare_supabase = create_client(
+            os.getenv("SUPABASE_URL"),
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY"),
+            healthcare_options
+        )
+
+        # First check healthcare schema (for Evolution/WhatsApp integrations)
+        healthcare_result = healthcare_supabase.from_('integrations').select('*').eq('id', integration_id).execute()
+
+        if healthcare_result.data:
+            # It's a healthcare integration (WhatsApp/Evolution)
+            integration = healthcare_result.data[0]
+
+            # Notify workers if it's a WhatsApp integration
+            if integration.get('type') == 'whatsapp' and integration.get('provider') == 'evolution':
+                try:
+                    config = integration.get('config', {})
+                    instance_name = config.get('instance_name')
+                    org_id = integration.get('organization_id')
+
+                    if instance_name and org_id:
+                        notifier = InstanceNotifier()
+                        notifier.notify_removed(instance_name, org_id)
+                except Exception as notify_error:
+                    print(f"Warning: Failed to notify workers about deleted instance: {notify_error}")
+
+            # Delete from healthcare schema
+            delete_result = healthcare_supabase.from_('integrations').delete().eq('id', integration_id).execute()
+            return {"deleted": True, "schema": "healthcare"}
+
+        # Try public schema if not found in healthcare
         result = public_supabase.table("integrations").delete().eq("id", integration_id).execute()
-        return {"deleted": True}
+        return {"deleted": True, "schema": "public"}
+
     except Exception as e:
         print(f"Error deleting integration: {e}")
         raise HTTPException(status_code=500, detail=str(e))
