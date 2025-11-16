@@ -71,8 +71,8 @@ class AppointmentHoldService:
             'clinic_id': clinic_id,
             'doctor_id': doctor_id,
             'patient_phone': patient_phone,
-            'start_ts': start_time.isoformat(),
-            'end_ts': end_time.isoformat(),
+            'start_time': start_time.isoformat(),
+            'end_time': end_time.isoformat(),
             'hold_expires_at': hold_expires_at.isoformat(),
             'conversation_id': conversation_id,
             'booking_request_id': booking_request_id,
@@ -195,9 +195,9 @@ class AppointmentHoldService:
         ).in_(
             'status', ['held', 'reserved']
         ).gte(
-            'start_ts', start_time.isoformat()
+            'start_time', start_time.isoformat()
         ).lt(
-            'end_ts', end_time.isoformat()
+            'end_time', end_time.isoformat()
         ).execute()
 
         if holds.data:
