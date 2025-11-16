@@ -803,10 +803,10 @@ async def get_ai_response_with_rag(user_message: str, from_number: str, clinic_i
 
 async def send_whatsapp_via_evolution(instance_name: str, to_number: str, text: str) -> bool:
     """
-    Queue WhatsApp message for async sending with 1s timeout cap.
+    Write WhatsApp message to outbox for async processing by OutboxProcessor worker.
 
-    This function enqueues the message to Redis with a timeout. If queueing
-    takes >1s, we return anyway and let the background task finish.
+    This function writes the message to the database outbox table with a timeout cap.
+    The OutboxProcessor worker will pick it up and deliver it asynchronously.
 
     Args:
         instance_name: WhatsApp instance name
@@ -814,47 +814,47 @@ async def send_whatsapp_via_evolution(instance_name: str, to_number: str, text: 
         text: Message text content
 
     Returns:
-        True if message was successfully queued (or likely queued), False on immediate error
+        True if message was successfully written to outbox, False on immediate error
     """
-    from app.services.whatsapp_queue import enqueue_message
+    from app.services.outbox_service import write_to_outbox
     import uuid
 
     message_id = str(uuid.uuid4())
 
-    print(f"[SendMessage] Queueing message {message_id} for {to_number}")
+    print(f"[SendMessage] Writing message {message_id} to outbox for {to_number}")
     print(f"[SendMessage] Instance: {instance_name}")
     print(f"[SendMessage] Text length: {len(text)} chars")
     print(f"[SendMessage] Text preview: {text[:100]}...")
 
-    async def _enqueue():
+    async def _write_to_outbox():
         try:
-            # Queue the message (non-blocking, returns immediately)
-            success = await enqueue_message(
-                instance=instance_name,
+            # Write to outbox table (returns immediately)
+            success = await write_to_outbox(
+                instance_name=instance_name,
                 to_number=to_number,
-                text=text,
+                text_content=text,
                 message_id=message_id
             )
 
             if success:
-                print(f"[SendMessage] ✅ Message queued successfully (id: {message_id})")
+                print(f"[SendMessage] ✅ Message written to outbox (id: {message_id})")
                 return True
             else:
-                print(f"[SendMessage] ❌ Failed to queue message")
+                print(f"[SendMessage] ❌ Failed to write message to outbox")
                 return False
 
         except Exception as e:
-            print(f"[SendMessage] ❌ Queue error: {e}")
+            print(f"[SendMessage] ❌ Outbox write error: {e}")
             import traceback
             print(f"[SendMessage] Traceback: {traceback.format_exc()[:300]}")
             return False
 
     try:
-        # Cap queueing at 1s - don't block on slow Redis
-        return await asyncio.wait_for(_enqueue(), timeout=1.0)
+        # Cap write operation at 1s - don't block on slow database
+        return await asyncio.wait_for(_write_to_outbox(), timeout=1.0)
     except asyncio.TimeoutError:
-        print(f"[SendMessage] ⚠️ Queue operation timed out (>1s), continuing")
-        # Return True optimistically - the background task will finish
+        print(f"[SendMessage] ⚠️ Outbox write timed out (>1s), continuing")
+        # Return True optimistically - the write may still complete
         return True
 
 

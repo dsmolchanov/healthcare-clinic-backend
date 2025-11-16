@@ -142,6 +142,28 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to start calendar sync worker: {str(e)}")
         # Don't fail startup, but log the issue
 
+    # Start outbox processor worker for async message delivery
+    try:
+        from app.workers.outbox_processor import OutboxProcessor
+        outbox_processor = OutboxProcessor()
+        asyncio.create_task(outbox_processor.start())
+        app.state.outbox_processor = outbox_processor
+        logger.info("✅ Outbox processor worker started")
+    except Exception as e:
+        logger.error(f"Failed to start outbox processor: {str(e)}")
+        # Don't fail startup, but log the issue
+
+    # Start failed confirmation escalation worker
+    try:
+        from app.workers.failed_confirmation_escalation import FailedConfirmationEscalation
+        escalation_worker = FailedConfirmationEscalation()
+        asyncio.create_task(escalation_worker.start())
+        app.state.escalation_worker = escalation_worker
+        logger.info("✅ Failed confirmation escalation worker started")
+    except Exception as e:
+        logger.error(f"Failed to start escalation worker: {str(e)}")
+        # Don't fail startup, but log the issue
+
     # Initialize Redis for FSM (if FSM is enabled)
     fsm_enabled = os.getenv('ENABLE_FSM', 'false').lower() == 'true'
     if fsm_enabled:
@@ -230,6 +252,22 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Calendar sync worker stopped")
     except Exception as e:
         logger.error(f"Error stopping calendar sync worker: {str(e)}")
+
+    # Stop outbox processor worker
+    try:
+        if hasattr(app.state, 'outbox_processor'):
+            await app.state.outbox_processor.stop()
+            logger.info("✅ Outbox processor worker stopped")
+    except Exception as e:
+        logger.error(f"Error stopping outbox processor: {str(e)}")
+
+    # Stop escalation worker
+    try:
+        if hasattr(app.state, 'escalation_worker'):
+            await app.state.escalation_worker.stop()
+            logger.info("✅ Escalation worker stopped")
+    except Exception as e:
+        logger.error(f"Error stopping escalation worker: {str(e)}")
 
     if hasattr(app.state, 'http_client') and app.state.http_client:
         await app.state.http_client.aclose()
