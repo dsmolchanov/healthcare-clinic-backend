@@ -30,15 +30,17 @@ async def get_real_connection_status(instance_name: str) -> Dict[str, Any]:
                     # Map Evolution states to simpler states
                     if state == "open":
                         connection_state = "connected"
+                        # Get phone number from instance data
+                        phone_number = instance.get("number") or instance.get("phoneNumber") or instance.get("wuid")
                     elif state == "connecting":
-                        connection_state = "qr"  # Waiting for QR scan
+                        connection_state = "connecting"
                     else:
                         connection_state = "disconnected"
         except Exception as e:
             print(f"Error checking connection state: {e}")
             connection_state = "disconnected"
 
-        # Check if truly connected (has phone number)
+        # Check if truly connected (has connection state and optionally phone number)
         is_truly_connected = connection_state == "connected"
 
         return {

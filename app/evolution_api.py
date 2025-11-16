@@ -216,10 +216,16 @@ class EvolutionAPIClient:
         try:
             result = await self._make_request("GET", f"/instance/connectionState/{instance_name}")
 
+            # FIX: The custom Baileys service returns nested structure: {"instance": {"state": "open"}}
+            # Need to extract state from the nested instance object
+            instance_data = result.get("instance", {})
+            state = instance_data.get("state", result.get("state", "disconnected"))
+
             return {
                 "instance": instance_name,
-                "state": result.get("state", "disconnected"),
+                "state": state,
                 "status": result.get("status"),
+                "phone_number": instance_data.get("phone"),
                 **result
             }
 

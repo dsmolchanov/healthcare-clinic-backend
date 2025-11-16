@@ -27,6 +27,7 @@ from .slot_manager import SlotManager
 from .manager import FSMManager
 from .answer_service import AnswerService
 from .constants import SlotSource
+from .llm_slot_extractor import LLMSlotExtractor
 from .metrics import (
     record_escalation,
     record_fallback_hit,
@@ -77,6 +78,7 @@ class StateHandler:
         self.intent = intent_router
         self.slots = slot_manager
         self.answers = answer_service
+        self.llm_extractor = LLMSlotExtractor()  # NEW: Hybrid FSM+LLM
 
     async def handle_greeting(
         self,
@@ -312,11 +314,10 @@ class StateHandler:
         intent: str
     ) -> Tuple[FSMState, str]:
         """
-        Handle COLLECTING_SLOTS state.
+        Handle COLLECTING_SLOTS state with Hybrid FSM+LLM approach.
 
-        Extracts slots from message, validates them, and transitions to
-        AWAITING_CONFIRMATION when all required slots are collected.
-        Transitions to AWAITING_CLARIFICATION if validation fails.
+        Uses LLM to extract slots intelligently, then validates them using
+        existing validation logic. The FSM controls flow, LLM handles NLU.
 
         Args:
             state: Current FSM state
@@ -328,84 +329,175 @@ class StateHandler:
 
         Example:
             >>> state, response = await handler.handle_collecting_slots(
-            ...     state, "к доктору Иванову", Intent.INFORMATION
+            ...     state, "запишите меня к терапевту на завтра в 14:00", Intent.INFORMATION
             ... )
+            >>> # LLM extracts all three slots: doctor="терапевт", date="завтра", time="14:00"
         """
-        # Extract doctor name from message
-        doctor_name = self.slots.extract_doctor_name(message)
+        required_slots = ["doctor", "date", "time"]
 
-        if doctor_name:
-            # Validate doctor name and get doctor_id
-            is_valid, error, doctor_id = await self.slots.validate_doctor_name(
-                doctor_name,
-                state.clinic_id
+        # 1. Determine which slots are still missing
+        missing_slots = [s for s in required_slots if s not in state.slots]
+
+        logger.info(
+            f"Conversation {state.conversation_id}: "
+            f"Collecting slots. Missing: {missing_slots}, Message: '{message}'"
+        )
+
+        # 2. Use LLM to extract ALL missing slots from user's message
+        # This is the HYBRID part - smart extraction instead of brittle regex
+        if missing_slots:
+            llm_extracted = await self.llm_extractor.extract_slots(
+                message=message,
+                missing_slots=missing_slots,
+                clinic_id=state.clinic_id,
+                conversation_history=None  # TODO: Pass conversation history for better context
             )
 
-            if is_valid and doctor_id:
-                # Add validated doctor slot with UUID (not name)
-                state = self.slots.add_slot(
-                    state,
-                    "doctor",
-                    doctor_id,  # Store UUID instead of name
-                    SlotSource.LLM_EXTRACT,
-                    confidence=0.9
-                )
-                # Also store the name for display purposes
-                state = self.slots.add_slot(
-                    state,
-                    "doctor_name",
-                    doctor_name,
-                    SlotSource.LLM_EXTRACT,
-                    confidence=0.9
-                )
-                logger.info(f"Conversation {state.conversation_id}: Extracted doctor={doctor_name} (id={doctor_id})")
-            else:
-                # Invalid doctor, ask for clarification
-                new_state = await self.fsm.transition_state(
-                    state,
-                    ConversationState.AWAITING_CLARIFICATION
-                )
-                logger.warning(
-                    f"Conversation {state.conversation_id}: Invalid doctor '{doctor_name}'"
-                )
-                return new_state, error
+            logger.info(
+                f"Conversation {state.conversation_id}: "
+                f"LLM extracted {len(llm_extracted)} slots: {list(llm_extracted.keys())}"
+            )
 
-        # TODO: Extract date and time slots (requires LLM integration)
-        # For now, we'll use placeholder logic
+            # 3. Validate and add each extracted slot
+            for slot_name, slot_data in llm_extracted.items():
+                slot_value = slot_data["value"]
+                confidence = slot_data.get("confidence", 0.8)
 
-        # Check if all required slots present
-        required_slots = ["doctor", "date", "time"]
+                if slot_name == "doctor":
+                    # Validate doctor (handle both names and specialties)
+                    doctor_value = slot_value
+                    slot_type = slot_data.get("type", "name")
+
+                    # Try validation
+                    is_valid, error_msg, doctor_id = await self.slots.validate_doctor_name(
+                        doctor_value,
+                        state.clinic_id
+                    )
+
+                    if is_valid and doctor_id:
+                        # Add validated doctor slot with UUID
+                        state = self.slots.add_slot(
+                            state,
+                            "doctor",
+                            doctor_id,  # Store UUID instead of name
+                            SlotSource.LLM_EXTRACT,
+                            confidence=confidence
+                        )
+                        # Also store the name for display
+                        state = self.slots.add_slot(
+                            state,
+                            "doctor_name",
+                            doctor_value,
+                            SlotSource.LLM_EXTRACT,
+                            confidence=confidence
+                        )
+                        logger.info(
+                            f"Conversation {state.conversation_id}: "
+                            f"✅ Validated doctor={doctor_value} (id={doctor_id}, type={slot_type})"
+                        )
+                    else:
+                        # Invalid doctor - return error and ask for clarification
+                        logger.warning(
+                            f"Conversation {state.conversation_id}: "
+                            f"❌ Invalid doctor '{doctor_value}'"
+                        )
+                        new_state = await self.fsm.transition_state(
+                            state,
+                            ConversationState.AWAITING_CLARIFICATION
+                        )
+                        return new_state, error_msg
+
+                elif slot_name == "date":
+                    # Validate date (uses clinic timezone)
+                    is_valid, error_msg = await self.slots.validate_date_slot(
+                        slot_value,
+                        state.clinic_id
+                    )
+
+                    if is_valid:
+                        state = self.slots.add_slot(
+                            state,
+                            "date",
+                            slot_value,
+                            SlotSource.LLM_EXTRACT,
+                            confidence=confidence
+                        )
+                        logger.info(
+                            f"Conversation {state.conversation_id}: "
+                            f"✅ Validated date={slot_value}"
+                        )
+                    else:
+                        # Invalid date - return error
+                        logger.warning(
+                            f"Conversation {state.conversation_id}: "
+                            f"❌ Invalid date '{slot_value}': {error_msg}"
+                        )
+                        new_state = await self.fsm.transition_state(
+                            state,
+                            ConversationState.AWAITING_CLARIFICATION
+                        )
+                        return new_state, error_msg
+
+                elif slot_name == "time":
+                    # For now, accept any time format (TODO: validate against clinic hours)
+                    state = self.slots.add_slot(
+                        state,
+                        "time",
+                        slot_value,
+                        SlotSource.LLM_EXTRACT,
+                        confidence=confidence
+                    )
+                    logger.info(
+                        f"Conversation {state.conversation_id}: "
+                        f"✅ Extracted time={slot_value}"
+                    )
+
+        # 4. Check if all required slots are now present
         if self.slots.has_required_slots(state, required_slots):
-            # All slots collected, ask for confirmation
+            # All slots collected and confirmed - transition to confirmation
             new_state = await self.fsm.transition_state(
                 state,
                 ConversationState.AWAITING_CONFIRMATION
             )
-            doctor = state.slots["doctor"].value
+
+            doctor_name = state.slots.get("doctor_name", state.slots.get("doctor", {}).value)
             date = state.slots["date"].value
             time = state.slots["time"].value
-            response = f"Подтверждаете запись к доктору {doctor} на {date} в {time}?"
+
+            response = (
+                f"Отлично! Давайте подтвердим запись:\n"
+                f"• Доктор: {doctor_name}\n"
+                f"• Дата: {date}\n"
+                f"• Время: {time}\n\n"
+                f"Всё верно?"
+            )
+
             logger.info(
-                f"Conversation {state.conversation_id}: All slots collected, "
-                f"requesting confirmation"
+                f"Conversation {state.conversation_id}: "
+                f"All slots collected, requesting confirmation"
             )
             return new_state, response
-        else:
-            # Still collecting, ask for next missing slot
-            if "doctor" not in state.slots:
-                response = "К какому доктору вы хотите записаться?"
-            elif "date" not in state.slots:
-                response = "На какую дату?"
-            elif "time" not in state.slots:
-                response = "На какое время?"
-            else:
-                response = "Пожалуйста, уточните детали записи."
 
-            logger.debug(
-                f"Conversation {state.conversation_id}: "
-                f"Missing slots: {set(required_slots) - set(state.slots.keys())}"
-            )
-            return state, response
+        # 5. Still missing slots - ask for the next one
+        # This is still TEMPLATE-based (FSM controls responses), but smarter
+        missing_after_extraction = [s for s in required_slots if s not in state.slots]
+
+        if "doctor" in missing_after_extraction:
+            response = "К какому доктору или специалисту вы хотите записаться?"
+        elif "date" in missing_after_extraction:
+            doctor_name = state.slots.get("doctor_name", {}).value if "doctor_name" in state.slots else "доктору"
+            response = f"Отлично! На какую дату вы хотите записаться к {doctor_name}?"
+        elif "time" in missing_after_extraction:
+            date = state.slots["date"].value
+            response = f"Хорошо, на {date}. А в какое время вам удобно?"
+        else:
+            response = "Пожалуйста, уточните детали записи."
+
+        logger.debug(
+            f"Conversation {state.conversation_id}: "
+            f"Still missing: {missing_after_extraction}"
+        )
+        return state, response
 
     async def handle_awaiting_confirmation(
         self,

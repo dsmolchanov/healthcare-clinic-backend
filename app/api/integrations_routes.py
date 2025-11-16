@@ -394,15 +394,23 @@ async def create_evolution_instance(data: EvolutionInstanceCreate):
                             print(f"✅ Cleaned up orphaned database record")
                             # Continue to create new instance
                     except Exception as evolution_check_error:
-                        print(f"Warning: Failed to check Evolution status: {evolution_check_error}")
-                        # If we can't check Evolution, assume existing instance is valid
-                        return {
-                            "success": False,
-                            "error": "WhatsApp integration already exists for this organization",
-                            "existing_instance": instance_name,
-                            "existing_status": existing_instance.get("status"),
-                            "message": "Please delete the existing integration before creating a new one"
-                        }
+                        print(f"⚠️  Failed to check Evolution status: {evolution_check_error}")
+                        # If we can't check Evolution, assume it's orphaned and clean it up
+                        # This handles cases where Evolution API is down or instance is truly orphaned
+                        print(f"⚠️  Treating as orphaned record and cleaning up: {instance_name}")
+                        try:
+                            supabase.schema("healthcare").table("integrations").delete().eq(
+                                "id", existing_instance["id"]
+                            ).execute()
+                            print(f"✅ Cleaned up potentially orphaned database record")
+                            # Continue to create new instance
+                        except Exception as cleanup_error:
+                            print(f"❌ Failed to clean up orphaned record: {cleanup_error}")
+                            return {
+                                "success": False,
+                                "error": "Failed to clean up existing integration",
+                                "message": "Please manually delete the existing integration and try again"
+                            }
         except Exception as check_error:
             print(f"Warning: Failed to check for existing integration: {check_error}")
             # Continue anyway - RPC has its own check
@@ -414,6 +422,34 @@ async def create_evolution_instance(data: EvolutionInstanceCreate):
                 tenant_id=data.organization_id,  # Use organization_id as tenant_id
                 instance_name=data.instance_name
             )
+
+            # CRITICAL: Set webhook configuration AFTER instance creation
+            # Evolution API requires a separate webhook setup call
+            if result.get("success"):
+                try:
+                    webhook_url = result.get("webhook_url", f"{os.getenv('EVOLUTION_SERVER_URL', 'https://evolution-api-prod.fly.dev')}/webhook/{data.instance_name}")
+
+                    print(f"[Create] Setting up webhooks for {data.instance_name}...")
+                    webhook_result = await evolution_client.set_webhook(
+                        instance_name=data.instance_name,
+                        webhook_url=webhook_url.replace('/webhook/', '/webhooks/evolution/'),  # Use correct URL
+                        events=[
+                            "QRCODE_UPDATED",
+                            "MESSAGES_UPSERT",
+                            "MESSAGES_UPDATE",
+                            "CONNECTION_UPDATE",  # CRITICAL for pairing
+                            "SEND_MESSAGE"
+                        ]
+                    )
+
+                    if webhook_result.get("success"):
+                        print(f"[Create] ✅ Webhooks configured successfully")
+                    else:
+                        print(f"[Create] ⚠️  Webhook configuration failed: {webhook_result.get('error')}")
+
+                except Exception as webhook_error:
+                    print(f"[Create] ⚠️  Warning: Failed to configure webhooks: {webhook_error}")
+                    # Continue anyway - webhooks can be configured later
 
             # Save integration to database immediately using RPC
             if result.get("success"):
@@ -488,6 +524,78 @@ async def get_evolution_status(instance_name: str):
         return status
     except Exception as e:
         print(f"Error in get_evolution_status: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/evolution/refresh-qr/{instance_name}")
+async def refresh_evolution_qr(instance_name: str):
+    """
+    Refresh QR code for an Evolution instance that's stuck in QR timeout loop.
+
+    This fixes the issue where:
+    1. QR codes expire after 60 seconds
+    2. Evolution auto-reconnects and generates new QR codes infinitely
+    3. User can't complete pairing because of the loop
+
+    Solution: Delete and recreate the instance to get a fresh QR code.
+    """
+    try:
+        from ..main import supabase
+
+        print(f"[Refresh QR] Starting refresh for instance: {instance_name}")
+
+        # Step 1: Get the integration details from database
+        result = supabase.schema("healthcare").table("integrations").select("*").eq(
+            "config->>instance_name", instance_name
+        ).eq("type", "whatsapp").execute()
+
+        if not result.data or len(result.data) == 0:
+            raise HTTPException(status_code=404, detail="Integration not found")
+
+        integration = result.data[0]
+        org_id = integration["organization_id"]
+
+        print(f"[Refresh QR] Found integration for org: {org_id}")
+
+        # Step 2: Delete the old instance from Evolution API (stop the QR loop)
+        async with EvolutionAPIClient() as evolution_client:
+            print(f"[Refresh QR] Deleting old instance...")
+            delete_result = await evolution_client.delete_instance(instance_name)
+            print(f"[Refresh QR] Delete result: {delete_result}")
+
+            # Step 3: Wait a moment for cleanup
+            import asyncio
+            await asyncio.sleep(2)
+
+            # Step 4: Create a fresh instance with same name
+            print(f"[Refresh QR] Creating fresh instance...")
+            create_result = await evolution_client.create_instance(
+                tenant_id=org_id,
+                instance_name=instance_name
+            )
+
+            if not create_result.get("success"):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to recreate instance: {create_result.get('error')}"
+                )
+
+            print(f"[Refresh QR] Fresh instance created successfully")
+
+            # Step 5: Return the new QR code
+            return {
+                "success": True,
+                "instance_name": instance_name,
+                "qrcode": create_result.get("qrcode"),
+                "message": "QR code refreshed successfully. Please scan the new QR code.",
+                "status": "qr"
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Refresh QR] Error: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

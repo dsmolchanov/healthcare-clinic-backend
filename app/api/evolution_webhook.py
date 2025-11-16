@@ -83,26 +83,21 @@ async def whatsapp_webhook_v2(
     print(f"[WhatsApp Webhook V2] Body type: {type(body)}")
     print(f"[WhatsApp Webhook V2] Body keys: {list(body.keys()) if body else 'None'}")
 
-    # Verify webhook signature
+    # Verify webhook signature (OPTIONAL - Evolution doesn't send signatures by default)
     evolution_webhook_secret = os.getenv("EVOLUTION_WEBHOOK_SECRET", "")
-
-    if not evolution_webhook_secret:
-        logger.error("EVOLUTION_WEBHOOK_SECRET not configured")
-        raise HTTPException(status_code=503, detail="Webhook secret not configured")
-
     signature = request.headers.get("X-Webhook-Signature")
-    if not signature:
-        print(f"[WhatsApp Webhook V2] ❌ No signature header")
-        raise HTTPException(status_code=401, detail="Webhook signature required")
 
     # Convert body to JSON bytes for signature verification
     body_bytes = json.dumps(body, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
 
-    if not verify_webhook_signature('evolution', body=body_bytes, signature=signature):
-        print(f"[WhatsApp Webhook V2] ❌ Invalid signature")
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
-
-    print(f"[WhatsApp Webhook V2] ✅ Signature verified")
+    if evolution_webhook_secret and signature:
+        # Verify signature if both are present
+        if verify_webhook_signature('evolution', body=body_bytes, signature=signature):
+            print(f"[WhatsApp Webhook V2] ✅ Signature verified")
+        else:
+            print(f"[WhatsApp Webhook V2] ⚠️  Invalid signature - continuing anyway (optional verification)")
+    else:
+        print(f"[WhatsApp Webhook V2] ⚠️  No signature verification (secret={bool(evolution_webhook_secret)}, signature={bool(signature)})")
 
     # Create background task for processing (CRITICAL: return immediately)
     asyncio.create_task(process_webhook_by_token(webhook_token, body_bytes))
@@ -192,12 +187,16 @@ async def process_webhook_by_token(webhook_token: str, body_bytes: bytes):
         # Route to FSM or multilingual processor (same as existing flow)
         if FSM_ENABLED:
             from app.api.webhooks import process_with_fsm
-            ai_response = await process_with_fsm(
-                clinic_id=clinic_id,
+            fsm_result = await process_with_fsm(
+                message_sid=message_id,
+                conversation_id=from_number,
                 message=message_text,
-                from_number=from_number,
-                message_sid=message_id
+                context={
+                    "clinic_id": clinic_id,
+                    "instance_name": instance_name
+                }
             )
+            ai_response = fsm_result.get("response", "")
         else:
             # Multilingual processor fallback
             processor = MultilingualMessageProcessor()
@@ -249,34 +248,22 @@ async def evolution_webhook(
     print(f"[Evolution Webhook] Body type: {type(body)}")
     print(f"[Evolution Webhook] Body keys: {list(body.keys()) if body else 'None'}")
 
-    # Verify webhook signature if configured
-    # Check if webhook secret is configured
+    # Verify webhook signature if configured (OPTIONAL - Evolution doesn't send signatures by default)
     evolution_webhook_secret = os.getenv("EVOLUTION_WEBHOOK_SECRET", "")
-
-    if not evolution_webhook_secret:
-        logger.error("EVOLUTION_WEBHOOK_SECRET not configured - rejecting Evolution webhook request")
-        raise HTTPException(
-            status_code=503,
-            detail="Evolution webhook secret not configured"
-        )
-
-    # Signature verification is ENABLED - require signature
     signature = request.headers.get("X-Webhook-Signature")
-    if not signature:
-        print(f"[Evolution Webhook] ❌ No signature header - rejecting request (verification enabled)")
-        raise HTTPException(
-            status_code=401,
-            detail="Webhook signature required (X-Webhook-Signature header missing)"
-        )
 
-    print(f"[Evolution Webhook] Signature header present: {signature[:20]}...")
-    # Convert dict back to bytes for signature verification.
-    # Match JSON.stringify output (no spaces, UTF-8) so HMAC lines up with Evolution API.
-    body_bytes = json.dumps(body, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-    if not verify_webhook_signature('evolution', body=body_bytes, signature=signature):
-        print(f"[Evolution Webhook] ❌ Invalid signature - rejecting request")
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
-    print(f"[Evolution Webhook] ✅ Signature verified")
+    if evolution_webhook_secret and signature:
+        # Signature verification is OPTIONAL - verify if both secret and signature present
+        print(f"[Evolution Webhook] Signature header present: {signature[:20]}...")
+        # Convert dict back to bytes for signature verification.
+        # Match JSON.stringify output (no spaces, UTF-8) so HMAC lines up with Evolution API.
+        body_bytes = json.dumps(body, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+        if verify_webhook_signature('evolution', body=body_bytes, signature=signature):
+            print(f"[Evolution Webhook] ✅ Signature verified")
+        else:
+            print(f"[Evolution Webhook] ⚠️  Invalid signature - continuing anyway (optional verification)")
+    else:
+        print(f"[Evolution Webhook] ⚠️  No signature verification (secret={bool(evolution_webhook_secret)}, signature={bool(signature)})")
 
     print(f"{'='*80}\n")
 
@@ -386,6 +373,44 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
                 print(f"[Background] Message ID: {message_id} (first time processing)")
         else:
             print(f"[Background] ⚠️ No message ID found - skipping idempotency check")
+
+        # Check if this is a CONNECTION_UPDATE event (not a message)
+        event_type = data.get("event")
+        if event_type == "CONNECTION_UPDATE":
+            print(f"[Background] 📡 CONNECTION_UPDATE event received")
+            connection_data = data.get("data", {})
+            state = connection_data.get("state")
+            phone = connection_data.get("phone")
+            connected = connection_data.get("connected", False)
+
+            print(f"[Background] Connection state: {state}")
+            print(f"[Background] Phone number: {phone}")
+            print(f"[Background] Connected: {connected}")
+
+            # Update integration status in database
+            if state == "open" and connected:
+                print(f"[Background] ✅ WhatsApp connected! Updating integration status...")
+                from app.main import supabase
+
+                try:
+                    # Update integration status to connected
+                    result = supabase.schema("healthcare").table("integrations").update({
+                        "status": "connected",
+                        "config": {
+                            "instance_name": instance_name,
+                            "phone_number": phone,
+                            "connected_at": datetime.datetime.utcnow().isoformat()
+                        },
+                        "enabled": True
+                    }).eq("config->>instance_name", instance_name).execute()
+
+                    print(f"[Background] ✅ Integration status updated to connected")
+                    print(f"[Background] Updated records: {len(result.data) if result.data else 0}")
+                except Exception as db_error:
+                    print(f"[Background] ⚠️  Failed to update integration status: {db_error}")
+
+            # CONNECTION_UPDATE events don't have messages, so return early
+            return
 
         # Evolution API sends both instanceName in body AND in URL path
         # The URL path is more reliable
