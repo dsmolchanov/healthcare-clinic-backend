@@ -20,6 +20,8 @@ State Flow:
 
 from typing import Tuple
 import logging
+import uuid
+from datetime import datetime, date, time, timedelta, timezone
 
 from .models import FSMState, ConversationState, IntentResult
 from .intent_router import Intent, IntentRouter
@@ -37,6 +39,12 @@ from .metrics import (
 )
 from .logger import log_auto_escalation, log_fallback_hit, log_response_type
 from .coverage import validate_coverage
+
+# P2 Phase 2B: Import new services
+from app.services.availability_service import AvailabilityService
+from app.services.appointment_hold_service import AppointmentHoldService
+from app.observability.langfuse_tracer import llm_observability
+from app.db.supabase_client import get_supabase_client
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +86,12 @@ class StateHandler:
         self.intent = intent_router
         self.slots = slot_manager
         self.answers = answer_service
-        self.llm_extractor = LLMSlotExtractor()  # NEW: Hybrid FSM+LLM
+        self.llm_extractor = LLMSlotExtractor()  # Hybrid FSM+LLM
+
+        # P2 Phase 2B: Initialize availability and hold services
+        self.supabase = get_supabase_client(schema='healthcare')
+        self.availability_service = AvailabilityService(self.supabase)
+        self.hold_service = AppointmentHoldService(self.supabase)
 
     async def handle_greeting(
         self,
@@ -345,12 +358,15 @@ class StateHandler:
 
         # 2. Use LLM to extract ALL missing slots from user's message
         # This is the HYBRID part - smart extraction instead of brittle regex
+        # P2 Phase 2B: Wrap LLM call with Langfuse tracing
         if missing_slots:
-            llm_extracted = await self.llm_extractor.extract_slots(
+            llm_extracted = await llm_observability.extract_slots_with_tracing(
                 message=message,
                 missing_slots=missing_slots,
                 clinic_id=state.clinic_id,
-                conversation_history=None  # TODO: Pass conversation history for better context
+                session_id=state.conversation_id,
+                fsm_state=state.current_state.value,
+                llm_extractor=self.llm_extractor
             )
 
             logger.info(
@@ -453,7 +469,85 @@ class StateHandler:
                     )
 
         # 4. Check if all required slots are now present
-        if self.slots.has_required_slots(state, required_slots):
+        # P2 Phase 2B: Branch logic based on collected slots
+        if "doctor" in state.slots and "date" in state.slots and "time" not in state.slots:
+            # Path A: Doctor + Date collected → Show available slots
+            doctor_id = state.slots["doctor"].value
+            date_str = state.slots["date"].value
+            doctor_name = state.slots.get("doctor_name", {}).value if "doctor_name" in state.slots else "доктору"
+
+            try:
+                appointment_date = date.fromisoformat(date_str)
+            except ValueError:
+                # Invalid date format
+                logger.error(f"Invalid date format: {date_str}")
+                return state, "Неверный формат даты. Пожалуйста, укажите дату снова."
+
+            # Get clinic timezone for availability check
+            clinic_timezone = await self.availability_service.get_clinic_timezone(state.clinic_id)
+
+            # Query available slots
+            logger.info(
+                f"Conversation {state.conversation_id}: "
+                f"Querying available slots for doctor={doctor_id}, date={date_str}"
+            )
+
+            available_slots = await self.availability_service.get_available_slots(
+                clinic_id=state.clinic_id,
+                doctor_id=doctor_id,
+                preferred_date=appointment_date,
+                clinic_timezone=clinic_timezone,
+                limit=5
+            )
+
+            if not available_slots:
+                # No slots available on this date
+                logger.warning(
+                    f"Conversation {state.conversation_id}: "
+                    f"No available slots for doctor={doctor_id} on {date_str}"
+                )
+
+                # Clear date so user can choose again
+                if "date" in state.slots:
+                    del state.slots["date"]
+
+                response = (
+                    f"К сожалению, на {date_str} нет свободных слотов к {doctor_name}.\n"
+                    f"Попробуйте другую дату."
+                )
+
+                return state, response
+
+            # Transition to PRESENTING_SLOTS with cached slots
+            new_state = await self.fsm.transition_state(
+                state,
+                ConversationState.PRESENTING_SLOTS
+            )
+
+            # Store available slots in state
+            new_state.available_slots = available_slots
+
+            # Format slots for display
+            slots_text = "\n".join([
+                f"{i+1}. {slot['display']}"
+                for i, slot in enumerate(available_slots)
+            ])
+
+            response = (
+                f"Доступные слоты к {doctor_name} на {date_str}:\n\n"
+                f"{slots_text}\n\n"
+                f"Выберите номер слота (1-{len(available_slots)}) или напишите своё время."
+            )
+
+            logger.info(
+                f"Conversation {state.conversation_id}: "
+                f"Presenting {len(available_slots)} available slots"
+            )
+
+            return new_state, response
+
+        elif self.slots.has_required_slots(state, required_slots):
+            # Path B: All slots collected (existing logic)
             # All slots collected and confirmed - transition to confirmation
             new_state = await self.fsm.transition_state(
                 state,
@@ -545,16 +639,35 @@ class StateHandler:
             return new_state, "processing_booking"  # Trigger actual booking
 
         elif intent == Intent.DENY:
-            # User denied, go back to collecting
+            # User denied - release hold and go back to collecting
+            # P2 Phase 2B: Release hold if exists
+            if state.hold_id:
+                logger.info(
+                    f"Conversation {state.conversation_id}: "
+                    f"Releasing hold {state.hold_id} due to user denial"
+                )
+
+                await self.hold_service.release_hold(
+                    state.hold_id,
+                    reason="user_denied"
+                )
+
+                # Clear hold from state
+                state.hold_id = None
+                state.hold_expires_at = None
+
             new_state = await self.fsm.transition_state(
                 state,
                 ConversationState.COLLECTING_SLOTS
             )
+
             response = "Хорошо, давайте изменим. Что вы хотите изменить?"
+
             logger.info(
-                f"Conversation {state.conversation_id}: Booking denied, "
-                f"returning to COLLECTING_SLOTS"
+                f"Conversation {state.conversation_id}: "
+                f"Booking denied, returning to COLLECTING_SLOTS"
             )
+
             return new_state, response
 
         elif intent == Intent.DISAMBIGUATE:
@@ -784,6 +897,272 @@ class StateHandler:
                 )
                 return state, response
 
+    async def handle_presenting_slots(
+        self,
+        state: FSMState,
+        message: str,
+        intent: str
+    ) -> Tuple[FSMState, str]:
+        """
+        P2 Phase 2B: Handle user selection of time slot from presented options.
+
+        Supports:
+        - Numeric selection (1-5)
+        - Free-form time input ("14:00")
+
+        Creates durable hold on selected slot before confirmation.
+
+        Args:
+            state: Current FSM state with cached available_slots
+            message: User's message
+            intent: Detected intent
+
+        Returns:
+            Tuple of (new_state, response_message)
+        """
+        available_slots = state.available_slots
+
+        if not available_slots:
+            # State corrupted - available_slots should be set in COLLECTING_SLOTS
+            logger.error(
+                f"Conversation {state.conversation_id}: "
+                f"PRESENTING_SLOTS state has no available_slots"
+            )
+
+            new_state = await self.fsm.transition_state(
+                state,
+                ConversationState.COLLECTING_SLOTS
+            )
+            return new_state, "Пожалуйста, выберите дату снова."
+
+        # 1. Try to parse as slot number (1-5)
+        try:
+            slot_number = int(message.strip())
+            if 1 <= slot_number <= len(available_slots):
+                # Valid slot selection
+                selected_slot = available_slots[slot_number - 1]
+                time_str = selected_slot['time']
+                start_datetime_utc_str = selected_slot['start_datetime_utc']
+
+                logger.info(
+                    f"Conversation {state.conversation_id}: "
+                    f"User selected slot #{slot_number}: {time_str}"
+                )
+
+                # Add time slot to state
+                state = self.slots.add_slot(
+                    state,
+                    "time",
+                    time_str,
+                    SlotSource.USER_CONFIRM,  # User explicitly selected
+                    confidence=1.0
+                )
+
+                # Create hold for this slot
+                return await self._create_hold_and_confirm(
+                    state,
+                    start_datetime_utc_str,
+                    selected_slot['date'],
+                    time_str
+                )
+            else:
+                # Number out of range
+                response = (
+                    f"Пожалуйста, выберите номер от 1 до {len(available_slots)} "
+                    f"или напишите время в формате ЧЧ:ММ."
+                )
+                return state, response
+
+        except ValueError:
+            # Not a number - try to extract time from free-form text
+            pass
+
+        # 2. Try to extract time from free-form text using LLM
+        llm_extracted = await llm_observability.extract_slots_with_tracing(
+            message=message,
+            missing_slots=["time"],
+            clinic_id=state.clinic_id,
+            session_id=state.conversation_id,
+            fsm_state=state.current_state.value,
+            llm_extractor=self.llm_extractor
+        )
+
+        if "time" in llm_extracted:
+            time_str = llm_extracted["time"]["value"]
+
+            # Validate that time matches one of the available slots
+            matching_slot = next(
+                (slot for slot in available_slots if slot['time'] == time_str),
+                None
+            )
+
+            if matching_slot:
+                # Valid time - create hold
+                logger.info(
+                    f"Conversation {state.conversation_id}: "
+                    f"User requested time {time_str} which matches available slot"
+                )
+
+                state = self.slots.add_slot(
+                    state,
+                    "time",
+                    time_str,
+                    SlotSource.LLM_EXTRACT,
+                    confidence=llm_extracted["time"].get("confidence", 0.8)
+                )
+
+                return await self._create_hold_and_confirm(
+                    state,
+                    matching_slot['start_datetime_utc'],
+                    matching_slot['date'],
+                    time_str
+                )
+            else:
+                # User requested time not in available slots
+                logger.warning(
+                    f"Conversation {state.conversation_id}: "
+                    f"User requested unavailable time {time_str}"
+                )
+
+                response = (
+                    f"К сожалению, {time_str} не доступно.\n"
+                    f"Пожалуйста, выберите из предложенных вариантов (1-{len(available_slots)})."
+                )
+                return state, response
+        else:
+            # Could not extract time
+            response = (
+                f"Не понял. Пожалуйста, выберите номер слота (1-{len(available_slots)}) "
+                f"или напишите время в формате ЧЧ:ММ."
+            )
+            return state, response
+
+    async def _create_hold_and_confirm(
+        self,
+        state: FSMState,
+        start_datetime_utc_str: str,
+        date_str: str,
+        time_str: str
+    ) -> Tuple[FSMState, str]:
+        """
+        Helper method to create hold and transition to confirmation.
+
+        Args:
+            state: Current FSM state
+            start_datetime_utc_str: Slot start time in UTC (ISO format)
+            date_str: Appointment date (ISO format)
+            time_str: Appointment time (HH:MM format)
+
+        Returns:
+            Tuple of (new_state, response_message)
+        """
+        # Generate booking_request_id for end-to-end idempotency
+        if not state.booking_request_id:
+            state.booking_request_id = str(uuid.uuid4())
+
+        # Parse datetime
+        start_datetime_utc = datetime.fromisoformat(start_datetime_utc_str)
+        doctor_id = state.slots["doctor"].value
+        doctor_name = state.slots.get("doctor_name", {}).value if "doctor_name" in state.slots else "доктору"
+
+        # Get clinic timezone for hold creation
+        clinic_timezone = await self.availability_service.get_clinic_timezone(state.clinic_id)
+
+        # Attempt to create hold
+        logger.info(
+            f"Conversation {state.conversation_id}: "
+            f"Creating hold for slot {date_str} {time_str}"
+        )
+
+        success, hold_id, response_data = await self.hold_service.create_hold(
+            clinic_id=state.clinic_id,
+            doctor_id=doctor_id,
+            start_time=start_datetime_utc,
+            duration_minutes=30,  # TODO: Make configurable or get from doctor schedule
+            conversation_id=state.conversation_id,
+            booking_request_id=state.booking_request_id,
+            patient_phone=state.conversation_id,  # WhatsApp phone number
+            clinic_timezone=clinic_timezone
+        )
+
+        if success:
+            # Hold created successfully!
+            state.hold_id = hold_id
+            state.hold_expires_at = response_data['hold_expires_at']
+
+            # Clear available_slots (no longer needed)
+            state.available_slots = []
+
+            # Transition to AWAITING_CONFIRMATION
+            new_state = await self.fsm.transition_state(
+                state,
+                ConversationState.AWAITING_CONFIRMATION
+            )
+
+            # Format expiry time in clinic timezone
+            expires_at = state.hold_expires_at
+            if clinic_timezone != "UTC":
+                from zoneinfo import ZoneInfo
+                clinic_tz = ZoneInfo(clinic_timezone)
+                expires_at = state.hold_expires_at.astimezone(clinic_tz)
+
+            expires_time = expires_at.strftime("%H:%M")
+
+            response = (
+                f"✅ Забронировал для вас запись:\n"
+                f"• Доктор: {doctor_name}\n"
+                f"• Дата: {date_str}\n"
+                f"• Время: {time_str}\n\n"
+                f"⏰ Бронь действует до {expires_time} ({response_data['expires_in_minutes']} минут).\n"
+                f"Подтвердите записью 'да' или измените 'нет'."
+            )
+
+            logger.info(
+                f"Conversation {state.conversation_id}: "
+                f"Hold created {hold_id}, expires at {state.hold_expires_at}"
+            )
+
+            return new_state, response
+
+        else:
+            # Hold failed - slot already taken or other error
+            logger.warning(
+                f"Conversation {state.conversation_id}: "
+                f"Hold creation failed for {date_str} {time_str}"
+            )
+
+            alternatives = response_data.get('alternatives', [])
+
+            if alternatives:
+                # Update available_slots with new alternatives
+                state.available_slots = alternatives
+
+                alt_text = "\n".join([
+                    f"{i+1}. {alt['display']}"
+                    for i, alt in enumerate(alternatives[:3])
+                ])
+
+                response = (
+                    f"❌ К сожалению, это время уже занято.\n\n"
+                    f"Ближайшие доступные слоты:\n{alt_text}\n\n"
+                    f"Выберите номер слота или напишите 'отмена'."
+                )
+            else:
+                # No alternatives - return to collecting
+                new_state = await self.fsm.transition_state(
+                    state,
+                    ConversationState.COLLECTING_SLOTS
+                )
+
+                response = (
+                    f"❌ К сожалению, это время уже занято. "
+                    f"Давайте выберем другую дату."
+                )
+
+                return new_state, response
+
+            return state, response
+
     async def handle_booking(
         self,
         state: FSMState,
@@ -791,52 +1170,168 @@ class StateHandler:
         intent: str
     ) -> Tuple[FSMState, str]:
         """
-        Handle BOOKING state.
+        P2 Phase 2B: Create appointment using atomic RPC.
 
-        Placeholder for actual booking logic. In production, this would:
-        - Call external booking API
-        - Create appointment in database
-        - Send confirmation email/SMS
+        Uses `healthcare.confirm_hold_and_create_appointment()` to:
+        1. Validate hold is still valid (not expired)
+        2. Create appointment record
+        3. Convert hold status from 'held' → 'reserved'
+
+        All in a single atomic transaction.
 
         Args:
-            state: Current FSM state
-            message: User's message
-            intent: Detected intent
+            state: Current FSM state with hold_id
+            message: User's message (ignored in this state)
+            intent: Detected intent (ignored in this state)
 
         Returns:
             Tuple of (new_state, response_message)
-
-        Example:
-            >>> state, response = await handler.handle_booking(
-            ...     state, "", ""
-            ... )
-            >>> print(state.current_state)  # ConversationState.COMPLETED
         """
-        # TODO: Implement actual booking logic
-        # For now, immediately transition to COMPLETED
-
-        new_state = await self.fsm.transition_state(
-            state,
-            ConversationState.COMPLETED
-        )
-
-        # Reset failure count on successful booking
-        new_state = await self.fsm.reset_failure(new_state)
-
-        doctor = state.slots["doctor"].value
-        date = state.slots["date"].value
-        time = state.slots["time"].value
-
-        response = (
-            f"Ваша запись к доктору {doctor} на {date} в {time} подтверждена! "
-            f"Ждём вас в клинике."
-        )
+        doctor_id = state.slots["doctor"].value
+        doctor_name = state.slots.get("doctor_name", {}).value if "doctor_name" in state.slots else "доктору"
+        date_str = state.slots["date"].value
+        time_str = state.slots["time"].value
 
         logger.info(
-            f"Conversation {state.conversation_id}: Booking completed successfully"
+            f"Conversation {state.conversation_id}: "
+            f"Creating appointment via atomic RPC, hold_id={state.hold_id}"
         )
 
-        return new_state, response
+        try:
+            # Call atomic RPC to confirm hold and create appointment
+            # P2 Phase 2B: Use atomic RPC instead of separate operations
+            result = self.supabase.rpc(
+                'confirm_hold_and_create_appointment',
+                {
+                    'p_hold_id': state.hold_id,
+                    'p_patient_id': None,  # TODO: Get or create patient first
+                    'p_service_id': None,  # TODO: Add service selection to FSM
+                    'p_appointment_type': 'general',
+                    'p_reason_for_visit': None,  # TODO: Optionally collect from user
+                    'p_booking_request_id': state.booking_request_id
+                }
+            ).execute()
+
+            if result.data and len(result.data) > 0:
+                booking_result = result.data[0]
+
+                if booking_result['success']:
+                    # Booking succeeded!
+                    appointment_id = booking_result['appointment_id']
+
+                    logger.info(
+                        f"Conversation {state.conversation_id}: "
+                        f"Appointment created successfully: {appointment_id}"
+                    )
+
+                    # Transition to COMPLETED
+                    new_state = await self.fsm.transition_state(
+                        state,
+                        ConversationState.COMPLETED
+                    )
+
+                    # Reset failure count
+                    new_state = await self.fsm.reset_failure(new_state)
+
+                    # P2 Phase 2B: Track successful booking in Langfuse
+                    llm_observability.score_booking_outcome(
+                        session_id=state.conversation_id,
+                        success=True,
+                        booking_id=appointment_id
+                    )
+
+                    response = (
+                        f"✅ Ваша запись подтверждена!\n\n"
+                        f"• Доктор: {doctor_name}\n"
+                        f"• Дата: {date_str}\n"
+                        f"• Время: {time_str}\n\n"
+                        f"Ждём вас в клинике. Мы отправим напоминание за день до приёма."
+                    )
+
+                    return new_state, response
+                else:
+                    # RPC failed (hold expired or other error)
+                    error_message = booking_result.get('error_message', 'Unknown error')
+
+                    logger.error(
+                        f"Conversation {state.conversation_id}: "
+                        f"Atomic RPC failed: {error_message}"
+                    )
+
+                    # Transition to FAILED
+                    new_state = await self.fsm.transition_state(
+                        state,
+                        ConversationState.FAILED
+                    )
+
+                    # P2 Phase 2B: Track failed booking in Langfuse
+                    llm_observability.score_booking_outcome(
+                        session_id=state.conversation_id,
+                        success=False,
+                        reason=error_message
+                    )
+
+                    if "expired" in error_message.lower():
+                        response = (
+                            f"❌ К сожалению, бронь истекла.\n"
+                            f"Давайте попробуем снова. К какому доктору вы хотите записаться?"
+                        )
+                    else:
+                        response = (
+                            f"❌ Ошибка при создании записи: {error_message}\n"
+                            f"Пожалуйста, свяжитесь с нашим администратором."
+                        )
+
+                    return new_state, response
+            else:
+                # No result from RPC
+                logger.error(
+                    f"Conversation {state.conversation_id}: "
+                    f"RPC returned no data"
+                )
+
+                new_state = await self.fsm.transition_state(
+                    state,
+                    ConversationState.FAILED
+                )
+
+                llm_observability.score_booking_outcome(
+                    session_id=state.conversation_id,
+                    success=False,
+                    reason="RPC returned no data"
+                )
+
+                response = (
+                    f"❌ Ошибка при создании записи.\n"
+                    f"Пожалуйста, свяжитесь с нашим администратором."
+                )
+
+                return new_state, response
+
+        except Exception as e:
+            logger.error(
+                f"Conversation {state.conversation_id}: "
+                f"Exception during booking: {e}",
+                exc_info=True
+            )
+
+            new_state = await self.fsm.transition_state(
+                state,
+                ConversationState.FAILED
+            )
+
+            llm_observability.score_booking_outcome(
+                session_id=state.conversation_id,
+                success=False,
+                reason=str(e)
+            )
+
+            response = (
+                f"❌ Ошибка при создании записи.\n"
+                f"Пожалуйста, свяжитесь с нашим администратором."
+            )
+
+            return new_state, response
 
     async def handle_completed(
         self,
