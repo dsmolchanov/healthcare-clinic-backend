@@ -10,7 +10,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from app.db.supabase_client import get_supabase_client
 
