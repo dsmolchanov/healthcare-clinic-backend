@@ -12,7 +12,7 @@ Models:
 """
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from dataclasses import dataclass, field as dataclass_field
 
 from pydantic import BaseModel, Field, field_validator, ValidationInfo
@@ -142,6 +142,13 @@ class FSMState(BaseModel):
     last_prompt: Optional[Dict[str, Any]] = Field(default=None)
     inquiry_topic: Optional[str] = Field(default=None)
     inquiry_entities: Dict[str, Any] = Field(default_factory=dict)
+
+    # P2: Hold and availability tracking fields
+    booking_request_id: Optional[str] = Field(default=None)  # End-to-end idempotency key
+    hold_id: Optional[str] = Field(default=None)  # Reference to active appointment hold
+    hold_expires_at: Optional[datetime] = Field(default=None)  # When the hold expires
+    available_slots: List[Dict[str, Any]] = Field(default_factory=list)  # Cached available slots for PRESENTING_SLOTS state
+    metadata: Dict[str, Any] = Field(default_factory=dict)  # Generic metadata storage
 
     @field_validator('created_at', 'updated_at')
     @classmethod

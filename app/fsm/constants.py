@@ -13,15 +13,17 @@ class ConversationState(str, Enum):
     FSM states for conversation flow.
 
     State transitions typically follow this flow:
-    GREETING -> COLLECTING_SLOTS -> AWAITING_CONFIRMATION -> BOOKING -> COMPLETED
+    GREETING -> COLLECTING_SLOTS -> PRESENTING_SLOTS -> AWAITING_CONFIRMATION -> BOOKING -> COMPLETED
 
     Alternative paths:
     - AWAITING_CLARIFICATION: When LLM needs more information
     - DISAMBIGUATING: When multiple options match user input
+    - PRESENTING_SLOTS: When showing available appointment slots to user
     - FAILED: When booking or validation fails
     """
     GREETING = "greeting"
     COLLECTING_SLOTS = "collecting_slots"
+    PRESENTING_SLOTS = "presenting_slots"  # P2: Show available appointment slots
     AWAITING_CLARIFICATION = "awaiting_clarification"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
     DISAMBIGUATING = "disambiguating"
@@ -53,8 +55,14 @@ VALID_TRANSITIONS = {
         ConversationState.FAILED
     ],
     ConversationState.COLLECTING_SLOTS: [
+        ConversationState.PRESENTING_SLOTS,  # P2: After doctor+date collected
         ConversationState.AWAITING_CLARIFICATION,
         ConversationState.AWAITING_CONFIRMATION,
+        ConversationState.FAILED
+    ],
+    ConversationState.PRESENTING_SLOTS: [  # P2: New state for showing available slots
+        ConversationState.AWAITING_CONFIRMATION,  # After user selects slot
+        ConversationState.COLLECTING_SLOTS,  # If user wants to change doctor/date
         ConversationState.FAILED
     ],
     ConversationState.AWAITING_CLARIFICATION: [
