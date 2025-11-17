@@ -215,3 +215,25 @@ class LLMFactory:
 
         except Exception as e:
             logger.warning(f"Failed to track metrics: {e}")
+
+
+# Singleton instance
+_llm_factory_instance: Optional['LLMFactory'] = None
+
+
+async def get_llm_factory() -> 'LLMFactory':
+    """
+    Get or create singleton LLM factory instance.
+
+    Returns:
+        LLMFactory: Shared LLM factory instance
+    """
+    global _llm_factory_instance
+
+    if _llm_factory_instance is None:
+        from app.db.supabase_client import get_supabase_client
+        supabase = get_supabase_client()
+        _llm_factory_instance = LLMFactory(supabase)
+        logger.info("LLMFactory singleton created")
+
+    return _llm_factory_instance

@@ -8,7 +8,7 @@ from app.services.llm.base_adapter import (
     LLMAdapter
 )
 from app.services.llm.capability_matrix import CapabilityMatrix
-from app.services.llm.llm_factory import LLMFactory
+from app.services.llm.llm_factory import LLMFactory, get_llm_factory
 
 __all__ = [
     'LLMProvider',
@@ -17,5 +17,6 @@ __all__ = [
     'ModelCapability',
     'LLMAdapter',
     'CapabilityMatrix',
-    'LLMFactory'
+    'LLMFactory',
+    'get_llm_factory'
 ]
