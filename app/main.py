@@ -272,6 +272,14 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, 'http_client') and app.state.http_client:
         await app.state.http_client.aclose()
         logger.info("✅ HTTP client closed")
+
+    # Flush Langfuse events to ensure they're sent before shutdown
+    try:
+        from app.observability import flush_langfuse
+        await flush_langfuse()
+    except Exception as e:
+        logger.warning(f"Error flushing Langfuse: {e}")
+
     logger.info("Shutting down HIPAA compliance systems...")
     logger.info("Healthcare Backend shutdown complete")
 

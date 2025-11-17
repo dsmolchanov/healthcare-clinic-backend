@@ -4,6 +4,7 @@ Observability Module
 Provides metrics, tracing, and monitoring capabilities:
 - Prometheus metrics
 - OpenTelemetry tracing
+- Langfuse LLM observability
 - Grafana dashboards
 - Alert rules
 """
@@ -27,6 +28,14 @@ from .metrics import (
     get_metrics_summary,
 )
 
+from .langfuse_tracer import (
+    llm_observability,
+    LLMObservability,
+    track_llm_call,
+    flush_langfuse,
+    LANGFUSE_ENABLED
+)
+
 __all__ = [
     'observe_request_latency',
     'observe_cache_hit',
@@ -44,4 +53,10 @@ __all__ = [
     'track_latency',
     'get_metrics',
     'get_metrics_summary',
+    # Langfuse LLM observability
+    'llm_observability',
+    'LLMObservability',
+    'track_llm_call',
+    'flush_langfuse',
+    'LANGFUSE_ENABLED',
 ]

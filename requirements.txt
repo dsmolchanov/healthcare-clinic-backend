@@ -13,6 +13,7 @@ redis==5.0.1
 hiredis==2.2.3  # C parser for better Redis performance
 zstandard==0.22.0  # Compression for Redis cache (Task #2)
 prometheus-client==0.19.0  # Metrics collection for FSM monitoring (Issue #66)
+langfuse>=2.54.6  # LLM observability and cost tracking (P1 Enhancement #1)
 openai==1.58.1
 google-genai==1.40.0  # Gemini 2.5 Flash/Lite support
 zhipuai==2.1.5.20250825  # GLM-4.5 SDK
