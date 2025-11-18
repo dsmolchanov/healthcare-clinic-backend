@@ -481,17 +481,22 @@ DO NOT attempt to answer complex questions yourself.
 
         logger.info(f"Message classified as {lane} lane (confidence: {metadata.get('confidence', 0):.2f})")
 
-        # Handle fast-path lanes (FAQ, PRICE) without LLM
-        if lane in [Lane.FAQ, Lane.PRICE]:
+        # Handle fast-path lanes (FAQ, PRICE, SERVICE_INFO) without LLM
+        if lane in [Lane.FAQ, Lane.PRICE, Lane.SERVICE_INFO]:
             fast_path = FastPathService(language_service, session_service)
 
             if lane == Lane.FAQ:
                 result = await fast_path.handle_faq_query(request.body, router_context)
-            else:  # PRICE lane
+            elif lane == Lane.PRICE:
                 service_id = metadata.get('service_id')
                 confidence = metadata.get('confidence', 0)
                 result = await fast_path.handle_price_query(
                     request.body, router_context, service_id, confidence
+                )
+            else:  # SERVICE_INFO lane
+                service_context = metadata.get('service_context')
+                result = await fast_path.handle_service_info_query(
+                    request.body, router_context, service_context
                 )
 
             # If fast-path succeeded, return the response
@@ -977,6 +982,10 @@ IMPORTANT BEHAVIORS:
                     if llm_response.tool_calls and len(llm_response.tool_calls) > 0:
                         logger.info(f"LLM requesting {len(llm_response.tool_calls)} tool call(s)")
 
+                        # P0 GUARD: Initialize call budget tracker
+                        MAX_CALENDAR_CALLS_PER_MESSAGE = 10
+                        calendar_calls_made = 0
+
                         # Execute tool calls
                         tool_results = []
                         for tool_call in llm_response.tool_calls:
@@ -985,6 +994,34 @@ IMPORTANT BEHAVIORS:
                             tool_args = tool_call.arguments if isinstance(tool_call.arguments, dict) else json.loads(tool_call.arguments)
 
                             logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
+
+                            # P0 GUARD: Enforce calendar call budget
+                            if tool_name == "check_availability":
+                                calendar_calls_made += 1
+                                if calendar_calls_made > MAX_CALENDAR_CALLS_PER_MESSAGE:
+                                    logger.error(
+                                        f"🚨 BUDGET EXCEEDED: {calendar_calls_made} calendar calls in single message. "
+                                        f"Max allowed: {MAX_CALENDAR_CALLS_PER_MESSAGE}"
+                                    )
+
+                                    # Return friendly error instead of executing
+                                    tool_result = {
+                                        "error": "too_many_calendar_queries",
+                                        "message": "I'm having trouble finding availability. Let me connect you with our team to help directly.",
+                                        "requires_escalation": True,
+                                        "calls_attempted": calendar_calls_made
+                                    }
+
+                                    # Add to tool results
+                                    tool_results.append({
+                                        "tool_call_id": tool_call.id,
+                                        "role": "tool",
+                                        "name": tool_name,
+                                        "content": json.dumps(tool_result)
+                                    })
+
+                                    # Break out of tool execution loop
+                                    break
 
                             # Execute appropriate tool
                             if tool_name == "query_service_prices":

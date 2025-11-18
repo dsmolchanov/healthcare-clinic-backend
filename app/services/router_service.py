@@ -21,6 +21,7 @@ class Lane(str, Enum):
     """Message routing lanes"""
     FAQ = "faq"
     PRICE = "price"
+    SERVICE_INFO = "service_info"  # For "how long", "what's included" questions
     SCHEDULING = "scheduling"
     COMPLEX = "complex"
 
@@ -87,6 +88,25 @@ class RouterService:
             }
         }
 
+        # Service info keywords by language
+        self.service_info_keywords = {
+            'ru': {
+                'duration': {'сколько времени', 'как долго', 'длительность', 'продолжительность'},
+                'process': {'как проходит', 'что входит', 'этапы', 'процесс'},
+                'preparation': {'подготовка', 'что нужно', 'требования'},
+            },
+            'es': {
+                'duration': {'cuánto tiempo', 'cuánto tarda', 'duración'},
+                'process': {'cómo es', 'qué incluye', 'proceso', 'etapas'},
+                'preparation': {'preparación', 'qué necesito', 'requisitos'},
+            },
+            'en': {
+                'duration': {'how long', 'duration', 'time', 'takes'},
+                'process': {'how does', 'what includes', 'process', 'steps'},
+                'preparation': {'preparation', 'what do i need', 'requirements'},
+            }
+        }
+
     async def classify(
         self,
         message: str,
@@ -95,12 +115,13 @@ class RouterService:
         """
         Classify message into routing lane
 
-        Priority order:
+        UPDATED Priority order:
         1. Pending action (highest priority)
-        2. Service alias match
-        3. FAQ match
-        4. Scheduling keywords
-        5. Complex (default)
+        2. Service info match (NEW - before service alias)
+        3. Service alias match
+        4. FAQ match
+        5. Scheduling keywords
+        6. Complex (default)
 
         Args:
             message: User message
@@ -129,7 +150,23 @@ class RouterService:
                 metadata['reason'] = 'negative_to_booking_offer'
                 return Lane.FAQ, metadata
 
-        # 2. Try service alias match (for PRICE lane)
+        # 2. NEW: Check service info keywords (BEFORE alias matching)
+        if self._has_service_info_keywords(message, language):
+            # Only route to SERVICE_INFO if we have service context
+            last_service = session_state.get('last_service_mentioned')
+            if last_service:
+                logger.info(
+                    f"🎯 Lane: SERVICE_INFO (duration/process question with service context: {last_service})"
+                )
+                metadata['reason'] = 'service_info_with_context'
+                metadata['service_context'] = last_service
+                return Lane.SERVICE_INFO, metadata
+            else:
+                logger.info(f"🎯 Lane: SERVICE_INFO (duration/process question, will ask which service)")
+                metadata['reason'] = 'service_info_no_context'
+                return Lane.SERVICE_INFO, metadata
+
+        # 3. Try service alias match (for PRICE lane)
         alias_map = clinic.get('service_aliases', {})
         if alias_map:
             match = self.language.match_service_alias(
@@ -236,6 +273,27 @@ class RouterService:
 
         return False
 
+    def _has_service_info_keywords(self, message: str, language: str) -> bool:
+        """
+        Check if message contains service info keywords
+
+        Args:
+            message: User message
+            language: Language code
+
+        Returns:
+            True if service info keywords found
+        """
+        message_lower = message.lower()
+        keywords = self.service_info_keywords.get(language, {})
+
+        for category, words in keywords.items():
+            if any(word in message_lower for word in words):
+                logger.debug(f"Service info category matched: {category}")
+                return True
+
+        return False
+
     def get_lane_metrics(self) -> Dict[str, int]:
         """
         Get lane usage metrics (for coverage tracking)
@@ -248,6 +306,7 @@ class RouterService:
         return {
             'faq': 0,
             'price': 0,
+            'service_info': 0,
             'scheduling': 0,
             'complex': 0
         }

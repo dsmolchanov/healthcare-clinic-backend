@@ -417,6 +417,42 @@ async def create_evolution_instance(data: EvolutionInstanceCreate):
 
         # Initialize Evolution API client using async context manager
         async with EvolutionAPIClient() as evolution_client:
+            # ORPHAN CLEANUP: Delete any orphaned instances for this organization
+            # This prevents multiple instances from accumulating when frontend retries
+            try:
+                print(f"[Create] Checking for orphaned instances for org {data.organization_id}...")
+                all_instances = await evolution_client.fetch_all_instances()
+
+                # Find instances that belong to this organization
+                org_prefix = f"clinic-{data.organization_id}-"
+                orphaned_instances = []
+
+                for inst_data in all_instances:
+                    inst = inst_data.get('instance', {})
+                    inst_name = inst.get('instanceName', '')
+
+                    # Check if this is an instance for our organization
+                    if inst_name.startswith(org_prefix) and inst_name != data.instance_name:
+                        orphaned_instances.append(inst_name)
+
+                # Delete orphaned instances
+                if orphaned_instances:
+                    print(f"[Create] Found {len(orphaned_instances)} orphaned instance(s) for org {data.organization_id}")
+                    for orphan in orphaned_instances:
+                        try:
+                            print(f"[Create] Deleting orphaned instance: {orphan}")
+                            await evolution_client.delete_instance(orphan)
+                            print(f"[Create] ✅ Deleted orphaned instance: {orphan}")
+                        except Exception as delete_error:
+                            print(f"[Create] ⚠️ Failed to delete orphaned instance {orphan}: {delete_error}")
+                            # Continue anyway - best effort cleanup
+                else:
+                    print(f"[Create] No orphaned instances found for org {data.organization_id}")
+
+            except Exception as cleanup_error:
+                print(f"[Create] ⚠️ Orphan cleanup failed (non-fatal): {cleanup_error}")
+                # Continue with instance creation even if cleanup fails
+
             # Create the instance
             result = await evolution_client.create_instance(
                 tenant_id=data.organization_id,  # Use organization_id as tenant_id

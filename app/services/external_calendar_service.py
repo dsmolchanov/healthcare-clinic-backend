@@ -452,8 +452,20 @@ class ExternalCalendarService:
         end_time: datetime
     ) -> Dict[str, Any]:
         """Check availability in internal database"""
+        # P0 GUARD: Validate doctor_id before database query
+        if not doctor_id or doctor_id == "None":
+            logger.error(f"_check_internal_availability called with invalid doctor_id: {doctor_id}")
+            raise ValueError(f"Invalid doctor_id: {doctor_id}. Must be valid UUID.")
+
         try:
-            # Check existing appointments
+            import uuid
+            uuid.UUID(doctor_id)
+        except (ValueError, AttributeError) as e:
+            logger.error(f"doctor_id failed UUID validation: {doctor_id}")
+            raise ValueError(f"doctor_id must be valid UUID, got: {doctor_id}") from e
+
+        try:
+            # Check existing appointments (NOW SAFE - doctor_id validated)
             result = self.supabase.table('appointments').select('*').eq(
                 'doctor_id', doctor_id
             ).eq(

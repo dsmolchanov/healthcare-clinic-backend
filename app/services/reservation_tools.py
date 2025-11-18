@@ -80,6 +80,36 @@ class ReservationTools:
         Returns:
             Dictionary with available slots and recommendations
         """
+        # P0 GUARD: Fail fast if doctor_id is None or "None" string
+        if doctor_id is not None and (doctor_id == "None" or str(doctor_id).strip() == ""):
+            logger.warning(
+                f"⚠️ check_availability called with invalid doctor_id: {doctor_id}. "
+                "This likely indicates an intent routing error."
+            )
+            return {
+                "success": False,
+                "error": "missing_doctor_context",
+                "message": "I need to know which doctor you'd like to see first. Could you specify the service or doctor?",
+                "requires_clarification": True,
+                "suggested_action": "ask_which_doctor",
+                "available_slots": []
+            }
+
+        # Validate doctor_id is valid UUID format if provided
+        if doctor_id is not None:
+            try:
+                import uuid
+                uuid.UUID(doctor_id)
+            except (ValueError, AttributeError):
+                logger.error(f"Invalid doctor_id format: {doctor_id}")
+                return {
+                    "success": False,
+                    "error": "invalid_doctor_id",
+                    "message": "I encountered an error. Let me connect you with our team.",
+                    "requires_escalation": True,
+                    "available_slots": []
+                }
+
         try:
             # Parse preferred date
             if preferred_date:

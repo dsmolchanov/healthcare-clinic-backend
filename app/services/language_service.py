@@ -225,6 +225,33 @@ class LanguageService:
             service_name = context.get('service_name', 'servicio')
             price = context.get('price', 'N/A')
             return f"{first_name}, el precio de {service_name} es {price}."
+        elif template_name == "service_info_ask_which_service":
+            # P0: Clarifying prompt when service context is missing
+            first_name = context.get('first_name', '')
+            services = context.get('services', [])
+            greeting = f"{first_name}, " if first_name else ""
+            service_list = ", ".join(services[:3]) if services else "nuestros servicios"
+            return f"{greeting}¿Sobre cuál servicio te gustaría saber más? Ofrecemos: {service_list}."
+        elif template_name == "service_info_response":
+            # P0: Service info response with duration/process/price
+            first_name = context.get('first_name', '')
+            service_name = context.get('service_name', 'este servicio')
+            duration = context.get('duration_minutes', 30)
+            price = context.get('price_display', 'N/A')
+            greeting = f"{first_name}, " if first_name else ""
+
+            response = f"{greeting}{service_name} dura aproximadamente {duration} minutos"
+            if context.get('description'):
+                response += f". {context['description']}"
+            response += f". El precio es {price}."
+
+            if context.get('preparation_notes'):
+                response += f" {context['preparation_notes']}"
+
+            if context.get('include_booking_prompt'):
+                response += " ¿Te gustaría agendar una cita?"
+
+            return response
         return "Template not available"
 
     def format_currency(

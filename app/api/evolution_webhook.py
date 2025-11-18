@@ -218,7 +218,14 @@ async def process_webhook_by_token(webhook_token: str, body_bytes: bytes):
         # Send response via Evolution API (use instance_name from config)
         instance_name = clinic_info.get('instance_name')
         if instance_name:
-            await send_whatsapp_via_evolution(instance_name, from_number, ai_response)
+            conversation_id = f"whatsapp_{from_number}_{clinic_id[:8]}"
+            await send_whatsapp_via_evolution(
+                instance_name,
+                from_number,
+                ai_response,
+                conversation_id,
+                clinic_id
+            )
         else:
             print(f"[Token Async] ⚠️  No instance_name in clinic_info, cannot send response")
 
@@ -708,7 +715,13 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
         # Send response back via Evolution API
         print(f"\n[Background] Step 6: Sending WhatsApp response...")
         send_start = datetime.datetime.now()
-        send_result = await send_whatsapp_via_evolution(actual_instance, from_number, ai_response)
+        send_result = await send_whatsapp_via_evolution(
+            actual_instance,
+            from_number,
+            ai_response,
+            session_id,
+            clinic_id
+        )
         send_end = datetime.datetime.now()
         send_duration = (send_end - send_start).total_seconds()
 
@@ -801,7 +814,13 @@ async def get_ai_response_with_rag(user_message: str, from_number: str, clinic_i
         return fallback
 
 
-async def send_whatsapp_via_evolution(instance_name: str, to_number: str, text: str) -> bool:
+async def send_whatsapp_via_evolution(
+    instance_name: str,
+    to_number: str,
+    text: str,
+    conversation_id: str,
+    clinic_id: str
+) -> bool:
     """
     Write WhatsApp message to outbox for async processing by OutboxProcessor worker.
 
@@ -812,6 +831,8 @@ async def send_whatsapp_via_evolution(instance_name: str, to_number: str, text: 
         instance_name: WhatsApp instance name
         to_number: Recipient phone number
         text: Message text content
+        conversation_id: Conversation identifier for replay capability
+        clinic_id: UUID of the clinic
 
     Returns:
         True if message was successfully written to outbox, False on immediate error
@@ -832,7 +853,9 @@ async def send_whatsapp_via_evolution(instance_name: str, to_number: str, text: 
             success = await write_to_outbox(
                 instance_name=instance_name,
                 to_number=to_number,
-                text_content=text,
+                message_text=text,
+                conversation_id=conversation_id,
+                clinic_id=clinic_id,
                 message_id=message_id
             )
 

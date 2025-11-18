@@ -239,6 +239,128 @@ class FastPathService:
             logger.error(f"Error in handle_faq_query: {e}", exc_info=True)
             return await self._fallback_to_complex(message, context, f"error: {str(e)}")
 
+    async def handle_service_info_query(
+        self,
+        message: str,
+        context: Dict[str, Any],
+        service_context: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Handle service info query (duration/process/preparation) with template response
+
+        Target: <600ms P50 latency
+
+        Args:
+            message: User message
+            context: Hydrated context
+            service_context: Service name if already identified
+
+        Returns:
+            Response dictionary with reply text and metadata
+        """
+        start_time = time.time()
+
+        try:
+            patient = context.get('patient', {})
+            clinic = context.get('clinic', {})
+            language = patient.get('preferred_language', 'es')
+            first_name = patient.get('first_name')
+
+            # If no service context, ask which service
+            if not service_context:
+                services = clinic.get('services', [])
+                service_list = [s.get('name', '') for s in services[:5]]  # Top 5 services
+
+                reply = self.language.render_template(
+                    'service_info_ask_which_service',
+                    language,
+                    {
+                        'first_name': first_name,
+                        'services': service_list
+                    }
+                )
+
+                # Update session to expect service selection
+                session_state = context.get('session_state', {})
+                session_id = session_state.get('session_id')
+
+                if session_id and self.session:
+                    await self.session.update_state(
+                        session_id,
+                        pending_action='service_info_clarification',
+                        last_intent='service_info'
+                    )
+
+                latency_ms = (time.time() - start_time) * 1000
+                logger.info(f"⚡ SERVICE_INFO handler (no context): {latency_ms:.2f}ms")
+
+                return {
+                    'reply': reply,
+                    'lane': 'service_info',
+                    'latency_ms': latency_ms,
+                    'requires_clarification': True
+                }
+
+            # We have service context - provide duration/process info
+            services = clinic.get('services', [])
+            service = next((s for s in services if s.get('name', '').lower() == service_context.lower()), None)
+
+            if not service:
+                logger.warning(f"Service {service_context} not found in clinic services")
+                return await self._fallback_to_complex(message, context, "service_not_found")
+
+            # Get service details
+            service_name = service.get('name', service_context)
+            duration_minutes = service.get('duration_minutes', 30)
+            description = service.get('description', '')
+            preparation_notes = service.get('preparation_notes', '')
+            price = service.get('price', 0)
+            currency = service.get('currency', 'MXN')
+            formatted_price = self._format_currency(price, currency, language)
+
+            # Render template with service details
+            reply = self.language.render_template(
+                'service_info_response',
+                language,
+                {
+                    'first_name': first_name,
+                    'service_name': service_name,
+                    'duration_minutes': duration_minutes,
+                    'description': description,
+                    'preparation_notes': preparation_notes,
+                    'price_display': formatted_price,
+                    'include_booking_prompt': True
+                }
+            )
+
+            # Update session with service info provided
+            session_state = context.get('session_state', {})
+            session_id = session_state.get('session_id')
+
+            if session_id and self.session:
+                await self.session.update_state(
+                    session_id,
+                    last_service_mentioned=service_context,
+                    pending_action='offer_booking',
+                    last_intent='service_info'
+                )
+
+            # Track performance
+            latency_ms = (time.time() - start_time) * 1000
+            logger.info(f"⚡ SERVICE_INFO handler: {latency_ms:.2f}ms (target: <600ms)")
+
+            return {
+                'reply': reply,
+                'lane': 'service_info',
+                'service_name': service_name,
+                'latency_ms': latency_ms,
+                'next_action': 'offer_booking'
+            }
+
+        except Exception as e:
+            logger.error(f"Error in handle_service_info_query: {e}", exc_info=True)
+            return await self._fallback_to_complex(message, context, f"error: {str(e)}")
+
     def _format_currency(
         self,
         amount: float,
