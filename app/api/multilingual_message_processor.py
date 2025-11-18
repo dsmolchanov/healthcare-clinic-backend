@@ -230,6 +230,15 @@ class MultilingualMessageProcessor:
             logger.info(f"🔄 HARD RESET: New session {managed_session_id}")
             await self.constraints_manager.clear_constraints(managed_session_id)
 
+            # PHASE 2.5.4: Clear stale memories (older than 72 hours)
+            cleared_count = await self.memory_manager.clear_stale_memories(
+                phone_number=request.from_phone,
+                clinic_id=effective_clinic_id,
+                older_than_hours=72
+            )
+            if cleared_count > 0:
+                logger.info(f"🗑️ Hard reset: cleared {cleared_count} stale memories")
+
             # Get profile-level carryover data (language, allergies, hard bans)
             carryover = await self.session_manager.get_carryover_data(managed_session_id)
 
@@ -242,22 +251,16 @@ class MultilingualMessageProcessor:
                     )
 
         elif reset_type == ResetType.SOFT:
-            # SOFT RESET (4 hours): Clear EPISODE data but keep profile
-            logger.info(f"🔄 SOFT RESET: Clearing episode data for session {managed_session_id}")
+            # SOFT RESET (4 hours): Clear EPISODE data AND exclusions
+            # PHASE 2.5.3: Exclusions should also be cleared on soft reset to prevent
+            # old "Забудьте про Дана" from affecting new conversations
+            logger.info(f"🔄 SOFT RESET: Clearing episode + exclusions for session {managed_session_id}")
 
-            # Get current constraints
-            current_constraints = await self.constraints_manager.get_constraints(managed_session_id)
+            # Clear ALL constraints (episode + exclusions)
+            # Only hard safety bans (from patient profile) persist across hard resets
+            await self.constraints_manager.clear_constraints(managed_session_id)
 
-            # Clear episode-level data (desired service, time window)
-            # Keep profile-level data (excluded doctors/services from hard bans)
-            await self.constraints_manager.update_constraints(
-                managed_session_id,
-                desired_service=None,  # Clear
-                desired_service_id=None,  # Clear
-                time_window=None  # Clear
-            )
-
-            logger.info(f"✅ Cleared episode data, keeping {len(current_constraints.excluded_doctors)} excluded doctors")
+            logger.info(f"✅ Cleared all episode data and exclusions (4-hour soft reset)")
 
         elif is_new_session:
             # Fallback for legacy code path

@@ -974,9 +974,21 @@ class ConversationMemoryManager:
         self,
         phone_number: str,
         clinic_id: Optional[str],
-        limit: int
-    ) -> List[str]:
-        """Fetch recent mem0 summaries from Supabase metadata cache."""
+        limit: int,
+        time_window_hours: Optional[int] = None
+    ) -> List[Tuple[str, Optional[datetime]]]:
+        """
+        Fetch recent mem0 summaries from Supabase metadata cache.
+
+        Args:
+            phone_number: User's phone number
+            clinic_id: Clinic identifier
+            limit: Max number of summaries
+            time_window_hours: Optional time window filter (e.g., 4 for soft reset)
+
+        Returns:
+            List of (summary, created_at) tuples
+        """
 
         def _query():
             query = self.supabase.table('conversation_messages').select('metadata, created_at')
@@ -986,18 +998,34 @@ class ConversationMemoryManager:
                 query = query.eq('metadata->>clinic_id', clinic_id)
 
             query = query.filter('metadata->>mem0_summary', 'not.is', 'null')
+
+            # Phase 2.5: Add time window filter
+            if time_window_hours:
+                threshold = datetime.utcnow() - timedelta(hours=time_window_hours)
+                query = query.gte('created_at', threshold.isoformat())
+
             query = query.order('created_at', desc=True).limit(limit)
             response = query.execute()
             return response.data or []
 
         try:
             rows = await asyncio.to_thread(_query)
-            summaries: List[str] = []
+            summaries: List[Tuple[str, Optional[datetime]]] = []
             for row in rows:
                 metadata = row.get('metadata') or {}
                 summary = metadata.get('mem0_summary')
+                created_at_str = row.get('created_at')
+
                 if summary:
-                    summaries.append(summary)
+                    # Parse created_at
+                    created_at = None
+                    if created_at_str:
+                        try:
+                            created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+                        except Exception:
+                            pass
+
+                    summaries.append((summary, created_at))
             return summaries
         except Exception as exc:
             logger.debug(f"Cached mem0 summary fetch failed: {exc}")
@@ -1099,6 +1127,58 @@ class ConversationMemoryManager:
         except Exception as e:
             logger.debug(f"Redis mem0 cache write failed (non-critical): {e}")
 
+    async def clear_stale_memories(
+        self,
+        phone_number: str,
+        clinic_id: Optional[str] = None,
+        older_than_hours: int = 72  # 3 days for hard reset
+    ) -> int:
+        """
+        Clear stale mem0 memories older than threshold (for hard reset).
+
+        Args:
+            phone_number: User's phone number
+            clinic_id: Clinic identifier
+            older_than_hours: Clear memories older than this (default 72 hours)
+
+        Returns:
+            Number of memories cleared
+        """
+        clean_phone = phone_number.replace("@s.whatsapp.net", "")
+        cleared_count = 0
+
+        try:
+            # Clear from Supabase cache
+            threshold = datetime.utcnow() - timedelta(hours=older_than_hours)
+
+            def _delete_query():
+                query = self.supabase.table('conversation_messages')
+                query = query.delete()
+                query = query.eq('metadata->>from_number', clean_phone)
+
+                if clinic_id:
+                    query = query.eq('metadata->>clinic_id', clinic_id)
+
+                query = query.filter('metadata->>mem0_summary', 'not.is', 'null')
+                query = query.lt('created_at', threshold.isoformat())
+
+                response = query.execute()
+                return response.data
+
+            deleted = await asyncio.to_thread(_delete_query)
+            if deleted:
+                cleared_count = len(deleted)
+
+            logger.info(f"🗑️ Cleared {cleared_count} stale memories (older than {older_than_hours}h)")
+
+            # TODO: Also clear from mem0 cloud if using remote mem0
+            # For now, we rely on mem0's own TTL and cache invalidation
+
+        except Exception as e:
+            logger.warning(f"Failed to clear stale memories: {e}")
+
+        return cleared_count
+
     def _create_synthetic_constraint_memories(
         self,
         constraints: 'ConversationConstraints'
@@ -1149,10 +1229,11 @@ class ConversationMemoryManager:
         query: Optional[str] = None,
         limit: int = 5,
         session_id: Optional[str] = None,
-        pin_constraints: bool = True
+        pin_constraints: bool = True,
+        time_window_hours: Optional[int] = 4  # Default: 4-hour soft reset window
     ) -> List[str]:
         """
-        Get memory context for a phone number with optional constraint pinning.
+        Get memory context for a phone number with session-scoped filtering.
 
         Args:
             phone_number: User's phone number
@@ -1161,6 +1242,7 @@ class ConversationMemoryManager:
             limit: Max memories to return (default 5)
             session_id: Optional session ID for constraint pinning
             pin_constraints: If True, prepend synthetic constraint memories (default True)
+            time_window_hours: Time window for memory filtering (default 4 hours)
 
         Returns:
             List of memory strings with pinned constraints at top
@@ -1168,7 +1250,7 @@ class ConversationMemoryManager:
 
         clean_phone = phone_number.replace("@s.whatsapp.net", "")
 
-        # PHASE 2.2: Pin active constraints to top of memory context
+        # PHASE 2.3: Pin active constraints to top of memory context with emphasis
         pinned_memories = []
         if pin_constraints and session_id:
             try:
@@ -1179,16 +1261,25 @@ class ConversationMemoryManager:
                 constraints = await constraints_manager.get_constraints(session_id)
 
                 if constraints:
-                    pinned_memories = self._create_synthetic_constraint_memories(constraints)
-                    logger.info(f"📌 Pinned {len(pinned_memories)} constraint memories to top")
+                    raw_pins = self._create_synthetic_constraint_memories(constraints)
+                    # PHASE 2.5.2: Emphasize pinned memories with special markers
+                    pinned_memories = [
+                        f"⚠️ CURRENT INTENT: {pin}" for pin in raw_pins
+                    ]
+                    logger.info(f"📌 Pinned {len(pinned_memories)} emphasized constraint memories")
             except Exception as e:
                 logger.warning(f"Failed to pin constraints: {e}")
 
-        cached_summaries = await self._fetch_cached_mem0_summaries(
+        # PHASE 2.5.1: Session-scoped memory retrieval with time filtering
+        cached_summaries_with_time = await self._fetch_cached_mem0_summaries(
             phone_number=clean_phone,
             clinic_id=clinic_id,
-            limit=limit * 3
+            limit=limit * 3,
+            time_window_hours=time_window_hours  # Filter to recent window
         )
+
+        # Extract just the summaries for filtering and display
+        cached_summaries = [summary for summary, _ in cached_summaries_with_time]
 
         if query:
             lowered = query.lower()
@@ -1196,12 +1287,19 @@ class ConversationMemoryManager:
         else:
             cached_filtered = cached_summaries
 
-        # Start with pinned memories
+        # Start with emphasized pinned memories
         context: List[str] = list(pinned_memories)
+
+        logger.debug(
+            f"🔍 Memory context: {len(pinned_memories)} pinned, "
+            f"{len(cached_filtered)} from last {time_window_hours}h"
+        )
 
         # Add regular memories up to limit
         for summary in cached_filtered:
-            if summary not in context:  # Avoid duplicates
+            # Avoid duplicates (check without emphasis markers)
+            summary_text = summary.replace("⚠️ CURRENT INTENT: ", "")
+            if summary_text not in [c.replace("⚠️ CURRENT INTENT: ", "") for c in context]:
                 context.append(summary)
             if len(context) >= limit:
                 return context
