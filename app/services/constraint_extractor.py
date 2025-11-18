@@ -23,6 +23,17 @@ class ConstraintExtractor:
         'he': ['שכח', 'לא צריך', 'לא רוצה']
     }
 
+    # Blacklist of sentence words that indicate extraction failure
+    SENTENCE_FRAGMENT_WORDS = {
+        'ru': ['списке', 'врачей', 'сказал', 'сказала', 'записать', 'нашли', 'выдали',
+               'попросил', 'попросила', 'которого', 'которую', 'потом', 'после'],
+        'en': ['list', 'said', 'told', 'asked', 'found', 'showed', 'doctor', 'doctors',
+               'which', 'whom', 'that', 'then', 'after'],
+        'es': ['lista', 'dijo', 'preguntó', 'encontró', 'mostró', 'médico', 'médicos',
+               'cual', 'quien', 'entonces', 'después'],
+        'he': ['רשימה', 'אמר', 'אמרה', 'ביקש', 'מצא', 'הראה', 'רופא', 'רופאים']
+    }
+
     SWITCH_KEYWORDS = {
         'ru': ['вместо', 'лучше', 'хочу', 'давайте', 'переключимся'],
         'en': ['instead', 'rather', 'want', 'let\'s switch'],
@@ -32,7 +43,7 @@ class ConstraintExtractor:
 
     def detect_forget_pattern(self, message: str, language: str = 'ru') -> Optional[List[str]]:
         """
-        Detect 'Forget about X' patterns.
+        Detect 'Forget about X' patterns with validation.
 
         Returns:
             List of entities to exclude (e.g., ["Dan", "пломба"])
@@ -44,31 +55,81 @@ class ConstraintExtractor:
 
         for keyword in keywords:
             if keyword in message_lower:
-                # Extract what comes after the keyword
-                pattern = rf'{keyword}\s+(про\s+)?(.+?)(?:\s+и\s+|\s*$|[.,!?])'
+                # Extract what comes after the keyword - TIGHTENED with length limit
+                pattern = rf'{keyword}\s+(про\s+)?([а-яёa-z\s]{{3,25}}?)(?:\s+и\s+|\s*$|[.,!?])'
                 matches = re.findall(pattern, message_lower, re.IGNORECASE)
 
                 for match in matches:
                     entity = match[-1].strip()
-                    if entity:
+                    if entity and self._validate_extracted_constraint(entity, language):
                         entities_to_exclude.append(entity)
+                    elif entity:
+                        logger.warning(f"🚫 Invalid entity in forget pattern: '{entity}'")
 
         return entities_to_exclude if entities_to_exclude else None
 
+    def _validate_extracted_constraint(self, entity: str, language: str = 'ru') -> bool:
+        """
+        Validate extracted constraint to prevent garbage extraction.
+
+        Returns True if entity is valid, False if it's garbage/sentence fragment.
+
+        Validation layers:
+        1. Length check (>50 chars → reject)
+        2. Word count (>4 words → reject)
+        3. Sentence fragment detection (contains blacklist words → reject)
+        4. Verb detection (ends in verb suffixes → reject)
+        """
+        if not entity or not isinstance(entity, str):
+            return False
+
+        entity = entity.strip()
+
+        # Layer 1: Length check
+        if len(entity) > 50:
+            logger.warning(f"🚫 Rejected constraint (too long): '{entity[:50]}...'")
+            return False
+
+        # Layer 2: Word count
+        words = entity.split()
+        if len(words) > 4:
+            logger.warning(f"🚫 Rejected constraint (too many words): '{entity}'")
+            return False
+
+        # Layer 3: Sentence fragment detection
+        blacklist = self.SENTENCE_FRAGMENT_WORDS.get(language, self.SENTENCE_FRAGMENT_WORDS['en'])
+        entity_lower = entity.lower()
+        for blacklist_word in blacklist:
+            if blacklist_word in entity_lower:
+                logger.warning(f"🚫 Rejected constraint (contains '{blacklist_word}'): '{entity}'")
+                return False
+
+        # Layer 4: Verb detection (Russian-specific)
+        if language == 'ru':
+            # Check for verb endings (past tense, infinitive)
+            if any(entity_lower.endswith(suffix) for suffix in ['ли', 'ла', 'ло', 'ть', 'ти', 'чь']):
+                logger.warning(f"🚫 Rejected constraint (verb detected): '{entity}'")
+                return False
+
+        return True
+
     def detect_switch_pattern(self, message: str, language: str = 'ru') -> Optional[Tuple[str, str]]:
         """
-        Detect 'Instead of X, I want Y' patterns.
+        Detect 'Instead of X, I want Y' patterns with validation.
 
         Returns:
             Tuple of (exclude_entity, desired_entity) or None
         """
         message_lower = message.lower()
 
-        # Pattern: "вместо X хочу Y" or "не X, а Y"
+        # Tightened patterns with length limits to prevent sentence capture
+        # Pattern 1: Explicit "instead of" switch
         patterns = [
-            r'вместо\s+(.+?)\s+хочу\s+(.+?)(?:\s*$|[.,!?])',
-            r'не\s+(.+?),?\s+а\s+(.+?)(?:\s*$|[.,!?])',
-            r'instead of\s+(.+?),?\s+(?:I want|prefer)\s+(.+?)(?:\s*$|[.,!?])'
+            r'вместо\s+([а-яё\s]{3,25}?)\s+(?:хочу|желаю|нужн[оа])\s+([а-яё\s]{3,25}?)(?:\s*$|[.,!?])',
+            # Pattern 2: "not X, but Y" - MORE RESTRICTIVE (shorter capture, Cyrillic only)
+            r'не\s+([а-яё\s]{3,20}?),?\s+а\s+([а-яё\s]{3,20}?)(?:\s*$|[.,!?])',
+            # Pattern 3: English
+            r'instead of\s+([a-z\s]{3,25}?),?\s+(?:I want|prefer)\s+([a-z\s]{3,25}?)(?:\s*$|[.,!?])'
         ]
 
         for pattern in patterns:
@@ -76,6 +137,17 @@ class ConstraintExtractor:
             if match:
                 exclude_entity = match.group(1).strip()
                 desired_entity = match.group(2).strip()
+
+                # CRITICAL: Validate both entities before returning
+                if not self._validate_extracted_constraint(exclude_entity, language):
+                    logger.warning(f"🚫 Invalid exclude entity in switch: '{exclude_entity}'")
+                    continue
+
+                if not self._validate_extracted_constraint(desired_entity, language):
+                    logger.warning(f"🚫 Invalid desired entity in switch: '{desired_entity}'")
+                    continue
+
+                # Both entities passed validation
                 return (exclude_entity, desired_entity)
 
         return None

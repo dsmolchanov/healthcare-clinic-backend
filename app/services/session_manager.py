@@ -18,20 +18,29 @@ class SessionState(str, Enum):
     CLOSED = "closed"
 
 
+class ResetType(str, Enum):
+    """Types of session reset"""
+    NONE = "none"
+    SOFT = "soft"  # 4 hours - clear episode data (desired service, time window)
+    HARD = "hard"  # 3 days - clear all but profile (language, allergies, hard bans)
+
+
 class SessionSplitSignal:
     """Calculates session split score based on multiple signals"""
 
     # Weights for split signals (tune per clinic)
+    WEIGHT_TIME_GAP_4H = 0.5  # Soft reset threshold
     WEIGHT_TIME_GAP_24H = 0.3
     WEIGHT_TIME_GAP_48H = 0.6
-    WEIGHT_TIME_GAP_72H = 1.0  # Alone is enough
+    WEIGHT_TIME_GAP_72H = 1.0  # Hard reset threshold
     WEIGHT_TOPIC_DRIFT_MEDIUM = 0.4
     WEIGHT_TOPIC_DRIFT_HIGH = 0.8
     WEIGHT_HARD_CORRECTION = 0.7
     WEIGHT_OUTCOME_EVENT = 1.0
     WEIGHT_EXPLICIT_RESET = 1.0
 
-    SPLIT_THRESHOLD = 1.0  # Start new session when score >= 1.0
+    SOFT_RESET_THRESHOLD = 0.5  # Clear episode data
+    HARD_RESET_THRESHOLD = 1.0  # Start new session
 
     @classmethod
     def calculate_split_score(
@@ -41,17 +50,24 @@ class SessionSplitSignal:
         has_hard_correction: bool = False,
         has_outcome_event: bool = False,
         has_explicit_reset: bool = False
-    ) -> float:
-        """Calculate session split score from signals"""
+    ) -> Tuple[float, 'ResetType']:
+        """
+        Calculate session split score from signals.
+
+        Returns:
+            Tuple of (score, reset_type)
+        """
         score = 0.0
 
-        # Time gap signals
-        if time_gap_hours >= 72:
+        # Time gap signals with hierarchy
+        if time_gap_hours >= 72:  # 3 days
             score += cls.WEIGHT_TIME_GAP_72H
         elif time_gap_hours >= 48:
             score += cls.WEIGHT_TIME_GAP_48H
         elif time_gap_hours >= 24:
             score += cls.WEIGHT_TIME_GAP_24H
+        elif time_gap_hours >= 4:  # 4 hours - soft reset trigger
+            score += cls.WEIGHT_TIME_GAP_4H
 
         # Topic drift
         if topic_drift is not None:
@@ -68,12 +84,19 @@ class SessionSplitSignal:
         if has_explicit_reset:
             score += cls.WEIGHT_EXPLICIT_RESET
 
+        # Determine reset type
+        reset_type = ResetType.NONE
+        if score >= cls.HARD_RESET_THRESHOLD:
+            reset_type = ResetType.HARD
+        elif score >= cls.SOFT_RESET_THRESHOLD:
+            reset_type = ResetType.SOFT
+
         logger.debug(
-            f"Split score: {score:.2f} (gap={time_gap_hours:.1f}h, "
+            f"Split score: {score:.2f} reset={reset_type} (gap={time_gap_hours:.1f}h, "
             f"drift={topic_drift}, correction={has_hard_correction})"
         )
 
-        return score
+        return score, reset_type
 
 
 class SessionManager:
@@ -92,12 +115,15 @@ class SessionManager:
         clinic_id: str,
         message: str,
         current_time: datetime
-    ) -> Tuple[str, bool]:  # (session_id, is_new_session)
+    ) -> Tuple[str, bool, Optional[ResetType]]:  # (session_id, is_new_session, reset_type)
         """
-        Check if session boundary should be created.
+        Check if session boundary or soft reset should be triggered.
 
         Returns:
-            Tuple of (session_id, is_new_session_flag)
+            Tuple of (session_id, is_new_session_flag, reset_type)
+            - reset_type=SOFT: Clear episode data (desired service, time window)
+            - reset_type=HARD: New session created
+            - reset_type=NONE: Continue session
         """
         key = self._make_session_key(phone, clinic_id)
         session_data = self.redis.hgetall(key)
@@ -105,7 +131,7 @@ class SessionManager:
         if not session_data:
             # First time user or expired session
             session_id, _ = await self._create_new_session(phone, clinic_id, current_time)
-            return session_id, True
+            return session_id, True, ResetType.HARD
 
         session_id = session_data.get('session_id')
         last_activity_str = session_data.get('last_activity')
@@ -114,18 +140,18 @@ class SessionManager:
 
         time_gap_hours = (current_time - last_activity).total_seconds() / 3600
 
-        # Calculate split score
-        split_score = SessionSplitSignal.calculate_split_score(
+        # Calculate split score and reset type
+        split_score, reset_type = SessionSplitSignal.calculate_split_score(
             time_gap_hours=time_gap_hours,
             # TODO: Add topic drift calculation in future enhancement
             # TODO: Detect hard corrections from message (Phase 2 integration)
             # TODO: Check for outcome events from appointments table
         )
 
-        # Check if we should split
-        if split_score >= SessionSplitSignal.SPLIT_THRESHOLD:
+        # Handle reset based on type
+        if reset_type == ResetType.HARD:
             logger.info(
-                f"🔄 Session split triggered (score={split_score:.2f}, gap={time_gap_hours:.1f}h)"
+                f"🔄 HARD RESET: Creating new session (score={split_score:.2f}, gap={time_gap_hours:.1f}h)"
             )
 
             # Archive old session
@@ -136,13 +162,26 @@ class SessionManager:
                 phone, clinic_id, current_time, previous_session_id=session_id
             )
 
-            return new_session_id, True
-        else:
-            # Update heartbeat
+            return new_session_id, True, ResetType.HARD
+
+        elif reset_type == ResetType.SOFT:
+            logger.info(
+                f"🔄 SOFT RESET: Clearing episode data (score={split_score:.2f}, gap={time_gap_hours:.1f}h)"
+            )
+
+            # Update heartbeat but return soft reset flag
+            # Caller should clear episode-level constraints
             self.redis.hset(key, 'last_activity', current_time.isoformat())
             self.redis.hset(key, 'state', SessionState.ACTIVE.value)
 
-            return session_id, False
+            return session_id, False, ResetType.SOFT
+
+        else:
+            # Update heartbeat - normal continuation
+            self.redis.hset(key, 'last_activity', current_time.isoformat())
+            self.redis.hset(key, 'state', SessionState.ACTIVE.value)
+
+            return session_id, False, ResetType.NONE
 
     async def _create_new_session(
         self,
@@ -191,7 +230,7 @@ class SessionManager:
 
         logger.info(f"🗄️ Archived session {session_id}")
 
-    async def get_carryover_data(self, previous_session_id: str) -> Dict:
+    async def get_carryover_data(self, session_id: str) -> Dict:
         """
         Retrieve data that should carry over to new session.
 
@@ -204,10 +243,51 @@ class SessionManager:
         - desired_service
         - time_window
         - soft preferences
+
+        Returns:
+            Dict with profile-level data to restore in new session
         """
-        # Query mem0 for profile-level data
-        # For now, return placeholder - implement in Phase 5 enhancement
-        return {
-            'profile_data': {},
-            'pending_reminders': []
+        carryover = {
+            'language_preference': None,
+            'allergies': [],
+            'hard_doctor_bans': [],
+            'hard_service_bans': []
         }
+
+        try:
+            # Get session from Supabase to find previous session
+            session_response = self.supabase.table('conversation_sessions').select('*').eq('id', session_id).limit(1).execute()
+
+            if not session_response.data:
+                return carryover
+
+            session = session_response.data[0]
+            previous_session_id = session.get('metadata', {}).get('previous_session_id')
+
+            if not previous_session_id:
+                return carryover
+
+            # Get constraints from previous session (if available in Redis)
+            from app.services.conversation_constraints import ConstraintsManager
+            from app.config import get_redis_client
+
+            constraints_manager = ConstraintsManager(get_redis_client())
+            prev_constraints = await constraints_manager.get_constraints(previous_session_id)
+
+            # Extract profile-level data (hard bans only, not episode-level desires)
+            # Hard bans are exclusions that persist across sessions for safety/preference
+            carryover['hard_doctor_bans'] = list(prev_constraints.excluded_doctors) if prev_constraints.excluded_doctors else []
+            carryover['hard_service_bans'] = list(prev_constraints.excluded_services) if prev_constraints.excluded_services else []
+
+            # TODO: Get language preference from patient profile
+            # TODO: Get allergies from patient profile (medical safety)
+
+            logger.info(
+                f"📋 Carryover data: {len(carryover['hard_doctor_bans'])} doctor bans, "
+                f"{len(carryover['hard_service_bans'])} service bans"
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to get carryover data: {e}")
+
+        return carryover

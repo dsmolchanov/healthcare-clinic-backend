@@ -73,14 +73,17 @@ class ToolStateGate:
                     f"🔄 Rewriting service: {service_name} → {constraints.desired_service}"
                 )
 
-        # Enforce desired service if set
+        # Enforce desired service if set - HARD BLOCKING
         elif constraints.desired_service and service_name:
             if constraints.desired_service.lower() not in service_name:
-                logger.warning(
-                    f"⚠️  Service mismatch: tool uses '{service_name}' "
-                    f"but user wants '{constraints.desired_service}'"
+                errors.append(
+                    f"❌ Service mismatch: tool uses '{service_name}' "
+                    f"but user wants '{constraints.desired_service}'. BLOCKING."
                 )
                 fixes['service_name'] = constraints.desired_service
+                logger.error(
+                    f"🚫 BLOCKING service mismatch: '{service_name}' != '{constraints.desired_service}'"
+                )
 
         # 2. Check doctor against constraints
         doctor_name = arguments.get('doctor_name', '').lower()

@@ -8,8 +8,122 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+
+class RussianMorphology:
+    """
+    Russian name normalization for constraint matching.
+
+    Handles case variations (genitive, dative, accusative → nominative)
+    and fuzzy matching for names.
+    """
+
+    # Common Russian name endings by case
+    GENITIVE_ENDINGS = {
+        # Male names: Ивана → Иван, Марка → Марк
+        'а': '',  # Иван-а → Иван
+        'я': '',  # Арсени-я → Арсений
+
+        # Female names: Марии → Мария, Анны → Анна
+        'ии': 'ия',  # Мар-ии → Мария
+        'ны': 'на',  # Ан-ны → Анна
+        'ры': 'ра',  # Ве-ры → Вера
+    }
+
+    DATIVE_ENDINGS = {
+        # "к доктору Марку" → Марк
+        'у': '',  # Марк-у → Марк, Иван-у → Иван
+        'е': 'а',  # Мари-е → Мария
+        'и': 'а',  # Анн-и → Анна
+    }
+
+    @classmethod
+    def normalize_russian_name(cls, name: str) -> List[str]:
+        """
+        Generate possible nominative forms of a Russian name.
+
+        Args:
+            name: Name in any case (e.g., "Марку", "Дана", "Марии")
+
+        Returns:
+            List of possible nominative forms ["Марк", "Дан", "Мария"]
+        """
+        if not name or len(name) < 3:
+            return [name]
+
+        name_lower = name.lower().strip()
+        variants = [name]  # Always include original
+
+        # Try genitive → nominative
+        for ending, replacement in cls.GENITIVE_ENDINGS.items():
+            if name_lower.endswith(ending) and len(name_lower) > len(ending) + 1:
+                base = name_lower[:-len(ending)] if ending else name_lower
+                nominative = base + replacement
+                if nominative not in [v.lower() for v in variants]:
+                    # Capitalize first letter
+                    variants.append(nominative.capitalize())
+
+        # Try dative → nominative
+        for ending, replacement in cls.DATIVE_ENDINGS.items():
+            if name_lower.endswith(ending) and len(name_lower) > len(ending) + 1:
+                base = name_lower[:-len(ending)] if ending else name_lower
+                nominative = base + replacement
+                if nominative not in [v.lower() for v in variants]:
+                    variants.append(nominative.capitalize())
+
+        return variants
+
+    @classmethod
+    def fuzzy_match(cls, name1: str, name2: str, threshold: int = 2) -> bool:
+        """
+        Check if two names match with Levenshtein distance.
+
+        Args:
+            name1: First name
+            name2: Second name
+            threshold: Max edit distance (default 2)
+
+        Returns:
+            True if names match within threshold
+        """
+        if not name1 or not name2:
+            return False
+
+        name1_lower = name1.lower().strip()
+        name2_lower = name2.lower().strip()
+
+        # Exact match
+        if name1_lower == name2_lower:
+            return True
+
+        # Calculate Levenshtein distance (simple implementation)
+        distance = cls._levenshtein_distance(name1_lower, name2_lower)
+        return distance <= threshold
+
+    @classmethod
+    def _levenshtein_distance(cls, s1: str, s2: str) -> int:
+        """Calculate Levenshtein distance between two strings"""
+        if len(s1) < len(s2):
+            return cls._levenshtein_distance(s2, s1)
+
+        if len(s2) == 0:
+            return len(s1)
+
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                # Cost of insertions, deletions, or substitutions
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+
+        return previous_row[-1]
 
 
 @dataclass
@@ -86,19 +200,82 @@ class ConversationConstraints:
         return cls(**data)
 
     def should_exclude_doctor(self, doctor_name: Optional[str], doctor_id: Optional[str]) -> bool:
-        """Check if doctor should be excluded"""
-        if doctor_name and doctor_name.lower() in {d.lower() for d in self.excluded_doctors}:
-            return True
+        """
+        Check if doctor should be excluded with Russian morphology support.
+
+        Handles case variations: "Марку" matches "Марк", "Дана" matches "Дан"
+        """
+        # Check by ID first (exact match)
         if doctor_id and doctor_id in self.excluded_doctor_ids:
             return True
+
+        if not doctor_name:
+            return False
+
+        # Simple case-insensitive match
+        doctor_lower = doctor_name.lower().strip()
+        if doctor_lower in {d.lower() for d in self.excluded_doctors}:
+            return True
+
+        # Phase 2.4: Russian morphology normalization
+        # Generate case variants of the input name
+        name_variants = RussianMorphology.normalize_russian_name(doctor_name)
+
+        # Check if any variant matches excluded doctors
+        for variant in name_variants:
+            if variant.lower() in {d.lower() for d in self.excluded_doctors}:
+                logger.debug(f"🔍 Morphology match: '{doctor_name}' → '{variant}' in exclusions")
+                return True
+
+        # Check excluded names against input variants (reverse check)
+        for excluded_doctor in self.excluded_doctors:
+            excluded_variants = RussianMorphology.normalize_russian_name(excluded_doctor)
+            for variant in excluded_variants:
+                if variant.lower() == doctor_lower:
+                    logger.debug(f"🔍 Morphology match: excluded '{excluded_doctor}' → '{variant}' matches '{doctor_name}'")
+                    return True
+
+        # Phase 2.4: Fuzzy matching for typos (max edit distance 2)
+        for excluded_doctor in self.excluded_doctors:
+            if RussianMorphology.fuzzy_match(doctor_name, excluded_doctor, threshold=2):
+                logger.debug(f"🔍 Fuzzy match: '{doctor_name}' ≈ '{excluded_doctor}'")
+                return True
+
         return False
 
     def should_exclude_service(self, service_name: Optional[str], service_id: Optional[str]) -> bool:
-        """Check if service should be excluded"""
-        if service_name and service_name.lower() in {s.lower() for s in self.excluded_services}:
-            return True
+        """
+        Check if service should be excluded with Russian morphology support.
+
+        Handles case variations for service names.
+        """
+        # Check by ID first (exact match)
         if service_id and service_id in self.excluded_service_ids:
             return True
+
+        if not service_name:
+            return False
+
+        # Simple case-insensitive match
+        service_lower = service_name.lower().strip()
+        if service_lower in {s.lower() for s in self.excluded_services}:
+            return True
+
+        # Phase 2.4: Russian morphology for service names
+        # Less aggressive than doctor names (services are usually nouns, not names)
+        name_variants = RussianMorphology.normalize_russian_name(service_name)
+
+        for variant in name_variants:
+            if variant.lower() in {s.lower() for s in self.excluded_services}:
+                logger.debug(f"🔍 Morphology match: service '{service_name}' → '{variant}' in exclusions")
+                return True
+
+        # Fuzzy matching with lower threshold for services (threshold=1)
+        for excluded_service in self.excluded_services:
+            if RussianMorphology.fuzzy_match(service_name, excluded_service, threshold=1):
+                logger.debug(f"🔍 Fuzzy match: service '{service_name}' ≈ '{excluded_service}'")
+                return True
+
         return False
 
 

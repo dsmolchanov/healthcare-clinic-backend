@@ -213,15 +213,54 @@ class MultilingualMessageProcessor:
         effective_clinic_id = self._get_clinic_id_from_organization(raw_clinic_identifier)
 
         # Phase 0: Check session boundary (prevents old state from polluting new conversations)
-        managed_session_id, is_new_session = await self.session_manager.check_and_manage_boundary(
+        from app.services.session_manager import ResetType
+        managed_session_id, is_new_session, reset_type = await self.session_manager.check_and_manage_boundary(
             phone=request.from_phone,
             clinic_id=effective_clinic_id or request.clinic_id,
             message=request.body,
             current_time=datetime.utcnow()
         )
 
-        # If new session detected, clear constraints from previous episode
-        if is_new_session:
+        # CRITICAL FIX: Use managed_session_id for all constraint operations
+        session_id = managed_session_id
+
+        # Handle session resets
+        if reset_type == ResetType.HARD:
+            # HARD RESET (3 days): Clear ALL constraints, new session
+            logger.info(f"🔄 HARD RESET: New session {managed_session_id}")
+            await self.constraints_manager.clear_constraints(managed_session_id)
+
+            # Get profile-level carryover data (language, allergies, hard bans)
+            carryover = await self.session_manager.get_carryover_data(managed_session_id)
+
+            # Restore profile-level constraints from carryover
+            if carryover.get('hard_doctor_bans'):
+                for doctor in carryover['hard_doctor_bans']:
+                    await self.constraints_manager.update_constraints(
+                        managed_session_id,
+                        exclude_doctor=doctor
+                    )
+
+        elif reset_type == ResetType.SOFT:
+            # SOFT RESET (4 hours): Clear EPISODE data but keep profile
+            logger.info(f"🔄 SOFT RESET: Clearing episode data for session {managed_session_id}")
+
+            # Get current constraints
+            current_constraints = await self.constraints_manager.get_constraints(managed_session_id)
+
+            # Clear episode-level data (desired service, time window)
+            # Keep profile-level data (excluded doctors/services from hard bans)
+            await self.constraints_manager.update_constraints(
+                managed_session_id,
+                desired_service=None,  # Clear
+                desired_service_id=None,  # Clear
+                time_window=None  # Clear
+            )
+
+            logger.info(f"✅ Cleared episode data, keeping {len(current_constraints.excluded_doctors)} excluded doctors")
+
+        elif is_new_session:
+            # Fallback for legacy code path
             logger.info(f"🆕 New session detected: {managed_session_id}")
             await self.constraints_manager.clear_constraints(managed_session_id)
 
@@ -313,7 +352,9 @@ class MultilingualMessageProcessor:
         memory_task = self.memory_manager.get_memory_context(
             phone_number=request.from_phone,
             clinic_id=effective_clinic_id,
-            query=request.body
+            query=request.body,
+            session_id=session_id,  # Phase 2.2: Enable constraint pinning
+            pin_constraints=True
         )
 
         # Gather memory queries in parallel (return_exceptions to not fail on single error)

@@ -1099,16 +1099,90 @@ class ConversationMemoryManager:
         except Exception as e:
             logger.debug(f"Redis mem0 cache write failed (non-critical): {e}")
 
+    def _create_synthetic_constraint_memories(
+        self,
+        constraints: 'ConversationConstraints'
+    ) -> List[str]:
+        """
+        Create synthetic memories from active constraints for memory pinning.
+
+        These synthetic memories are ALWAYS prepended to mem0 results to ensure
+        constraints are never forgotten, bypassing top-K limits.
+
+        Returns:
+            List of constraint memories (max 3)
+        """
+        from app.services.conversation_constraints import ConversationConstraints
+
+        if not isinstance(constraints, ConversationConstraints):
+            return []
+
+        memories = []
+
+        # Pin 1: Desired service (current intent)
+        if constraints.desired_service:
+            memories.append(f"User wants: {constraints.desired_service}")
+
+        # Pin 2: Doctor exclusions (safety/preference)
+        if constraints.excluded_doctors:
+            excluded_list = ", ".join(list(constraints.excluded_doctors)[:3])
+            if len(constraints.excluded_doctors) > 3:
+                excluded_list += f" and {len(constraints.excluded_doctors) - 3} more"
+            memories.append(f"User does NOT want these doctors: {excluded_list}")
+
+        # Pin 3: Time window (when specified)
+        if constraints.time_window_start and constraints.time_window_display:
+            memories.append(f"User prefers appointments during: {constraints.time_window_display}")
+
+        # Pin 4: Service exclusions (if no desired service)
+        elif constraints.excluded_services and not constraints.desired_service:
+            excluded_list = ", ".join(list(constraints.excluded_services)[:3])
+            memories.append(f"User does NOT want these services: {excluded_list}")
+
+        logger.debug(f"📌 Created {len(memories)} pinned constraint memories")
+        return memories[:3]  # Max 3 pinned memories
+
     async def get_memory_context(
         self,
         phone_number: str,
         clinic_id: Optional[str] = None,
         query: Optional[str] = None,
-        limit: int = 5
+        limit: int = 5,
+        session_id: Optional[str] = None,
+        pin_constraints: bool = True
     ) -> List[str]:
-        """Get memory context for a phone number with detailed logging"""
+        """
+        Get memory context for a phone number with optional constraint pinning.
+
+        Args:
+            phone_number: User's phone number
+            clinic_id: Clinic identifier
+            query: Optional query to filter memories
+            limit: Max memories to return (default 5)
+            session_id: Optional session ID for constraint pinning
+            pin_constraints: If True, prepend synthetic constraint memories (default True)
+
+        Returns:
+            List of memory strings with pinned constraints at top
+        """
 
         clean_phone = phone_number.replace("@s.whatsapp.net", "")
+
+        # PHASE 2.2: Pin active constraints to top of memory context
+        pinned_memories = []
+        if pin_constraints and session_id:
+            try:
+                from app.services.conversation_constraints import ConstraintsManager
+                from app.config import get_redis_client
+
+                constraints_manager = ConstraintsManager(get_redis_client())
+                constraints = await constraints_manager.get_constraints(session_id)
+
+                if constraints:
+                    pinned_memories = self._create_synthetic_constraint_memories(constraints)
+                    logger.info(f"📌 Pinned {len(pinned_memories)} constraint memories to top")
+            except Exception as e:
+                logger.warning(f"Failed to pin constraints: {e}")
 
         cached_summaries = await self._fetch_cached_mem0_summaries(
             phone_number=clean_phone,
@@ -1122,9 +1196,13 @@ class ConversationMemoryManager:
         else:
             cached_filtered = cached_summaries
 
-        context: List[str] = []
+        # Start with pinned memories
+        context: List[str] = list(pinned_memories)
+
+        # Add regular memories up to limit
         for summary in cached_filtered:
-            context.append(summary)
+            if summary not in context:  # Avoid duplicates
+                context.append(summary)
             if len(context) >= limit:
                 return context
 
