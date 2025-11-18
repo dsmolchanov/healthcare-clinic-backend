@@ -17,6 +17,13 @@ from pydantic import BaseModel, Field
 
 from supabase import create_client, Client
 
+# Phase 0-6: Import constraint management services
+from app.services.session_manager import SessionManager
+from app.services.conversation_constraints import ConstraintsManager, ConversationConstraints
+from app.services.constraint_extractor import ConstraintExtractor
+from app.services.tool_state_gate import ToolStateGate
+from app.services.state_echo_formatter import StateEchoFormatter
+
 logger = logging.getLogger(__name__)
 
 # Pinecone removed (Phase 3) - using Supabase FTS + Redis cache instead
@@ -131,6 +138,15 @@ class MultilingualMessageProcessor:
         self.escalation_handler = EscalationHandler()
         self.followup_scheduler = FollowupScheduler()
 
+        # Phase 0-6: Initialize constraint management services
+        from app.config import get_redis_client
+        redis_client = get_redis_client()
+        self.session_manager = SessionManager(redis_client, get_supabase_client())
+        self.constraints_manager = ConstraintsManager(redis_client)
+        self.constraint_extractor = ConstraintExtractor()
+        self.state_gate = ToolStateGate()
+        self.state_echo_formatter = StateEchoFormatter()
+
         self._org_to_clinic_cache: Dict[str, str] = {}
         self._known_clinic_ids: Set[str] = set()
         self._patient_upsert_cache: Dict[Tuple[str, str], float] = {}
@@ -195,6 +211,24 @@ class MultilingualMessageProcessor:
         )
 
         effective_clinic_id = self._get_clinic_id_from_organization(raw_clinic_identifier)
+
+        # Phase 0: Check session boundary (prevents old state from polluting new conversations)
+        managed_session_id, is_new_session = await self.session_manager.check_and_manage_boundary(
+            phone=request.from_phone,
+            clinic_id=effective_clinic_id or request.clinic_id,
+            message=request.body,
+            current_time=datetime.utcnow()
+        )
+
+        # If new session detected, clear constraints from previous episode
+        if is_new_session:
+            logger.info(f"🆕 New session detected: {managed_session_id}")
+            await self.constraints_manager.clear_constraints(managed_session_id)
+
+            # Get carryover data from previous session (language, allergies, etc.)
+            carryover = await self.session_manager.get_carryover_data(managed_session_id)
+
+            # Note: Carryover reminders will be added to additional_context later if needed
 
         if effective_clinic_id:
             self._known_clinic_ids.add(effective_clinic_id)
@@ -532,18 +566,64 @@ DO NOT attempt to answer complex questions yourself.
             else:
                 logger.info(f"Fast-path failed or requested fallback, proceeding to LLM")
 
+        # Phase 2: Extract and update constraints from user message
+        # Use simple language detection from message (before full LLM call)
+        def detect_language_simple(text: str) -> str:
+            """Simple language detection based on character sets"""
+            if any(c in text for c in 'абвгдежзийклмнопрстуфхцчшщъыьэюя'):
+                return 'ru'
+            elif any(c in text for c in 'áéíóúñü'):
+                return 'es'
+            elif any('\u0590' <= c <= '\u05FF' for c in text):
+                return 'he'
+            else:
+                return 'en'
+
+        detected_language_prelim = detect_language_simple(request.body)
+
+        constraints = await self._extract_and_update_constraints(
+            session_id=session_id,
+            message=request.body,
+            detected_language=detected_language_prelim
+        )
+
+        # Log active constraints for observability
+        if constraints.excluded_doctors or constraints.excluded_services:
+            logger.info(
+                f"📋 Active constraints: "
+                f"desired={constraints.desired_service}, "
+                f"excluded_docs={list(constraints.excluded_doctors)}, "
+                f"excluded_svc={list(constraints.excluded_services)}"
+            )
+
         # Generate AI response with full context (for SCHEDULING, COMPLEX lanes, or fast-path fallback)
         ai_response, detected_language = await self._generate_response(
             user_message=request.body,
             clinic_name=resolved_clinic_name,
             clinic_id=effective_clinic_id or resolved_request_clinic_id or request.clinic_id,
+            session_id=session_id,  # Phase 4: Pass session_id for tool validation
             session_history=session_messages,
             knowledge_context=[],  # No RAG - knowledge via tools only
             memory_context=memory_context,
             user_preferences=user_preferences,
             additional_context=additional_context,
-            clinic_profile=clinic_profile
+            clinic_profile=clinic_profile,
+            constraints=constraints  # Phase 3: Pass constraints for prompt injection
         )
+
+        # Phase 6: Prepend state echo if significant constraints were added
+        if (constraints and (
+            constraints.excluded_doctors
+            or constraints.excluded_services
+            or constraints.desired_service
+            or constraints.time_window_start
+        )):
+            state_echo = self.state_echo_formatter.format_correction_acknowledgment(
+                constraints,
+                language=detected_language
+            )
+            # Prepend state echo to AI response
+            ai_response = state_echo + "\n\n" + ai_response
 
         # Update patient with extracted name and detected language
         if extracted_first or detected_language:
@@ -730,12 +810,14 @@ DO NOT attempt to answer complex questions yourself.
         user_message: str,
         clinic_name: str,
         clinic_id: str,
+        session_id: str,  # Phase 4: For tool validation
         session_history: List[Dict],
         knowledge_context: List[str] = None,
         memory_context: List[str] = None,
         user_preferences: Dict[str, Any] = None,
         additional_context: str = "",
-        clinic_profile: Optional[Dict[str, Any]] = None
+        clinic_profile: Optional[Dict[str, Any]] = None,
+        constraints: Optional[ConversationConstraints] = None  # Phase 3: For prompt injection
     ) -> tuple[str, str]:
         """Generate AI response using OpenAI with automatic language detection, RAG context, and memory"""
 
@@ -887,11 +969,14 @@ DO NOT attempt to answer complex questions yourself.
         # This allows for more dynamic and flexible information retrieval
         doctor_info_text = "Use the get_clinic_info tool to retrieve staff information"
 
+        # Phase 3: Build constraints section FIRST (before all other context)
+        constraints_section = self._build_constraints_section(constraints) if constraints else ""
+
         # Build system prompt for multilingual support with memory
         system_prompt = f"""You ARE {clinic_name}, speaking directly to patients. You represent the clinic itself, not a separate assistant or intermediary. When patients message you, they are messaging the clinic directly.
 
 CRITICAL LANGUAGE RULE: You MUST maintain conversation language consistency. Use the language of the conversation (from previous messages). Only switch languages if the user clearly switches to a different language with a complete sentence. Single words or medical terms (like "veneer", "implant", "consultation") DO NOT indicate a language switch - these are universal terms. Stay in the current conversation language unless the user explicitly writes a full sentence in a different language.
-{additional_context}{conversation_summary}{memory_section}{preferences_section}{knowledge_section}
+{constraints_section}{additional_context}{conversation_summary}{memory_section}{preferences_section}{knowledge_section}
 Clinic Information:
 - Name: {clinic_name}
 - Location: {profile_location}
@@ -994,6 +1079,37 @@ IMPORTANT BEHAVIORS:
                             tool_args = tool_call.arguments if isinstance(tool_call.arguments, dict) else json.loads(tool_call.arguments)
 
                             logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
+
+                            # Phase 4: Validate tool call against constraints BEFORE execution
+                            is_valid, error_msg, suggested_fixes = self.state_gate.validate_tool_call(
+                                tool_name=tool_name,
+                                arguments=tool_args,
+                                constraints=constraints or ConversationConstraints()
+                            )
+
+                            if not is_valid:
+                                # BLOCK invalid call
+                                logger.error(f"🚫 BLOCKED tool call: {error_msg}")
+
+                                # Return error to LLM for correction
+                                tool_results.append({
+                                    "tool_call_id": tool_call.id,
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "content": json.dumps({
+                                        "success": False,
+                                        "error": "constraint_violation",
+                                        "message": error_msg,
+                                        "suggested_fixes": suggested_fixes
+                                    })
+                                })
+                                continue  # Skip execution
+
+                            elif suggested_fixes:
+                                # REWRITE parameters
+                                logger.info(f"🔄 Applying suggested fixes: {suggested_fixes}")
+                                tool_args_original = tool_args.copy()
+                                tool_args.update(suggested_fixes)
 
                             # P0 GUARD: Enforce calendar call budget
                             if tool_name == "check_availability":
@@ -1864,6 +1980,104 @@ IMPORTANT BEHAVIORS:
         except Exception as e:
             # If logging fails, just print error (non-critical for MVP)
             print(f"Could not log to database: {e}")
+
+    async def _extract_and_update_constraints(
+        self,
+        session_id: str,
+        message: str,
+        detected_language: str
+    ) -> ConversationConstraints:
+        """Extract constraints from user message and update storage (Phase 2)"""
+
+        # Detect forget/exclusion patterns
+        entities_to_exclude = self.constraint_extractor.detect_forget_pattern(message, detected_language)
+
+        if entities_to_exclude:
+            logger.info(f"🚫 Detected exclusions: {entities_to_exclude}")
+
+            # Add each entity to exclusions
+            for entity in entities_to_exclude:
+                # Determine if it's a doctor or service based on context
+                # For now, add to both and let validation handle it
+                await self.constraints_manager.update_constraints(
+                    session_id,
+                    exclude_doctor=entity,
+                    exclude_service=entity
+                )
+
+        # Detect switch patterns ("instead of X, want Y")
+        switch_result = self.constraint_extractor.detect_switch_pattern(message, detected_language)
+
+        if switch_result:
+            exclude_entity, desired_entity = switch_result
+            logger.info(f"🔄 Detected switch: {exclude_entity} → {desired_entity}")
+
+            await self.constraints_manager.update_constraints(
+                session_id,
+                desired_service=desired_entity,
+                exclude_service=exclude_entity
+            )
+
+        # Detect time window normalization
+        time_window = self.constraint_extractor.normalize_time_window(
+            message,
+            datetime.now(),
+            detected_language
+        )
+
+        if time_window:
+            logger.info(f"📅 Normalized time window: {time_window[2]}")
+            await self.constraints_manager.update_constraints(
+                session_id,
+                time_window=time_window
+            )
+
+        # Return updated constraints
+        return await self.constraints_manager.get_constraints(session_id)
+
+    def _build_constraints_section(self, constraints: ConversationConstraints) -> str:
+        """
+        Build constraints section for system prompt (Phase 3).
+
+        This section is ALWAYS injected FIRST, before any other context.
+        Format is structured (YAML-like) for easier LLM parsing.
+        """
+        if not constraints or (
+            not constraints.desired_service
+            and not constraints.desired_doctor
+            and not constraints.excluded_doctors
+            and not constraints.excluded_services
+            and not constraints.time_window_start
+        ):
+            return ""
+
+        lines = ["\n🔒 CONVERSATION CONSTRAINTS (MUST ENFORCE):\n"]
+
+        # Current intent
+        if constraints.desired_service:
+            lines.append(f"  - Current Service: {constraints.desired_service}")
+        if constraints.desired_doctor:
+            lines.append(f"  - Preferred Doctor: {constraints.desired_doctor}")
+
+        # Exclusions
+        if constraints.excluded_doctors:
+            excluded_docs = ", ".join(constraints.excluded_doctors)
+            lines.append(f"  - NEVER suggest these doctors: {excluded_docs}")
+        if constraints.excluded_services:
+            excluded_svcs = ", ".join(constraints.excluded_services)
+            lines.append(f"  - NEVER suggest these services: {excluded_svcs}")
+
+        # Time window
+        if constraints.time_window_start:
+            lines.append(
+                f"  - Time Window: {constraints.time_window_display} "
+                f"({constraints.time_window_start} to {constraints.time_window_end})"
+            )
+
+        lines.append("\nIMPORTANT: These constraints OVERRIDE all other context. "
+                    "If a tool call violates these, STOP and ask for clarification.\n")
+
+        return "\n".join(lines)
 
 # FastAPI endpoint handler
 async def handle_process_message(request: MessageRequest) -> MessageResponse:
