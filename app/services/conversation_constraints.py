@@ -72,15 +72,15 @@ class ConversationConstraints:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'ConversationConstraints':
         """Deserialize from dict"""
-        # Convert lists back to sets
-        if 'excluded_doctors' in data and data['excluded_doctors']:
-            data['excluded_doctors'] = set(data['excluded_doctors'])
-        if 'excluded_doctor_ids' in data and data['excluded_doctor_ids']:
-            data['excluded_doctor_ids'] = set(data['excluded_doctor_ids'])
-        if 'excluded_services' in data and data['excluded_services']:
-            data['excluded_services'] = set(data['excluded_services'])
-        if 'excluded_service_ids' in data and data['excluded_service_ids']:
-            data['excluded_service_ids'] = set(data['excluded_service_ids'])
+        # Convert lists back to sets (handles both None and list cases)
+        if 'excluded_doctors' in data:
+            data['excluded_doctors'] = set(data['excluded_doctors']) if data['excluded_doctors'] else set()
+        if 'excluded_doctor_ids' in data:
+            data['excluded_doctor_ids'] = set(data['excluded_doctor_ids']) if data['excluded_doctor_ids'] else set()
+        if 'excluded_services' in data:
+            data['excluded_services'] = set(data['excluded_services']) if data['excluded_services'] else set()
+        if 'excluded_service_ids' in data:
+            data['excluded_service_ids'] = set(data['excluded_service_ids']) if data['excluded_service_ids'] else set()
         if 'last_updated' in data and data['last_updated']:
             data['last_updated'] = datetime.fromisoformat(data['last_updated'])
         return cls(**data)
