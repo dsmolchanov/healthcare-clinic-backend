@@ -61,14 +61,26 @@ class ClinicInfoTool:
 
             total_count = len(doctors)
 
-            # Group by specialization
+            # Group by specialization with doctor IDs
             specializations = {}
+            doctor_details = []
             for doc in doctors:
                 spec = doc.get('specialization', 'General Dentistry')
                 if spec not in specializations:
                     specializations[spec] = []
                 name = f"{doc.get('first_name', '')} {doc.get('last_name', '')}".strip()
-                specializations[spec].append(name)
+                doctor_id = doc.get('id')
+
+                # Store both name and ID
+                specializations[spec].append({
+                    'name': name,
+                    'id': doctor_id
+                })
+                doctor_details.append({
+                    'name': name,
+                    'id': doctor_id,
+                    'specialization': spec
+                })
 
             return {
                 'total_doctors': total_count,
@@ -76,7 +88,8 @@ class ClinicInfoTool:
                 'doctor_list': [
                     f"{d.get('first_name', '')} {d.get('last_name', '')}".strip()
                     for d in doctors
-                ]
+                ],
+                'doctor_details': doctor_details  # NEW: Full doctor details with IDs
             }
         except Exception as e:
             logger.error(f"Error getting doctor count: {e}")

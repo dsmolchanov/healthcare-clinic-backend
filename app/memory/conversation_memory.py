@@ -66,8 +66,12 @@ class ConversationMemoryManager:
         # Initialize mem0 for intelligent memory if available
         # Make it lazy to avoid blocking app startup
         self.memory = None
-        self.mem0_available = False
-        self._mem0_init_attempted = False
+        # Check if mem0 is explicitly disabled via environment variable
+        mem0_disabled = os.getenv('DISABLE_MEM0', 'false').lower() == 'true'
+        self.mem0_available = False if mem0_disabled else False  # Will be set to True if init succeeds
+        self._mem0_init_attempted = mem0_disabled  # Skip init if disabled
+        if mem0_disabled:
+            logger.info("🚫 mem0 explicitly disabled via DISABLE_MEM0=true environment variable")
         self._mem0_write_queue: Optional[asyncio.Queue] = None
         self._mem0_worker_task: Optional[asyncio.Task] = None
         self._mem0_warmup_clinics: Set[str] = set()
@@ -152,7 +156,9 @@ class ConversationMemoryManager:
 
     def _ensure_mem0_initialized(self):
         """Lazy initialization of mem0 - only init on first use"""
-        if self._mem0_init_attempted or not MEM0_AVAILABLE:
+        # Skip if already attempted, not available, or explicitly disabled
+        mem0_disabled = os.getenv('DISABLE_MEM0', 'false').lower() == 'true'
+        if self._mem0_init_attempted or not MEM0_AVAILABLE or mem0_disabled:
             return
 
         self._mem0_init_attempted = True
@@ -928,11 +934,23 @@ class ConversationMemoryManager:
         phone_number: str,
         clinic_id: str,
         limit: int = 10,
-        include_all_sessions: bool = True
+        include_all_sessions: bool = True,
+        time_window_hours: int = 24
     ) -> List[Dict[str, Any]]:
-        """Get conversation history for a phone number"""
+        """
+        Get conversation history for a phone number with time-based filtering.
+
+        Args:
+            time_window_hours: Only include messages from last N hours (default 24)
+                              Set to None to disable time filtering
+        """
 
         clean_phone = phone_number.replace("@s.whatsapp.net", "")
+
+        # Calculate cutoff time for message filtering
+        cutoff_time = None
+        if time_window_hours is not None:
+            cutoff_time = datetime.utcnow() - timedelta(hours=time_window_hours)
 
         try:
             if include_all_sessions:
@@ -942,30 +960,43 @@ class ConversationMemoryManager:
                 ).eq(
                     'metadata->>clinic_id', clinic_id
                 ).execute()
-                
+
                 if not sessions_result.data:
                     return []
-                
+
                 session_ids = [s['id'] for s in sessions_result.data]
-                
-                # Get messages from all sessions
-                messages_result = self.supabase.table('conversation_messages').select('*').in_(
+
+                # Get messages from all sessions with time filter
+                query = self.supabase.table('conversation_messages').select('*').in_(
                     'session_id', session_ids
-                ).order(
+                )
+
+                # Add time filter to prevent context leakage from old conversations
+                if cutoff_time:
+                    query = query.gte('created_at', cutoff_time.isoformat())
+
+                messages_result = query.order(
                     'created_at', desc=False  # Oldest first
                 ).limit(limit).execute()
-                
+
             else:
-                # Get only current session messages
+                # Get only current session messages with time filter
                 session = await self.get_or_create_session(phone_number, clinic_id)
-                messages_result = self.supabase.table('conversation_messages').select('*').eq(
+
+                query = self.supabase.table('conversation_messages').select('*').eq(
                     'session_id', session['id']
-                ).order(
+                )
+
+                # Add time filter to prevent loading stale messages from old active sessions
+                if cutoff_time:
+                    query = query.gte('created_at', cutoff_time.isoformat())
+
+                messages_result = query.order(
                     'created_at', desc=False
                 ).limit(limit).execute()
-            
+
             return messages_result.data if messages_result.data else []
-            
+
         except Exception as e:
             logger.error(f"Error getting conversation history: {e}")
             return []

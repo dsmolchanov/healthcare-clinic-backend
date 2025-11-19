@@ -351,11 +351,13 @@ class MultilingualMessageProcessor:
         )
 
         # Memory-specific queries still run in parallel (not part of clinic bundle)
+        # CRITICAL: include_all_sessions=False to prevent context leakage between sessions
+        # Each session should be isolated - don't load messages from previous sessions
         history_task = self.memory_manager.get_conversation_history(
             phone_number=request.from_phone,
             clinic_id=effective_clinic_id,
             limit=20,
-            include_all_sessions=True
+            include_all_sessions=False  # Session isolation - prevent hallucinations from old conversations
         )
 
         prefs_task = self.memory_manager.get_user_preferences(
@@ -1119,14 +1121,16 @@ Instructions:
 5. **USE TOOLS when needed**: You have access to tools for querying service prices and clinic information. Use them when:
    - Users ask about pricing or costs (use query_service_prices tool)
    - Users ask about doctors, staff, or clinic details (use get_clinic_info tool)
+   - Users want to check appointment availability (use check_availability tool)
    - You need up-to-date information from the database
-6. **CRITICAL: When tools return doctor information with specializations, you MUST quote the specialization EXACTLY as provided. DO NOT paraphrase, abbreviate, or add extra details to medical specializations. Copy them word-for-word.**
-7. Use the knowledge base information when answering questions about the clinic, staff, or services
-8. YOU ARE THE CLINIC - Never suggest calling the clinic or contacting the clinic
-9. For appointments, help schedule directly or gather information needed
-10. Keep responses concise (2-3 sentences maximum)
-11. If uncertain about something, say "Let me check with our specialists and get back to you" or "I need to consult with the team about that"
-12. Build on previous context - don't treat each message as isolated. If the user asks a follow-up question, assume it's about the same topic/person they just asked about.
+6. **CRITICAL - DOCTOR IDS**: When get_clinic_info returns doctor information, it includes doctor_id fields (UUIDs). You MUST extract and remember these doctor_ids. When calling check_availability for a specific doctor, ALWAYS use the doctor_id from the get_clinic_info response, NOT the doctor's name.
+7. **CRITICAL: When tools return doctor information with specializations, you MUST quote the specialization EXACTLY as provided. DO NOT paraphrase, abbreviate, or add extra details to medical specializations. Copy them word-for-word.**
+8. Use the knowledge base information when answering questions about the clinic, staff, or services
+9. YOU ARE THE CLINIC - Never suggest calling the clinic or contacting the clinic
+10. For appointments, help schedule directly or gather information needed
+11. Keep responses concise (2-3 sentences maximum)
+12. If uncertain about something, say "Let me check with our specialists and get back to you" or "I need to consult with the team about that"
+13. Build on previous context - don't treat each message as isolated. If the user asks a follow-up question, assume it's about the same topic/person they just asked about.
 
 LANGUAGE CONSISTENCY EXAMPLES:
 - Conversation in English + User writes "veneer" → Continue in English
@@ -1306,13 +1310,28 @@ IMPORTANT BEHAVIORS:
                                 # Route to appropriate method based on info_type
                                 if info_type == 'doctors':
                                     result = await tool.get_doctor_count(supabase_client)
-                                    # Format with explicit doctor-to-specialization mapping to prevent LLM hallucination
-                                    if result.get('specializations'):
-                                        # Build explicit list: "Dr. Name (Specialization)"
+                                    # Format with explicit doctor-to-specialization mapping AND doctor IDs
+                                    # This allows LLM to call check_availability with the correct doctor_id
+                                    if result.get('doctor_details'):
+                                        # Build explicit list with IDs: "Dr. Name (specialization: X, id: UUID)"
+                                        doctor_lines = []
+                                        for doc in result['doctor_details']:
+                                            doctor_lines.append(
+                                                f"{doc['name']} (specialization: {doc['specialization']}, doctor_id: {doc['id']})"
+                                            )
+                                        info = f"The clinic has {result['total_doctors']} doctors:\n" + "\n".join(doctor_lines)
+                                    elif result.get('specializations'):
+                                        # Fallback to old format if doctor_details not available
                                         doctor_details = []
-                                        for spec, names in result['specializations'].items():
-                                            for name in names:
-                                                doctor_details.append(f"{name} (specialization: {spec})")
+                                        for spec, doctors in result['specializations'].items():
+                                            for doc in doctors:
+                                                if isinstance(doc, dict):
+                                                    doctor_details.append(
+                                                        f"{doc['name']} (specialization: {spec}, doctor_id: {doc['id']})"
+                                                    )
+                                                else:
+                                                    # Legacy format (just name)
+                                                    doctor_details.append(f"{doc} (specialization: {spec})")
                                         info = f"The clinic has {result['total_doctors']} doctors:\n" + "\n".join(doctor_details)
                                     else:
                                         # Fallback if no specializations
@@ -1363,7 +1382,15 @@ IMPORTANT BEHAVIORS:
                                         info_parts.append(f"Address: {clinic_info['address']}")
                                     if doctor_result.get('total_doctors'):
                                         info_parts.append(f"Doctors: {doctor_result['total_doctors']}")
-                                        info_parts.append(f"Doctor list: {', '.join(doctor_result['doctor_list'])}")
+                                        # Include doctor details with IDs if available
+                                        if doctor_result.get('doctor_details'):
+                                            doctor_lines = [
+                                                f"{d['name']} (specialization: {d['specialization']}, doctor_id: {d['id']})"
+                                                for d in doctor_result['doctor_details']
+                                            ]
+                                            info_parts.append(f"Doctor details:\n" + "\n".join(doctor_lines))
+                                        else:
+                                            info_parts.append(f"Doctor list: {', '.join(doctor_result['doctor_list'])}")
 
                                     info = "\n".join(info_parts) if info_parts else "Clinic information not available"
 

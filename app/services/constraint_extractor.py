@@ -17,7 +17,11 @@ class ConstraintExtractor:
 
     # Meta-command patterns for complete context reset
     META_RESET_PATTERNS = {
-        'ru': ['забудь всё', 'забудь про всё', 'previous intents', 'начать заново', 'сбросить', 'начни сначала'],
+        'ru': [
+            'забудь всё', 'забудь все',  # Both ё and е variants
+            'забудь про всё', 'забудь про все',  # Both ё and е variants
+            'previous intents', 'начать заново', 'сбросить', 'начни сначала'
+        ],
         'en': ['forget everything', 'start over', 'reset', 'previous intents', 'clear context', 'start fresh'],
         'es': ['olvida todo', 'empezar de nuevo', 'resetear', 'borrar todo'],
         'he': ['שכח הכל', 'התחל מחדש', 'איפוס']
