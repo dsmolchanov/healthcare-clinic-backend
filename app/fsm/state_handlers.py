@@ -346,7 +346,7 @@ class StateHandler:
             ... )
             >>> # LLM extracts all three slots: doctor="терапевт", date="завтра", time="14:00"
         """
-        required_slots = ["doctor", "date", "time"]
+        required_slots = ["service", "doctor", "date", "time"]
 
         # 1. Determine which slots are still missing
         missing_slots = [s for s in required_slots if s not in state.slots]
@@ -379,7 +379,53 @@ class StateHandler:
                 slot_value = slot_data["value"]
                 confidence = slot_data.get("confidence", 0.8)
 
-                if slot_name == "doctor":
+                if slot_name == "service":
+                    # Validate service name against services table
+                    service_value = slot_value
+
+                    # Import service validation
+                    from app.fsm.service_validator import ServiceValidator
+                    service_validator = ServiceValidator(self.supabase)
+
+                    is_valid, error_msg, service_id = await service_validator.validate_service_name(
+                        service_value,
+                        state.clinic_id
+                    )
+
+                    if is_valid and service_id:
+                        # Add validated service slot with UUID
+                        state = self.slots.add_slot(
+                            state,
+                            "service",
+                            service_id,  # Store service UUID
+                            SlotSource.LLM_EXTRACT,
+                            confidence=confidence
+                        )
+                        # Also store display name
+                        state = self.slots.add_slot(
+                            state,
+                            "service_name",
+                            service_value,
+                            SlotSource.LLM_EXTRACT,
+                            confidence=confidence
+                        )
+                        logger.info(
+                            f"Conversation {state.conversation_id}: "
+                            f"✅ Validated service={service_value} (id={service_id})"
+                        )
+                    else:
+                        # Invalid service - transition to clarification
+                        logger.warning(
+                            f"Conversation {state.conversation_id}: "
+                            f"❌ Invalid service '{service_value}'"
+                        )
+                        new_state = await self.fsm.transition_state(
+                            state,
+                            ConversationState.AWAITING_CLARIFICATION
+                        )
+                        return new_state, error_msg
+
+                elif slot_name == "doctor":
                     # Validate doctor (handle both names and specialties)
                     doctor_value = slot_value
                     slot_type = slot_data.get("type", "name")
@@ -470,6 +516,89 @@ class StateHandler:
 
         # 4. Check if all required slots are now present
         # P2 Phase 2B: Branch logic based on collected slots
+
+        # NEW BRANCH: Service + Date present (but no doctor yet)
+        if "service" in state.slots and "date" in state.slots and "doctor" not in state.slots:
+            # Path A-Service: Service-first flow with smart matching
+            service_id = state.slots["service"].value
+            service_name = state.slots.get("service_name", {}).value if "service_name" in state.slots else "услугу"
+            date_str = state.slots["date"].value
+
+            logger.info(
+                f"Conversation {state.conversation_id}: "
+                f"Service-first flow detected: service={service_name}, date={date_str}"
+            )
+
+            # Import service mapper
+            from app.fsm.service_doctor_mapper import ServiceDoctorMapper
+            mapper = ServiceDoctorMapper(self.supabase)
+
+            # Get eligible doctors with match quality
+            doctors = await mapper.get_doctors_for_service(
+                service_id=service_id,
+                clinic_id=state.clinic_id,
+                patient_id=state.patient_id,  # For future patient constraints
+                limit=5
+            )
+
+            if not doctors:
+                # No eligible doctors
+                logger.warning(
+                    f"Conversation {state.conversation_id}: "
+                    f"No eligible doctors for service {service_name}"
+                )
+
+                # Clear service slot and ask user to choose another
+                if "service" in state.slots:
+                    del state.slots["service"]
+                if "service_name" in state.slots:
+                    del state.slots["service_name"]
+
+                return state, (
+                    f"К сожалению, сейчас нет доступных врачей для '{service_name}'. "
+                    f"Попробуйте другую услугу или обратитесь позже."
+                )
+
+            # Smart auto-selection rules:
+            # 1. Single doctor → auto-select
+            # 2. One preferred + others → auto-select preferred
+            # 3. Multiple qualified → let user choose
+
+            preferred = [d for d in doctors if d['match_type'] == 'preferred']
+
+            if len(doctors) == 1 or (len(preferred) == 1 and len(doctors) > 1):
+                # Auto-select
+                doctor = preferred[0] if preferred else doctors[0]
+
+                state = self.slots.add_slot(
+                    state, "doctor", doctor['id'],
+                    SlotSource.AUTO_RESOLVED, confidence=1.0
+                )
+                state = self.slots.add_slot(
+                    state, "doctor_name", doctor['name'],
+                    SlotSource.AUTO_RESOLVED, confidence=1.0
+                )
+
+                logger.info(
+                    f"Conversation {state.conversation_id}: "
+                    f"Auto-selected {doctor['match_type']} doctor {doctor['name']} "
+                    f"(score={doctor['match_score']})"
+                )
+
+                # Fall through to existing availability check
+                # Don't return here - let existing code handle availability query
+
+            else:
+                # Multiple doctors - present choice with match quality
+                logger.info(
+                    f"Conversation {state.conversation_id}: "
+                    f"Multiple doctors ({len(doctors)}) offer service {service_name}"
+                )
+
+                prompt = mapper.format_doctor_choice_prompt(doctors, service_name)
+                return state, prompt
+
+        # EXISTING BRANCH: Doctor + Date present (unchanged)
         if "doctor" in state.slots and "date" in state.slots and "time" not in state.slots:
             # Path A: Doctor + Date collected → Show available slots
             doctor_id = state.slots["doctor"].value
@@ -1205,7 +1334,7 @@ class StateHandler:
                 {
                     'p_hold_id': state.hold_id,
                     'p_patient_id': None,  # TODO: Get or create patient first
-                    'p_service_id': None,  # TODO: Add service selection to FSM
+                    'p_service_id': state.slots.get("service", {}).value if "service" in state.slots else None,
                     'p_appointment_type': 'general',
                     'p_reason_for_visit': None,  # TODO: Optionally collect from user
                     'p_booking_request_id': state.booking_request_id
