@@ -16,6 +16,9 @@ import logging
 from pydantic import BaseModel, Field
 
 from supabase import create_client, Client
+from langfuse import observe, Langfuse
+
+
 
 # Phase 0-6: Import constraint management services
 from app.services.session_manager import SessionManager
@@ -123,6 +126,10 @@ class MultilingualMessageProcessor:
         from app.memory.conversation_memory import get_memory_manager
         self.memory_manager = get_memory_manager()
 
+        # Initialize ProfileManager for deterministic memory (mem0 replacement)
+        from app.services.profile_manager import ProfileManager
+        self.profile_manager = ProfileManager(get_supabase_client())
+
         # Initialize async message logger (combined RPC for conversation + metrics)
         from app.api.async_message_logger import AsyncMessageLogger
         strict_logging = os.getenv("CONVERSATION_LOG_FAIL_FAST", "false").lower() == "true"
@@ -155,7 +162,11 @@ class MultilingualMessageProcessor:
         self._clinic_cache_inflight: Set[str] = set()
         self._clinic_cache_warm_ttl = int(os.getenv("CLINIC_CACHE_WARM_TTL_SECONDS", "900"))
         self._clinic_profile_cache: Dict[str, Dict[str, Any]] = {}
+        
+        # Initialize Langfuse
+        self.langfuse = Langfuse()
 
+    @observe()
     async def process_message(self, request: MessageRequest) -> MessageResponse:
         """Process incoming WhatsApp message with AI, RAG, and persistent memory"""
 
@@ -352,26 +363,40 @@ class MultilingualMessageProcessor:
             clinic_id=effective_clinic_id
         )
 
-        memory_task = self.memory_manager.get_memory_context(
-            phone_number=request.from_phone,
-            clinic_id=effective_clinic_id,
-            query=request.body,
-            session_id=session_id,  # Phase 2.2: Enable constraint pinning
-            pin_constraints=True
+        # Fetch deterministic profile (Layer 1) - ONCE per conversation
+        profile_task = self.profile_manager.get_patient_profile(
+            phone=request.from_phone,
+            clinic_id=effective_clinic_id
+        )
+
+        # Fetch conversation state (Layer 2) - EVERY message
+        conversation_state_task = self.profile_manager.get_conversation_state(
+            session_id=session_id
         )
 
         # Gather memory queries in parallel (return_exceptions to not fail on single error)
         results = await asyncio.gather(
             history_task,
             prefs_task,
-            memory_task,
+            profile_task,
+            conversation_state_task,
             return_exceptions=True
         )
 
         # Unpack results with error handling
         conversation_history = results[0] if not isinstance(results[0], Exception) else []
         user_preferences = results[1] if not isinstance(results[1], Exception) else {}
-        memory_context = results[2] if not isinstance(results[2], Exception) else []
+        profile = results[2] if not isinstance(results[2], Exception) else None
+        conversation_state = results[3] if not isinstance(results[3], Exception) else None
+
+        # Use empty instances if retrieval failed
+        if profile is None:
+            from app.services.profile_manager import PatientProfile
+            profile = PatientProfile()
+
+        if conversation_state is None:
+            from app.services.profile_manager import ConversationState
+            conversation_state = ConversationState()
 
         user_preferences = user_preferences or {}
         is_new_conversation = len(conversation_history) == 0
@@ -549,7 +574,8 @@ DO NOT attempt to answer complex questions yourself.
                 'last_agent_action': last_agent_action
             },
             'history': session_messages,
-            'memory': memory_context,  # Add memory for fast-path personalization
+            'profile': profile,  # Deterministic patient profile (mem0 replacement)
+            'conversation_state': conversation_state,  # Current conversation state
             'preferences': user_preferences  # Add preferences for personalization
         }
 
@@ -625,6 +651,37 @@ DO NOT attempt to answer complex questions yourself.
 
         detected_language_prelim = detect_language_simple(request.body)
 
+        # Check for meta-reset command FIRST (before constraint extraction)
+        if self.constraint_extractor.detect_meta_reset(request.body, detected_language_prelim):
+            # Clear ALL conversation state
+            await self.profile_manager.clear_constraints(session_id)
+
+            # Return confirmation message
+            reset_messages = {
+                'ru': 'Понял, начинаем с чистого листа! О чём вы хотите поговорить?',
+                'en': 'Understood, starting fresh! What would you like to discuss?',
+                'es': 'Entendido, empezamos de nuevo! ¿De qué quieres hablar?',
+                'he': 'הבנתי, מתחילים מחדש! על מה תרצה לדבר?'
+            }
+
+            ai_response = reset_messages.get(detected_language_prelim, reset_messages['en'])
+
+            # Store reset message
+            await self.memory_manager.store_message(
+                session_id=session_id,
+                role='assistant',
+                content=ai_response,
+                phone_number=request.from_phone
+            )
+
+            return MessageResponse(
+                message=ai_response,
+                session_id=session_id,
+                status="success",
+                detected_language=detected_language_prelim,
+                metadata={'reset': True}
+            )
+
         constraints = await self._extract_and_update_constraints(
             session_id=session_id,
             message=request.body,
@@ -648,7 +705,8 @@ DO NOT attempt to answer complex questions yourself.
             session_id=session_id,  # Phase 4: Pass session_id for tool validation
             session_history=session_messages,
             knowledge_context=[],  # No RAG - knowledge via tools only
-            memory_context=memory_context,
+            profile=profile,  # Deterministic patient profile (mem0 replacement)
+            conversation_state=conversation_state,  # Current conversation state
             user_preferences=user_preferences,
             additional_context=additional_context,
             clinic_profile=clinic_profile,
@@ -683,7 +741,8 @@ DO NOT attempt to answer complex questions yourself.
         # Store assistant response in persistent storage
         response_metadata = {
             'detected_language': detected_language,
-            'memory_context_used': len(memory_context),
+            'profile_loaded': bool(profile and profile.first_name),  # Profile was fetched successfully
+            'constraints_active': bool(conversation_state and conversation_state.excluded_doctors),
             'clinic_id': effective_clinic_id or resolved_request_clinic_id or request.clinic_id,
             'from_number': request.from_phone,
             'channel': request.channel
@@ -713,9 +772,9 @@ DO NOT attempt to answer complex questions yourself.
             rag_chunks_retrieved=len(relevant_knowledge) if relevant_knowledge else 0,
             rag_latency_ms=getattr(self, '_rag_latency_ms', 0),
 
-            # Memory metrics
-            mem0_queries=1 if memory_context else 0,
-            mem0_memories_retrieved=len(memory_context) if memory_context else 0,
+            # Memory metrics (mem0 replaced with deterministic SQL)
+            mem0_queries=0,  # mem0 no longer used
+            mem0_memories_retrieved=0,  # mem0 no longer used
 
             # Total
             total_latency_ms=int((time.time() - processing_start_time) * 1000),
@@ -728,18 +787,8 @@ DO NOT attempt to answer complex questions yourself.
 
         assistant_message_id = result.get('message_id') if result.get('success') else None
 
-        if assistant_message_id:
-            asyncio.create_task(
-                self.memory_manager.schedule_mem0_message_update(
-                    message_id=assistant_message_id,
-                    phone_number=request.from_phone,
-                    clinic_id=effective_clinic_id or resolved_request_clinic_id or request.clinic_id,
-                    content=ai_response,
-                    metadata=dict(response_metadata),
-                    session_uuid=session_id,
-                    role='assistant'
-                )
-            )
+        # Phase 4: mem0 update removed - using ProfileManager for deterministic memory
+        # Message already stored in Supabase via message_logger above
 
         # Analyze the response to determine turn status
         logger.info("Analyzing agent response to determine turn status...")
@@ -827,7 +876,7 @@ DO NOT attempt to answer complex questions yourself.
         # Build response metadata
         response_info = {
             "message_count": len(session_messages) + 2,  # Including current exchange
-            "memory_context_used": len(memory_context),
+            "profile_loaded": bool(profile and profile.first_name),  # Deterministic profile loaded
             "has_history": not is_new_conversation,
             "is_new_conversation": is_new_conversation,
             "conversation_stage": "new" if is_new_conversation else "continuation",
@@ -849,6 +898,7 @@ DO NOT attempt to answer complex questions yourself.
             metadata=response_info
         )
 
+    @observe()
     async def _generate_response(
         self,
         user_message: str,
@@ -857,13 +907,14 @@ DO NOT attempt to answer complex questions yourself.
         session_id: str,  # Phase 4: For tool validation
         session_history: List[Dict],
         knowledge_context: List[str] = None,
-        memory_context: List[str] = None,
+        profile = None,  # PatientProfile from ProfileManager (mem0 replacement)
+        conversation_state = None,  # ConversationState from ProfileManager
         user_preferences: Dict[str, Any] = None,
         additional_context: str = "",
         clinic_profile: Optional[Dict[str, Any]] = None,
         constraints: Optional[ConversationConstraints] = None  # Phase 3: For prompt injection
     ) -> tuple[str, str]:
-        """Generate AI response using OpenAI with automatic language detection, RAG context, and memory"""
+        """Generate AI response using OpenAI with automatic language detection, RAG context, and deterministic memory"""
 
         clinic_profile = clinic_profile or {}
         location_parts = []
@@ -924,13 +975,41 @@ DO NOT attempt to answer complex questions yourself.
 
             knowledge_section += "\nUse the above information to provide accurate, personalized responses.\n"
 
-        # Build memory context section
-        memory_section = ""
-        if memory_context:
-            memory_section = "\n\nPrevious Context and User Information:\n"
-            for i, memory in enumerate(memory_context[:3], 1):
-                memory_section += f"- {memory}\n"
-            memory_section += "\n"
+        # Build deterministic profile section (mem0 replacement)
+        profile_section = ""
+        if profile and conversation_state:
+            profile_section = f"""
+
+PATIENT PROFILE (CRITICAL - ALWAYS ENFORCE):
+Name: {profile.first_name} {profile.last_name}
+Bio: {profile.bio_summary}
+
+Medical History:
+  - Allergies: {', '.join(profile.allergies) if profile.allergies else 'None'}
+  - Implants: {'Yes' if profile.medical_history.get('implants') else 'No'}
+  - Chronic Conditions: {', '.join(profile.medical_history.get('chronic_conditions', []))}
+
+Hard Preferences:
+  - Language: {profile.preferred_language or 'auto-detect'}
+  - BANNED DOCTORS (NEVER SUGGEST): {', '.join(profile.hard_doctor_bans) if profile.hard_doctor_bans else 'None'}
+
+CURRENT CONVERSATION STATE:
+Episode Type: {conversation_state.episode_type}
+
+Booking Constraints:
+  - Desired Service: {conversation_state.desired_service or 'Not specified'}
+  - Desired Doctor: {conversation_state.current_constraints.get('desired_doctor', 'Not specified')}
+  - Excluded Doctors (this conversation): {', '.join(conversation_state.excluded_doctors) if conversation_state.excluded_doctors else 'None'}
+  - Excluded Services (this conversation): {', '.join(conversation_state.excluded_services) if conversation_state.excluded_services else 'None'}
+  - Time Window: {conversation_state.current_constraints.get('time_window', {}).get('display', 'Flexible')}
+
+ENFORCEMENT RULES:
+1. NEVER suggest doctors in BANNED DOCTORS list (patient safety)
+2. NEVER suggest doctors in Excluded Doctors (current conversation)
+3. NEVER suggest services in Excluded Services
+4. ALWAYS check allergies before recommending procedures
+5. Respect language preference for all responses
+"""
 
         # Build user preferences section
         preferences_section = ""
@@ -1020,7 +1099,7 @@ DO NOT attempt to answer complex questions yourself.
         system_prompt = f"""You ARE {clinic_name}, speaking directly to patients. You represent the clinic itself, not a separate assistant or intermediary. When patients message you, they are messaging the clinic directly.
 
 CRITICAL LANGUAGE RULE: You MUST maintain conversation language consistency. Use the language of the conversation (from previous messages). Only switch languages if the user clearly switches to a different language with a complete sentence. Single words or medical terms (like "veneer", "implant", "consultation") DO NOT indicate a language switch - these are universal terms. Stay in the current conversation language unless the user explicitly writes a full sentence in a different language.
-{constraints_section}{additional_context}{conversation_summary}{memory_section}{preferences_section}{knowledge_section}
+{profile_section}{constraints_section}{additional_context}{conversation_summary}{preferences_section}{knowledge_section}
 Clinic Information:
 - Name: {clinic_name}
 - Location: {profile_location}

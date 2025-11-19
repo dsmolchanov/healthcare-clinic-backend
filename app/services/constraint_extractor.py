@@ -15,6 +15,14 @@ logger = logging.getLogger(__name__)
 class ConstraintExtractor:
     """Extracts constraints from user messages"""
 
+    # Meta-command patterns for complete context reset
+    META_RESET_PATTERNS = {
+        'ru': ['забудь всё', 'забудь про всё', 'previous intents', 'начать заново', 'сбросить', 'начни сначала'],
+        'en': ['forget everything', 'start over', 'reset', 'previous intents', 'clear context', 'start fresh'],
+        'es': ['olvida todo', 'empezar de nuevo', 'resetear', 'borrar todo'],
+        'he': ['שכח הכל', 'התחל מחדש', 'איפוס']
+    }
+
     # Keyword patterns for negations/exclusions
     FORGET_KEYWORDS = {
         'ru': ['забудь', 'забудьте', 'не нужен', 'не надо', 'не хочу'],
@@ -40,6 +48,26 @@ class ConstraintExtractor:
         'es': ['en lugar de', 'prefiero', 'quiero'],
         'he': ['במקום', 'עדיף', 'רוצה']
     }
+
+    def detect_meta_reset(self, message: str, language: str = 'ru') -> bool:
+        """
+        Detect if user wants to reset conversation context entirely.
+
+        This is for meta-commands like "forget everything" or "previous intents"
+        that should trigger a complete context reset, not just entity exclusion.
+
+        Returns:
+            True if meta-reset pattern detected, False otherwise
+        """
+        message_lower = message.lower()
+        patterns = self.META_RESET_PATTERNS.get(language, self.META_RESET_PATTERNS['en'])
+
+        for pattern in patterns:
+            if pattern in message_lower:
+                logger.info(f"🔄 Meta-reset detected: '{pattern}' in message")
+                return True
+
+        return False
 
     def detect_forget_pattern(self, message: str, language: str = 'ru') -> Optional[List[str]]:
         """

@@ -49,8 +49,8 @@ azure-identity==1.19.0
 psutil==5.9.6
 apscheduler==3.10.4
 boto3==1.34.0
-# mem0 for advanced memory with Qdrant vector store (compatible with langchain-community==0.3.0)
-mem0ai>=0.1.17
+# mem0 REMOVED - Phase 4: Migrated to deterministic SQL (ProfileManager)
+# mem0ai>=0.1.17  # No longer needed - using Supabase JSONB for memory
 python-dateutil
 # Language Processing (Task #4)
 langdetect==1.0.9  # Fast language detection (<10ms)
