@@ -1,4 +1,5 @@
 from typing import Dict, List, Any, Optional
+from langfuse import observe
 from app.services.llm.base_adapter import LLMAdapter, LLMResponse, LLMProvider
 from app.services.llm.capability_matrix import CapabilityMatrix
 from app.services.llm.adapters.glm_adapter import GLMAdapter
@@ -44,6 +45,7 @@ class LLMFactory:
         self._adapter_cache[model_name] = adapter
         return adapter
 
+    @observe()
     async def generate(
         self,
         messages: List[Dict[str, str]],
@@ -87,6 +89,7 @@ class LLMFactory:
             # Try fallback
             return await self._fallback_generate(messages, model, temperature, max_tokens, **kwargs)
 
+    @observe()
     async def generate_with_tools(
         self,
         messages: List[Dict[str, str]],

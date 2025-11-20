@@ -247,6 +247,35 @@ class LLMSlotExtractor:
                 "required": ["value", "confidence"]
             }
 
+        if "service" in missing_slots:
+            properties["service"] = {
+                "type": "object",
+                "description": "Healthcare service or procedure mentioned by the user",
+                "properties": {
+                    "value": {
+                        "type": "string",
+                        "description": (
+                            "Service name in user's language "
+                            "(e.g., 'teeth cleaning', 'чистка зубов', 'пломбирование', 'виниры')"
+                        )
+                    },
+                    "normalized": {
+                        "type": "string",
+                        "description": (
+                            "Normalized service name if recognizable "
+                            "(e.g., 'cleaning', 'filling', 'veneer')"
+                        )
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "Confidence score between 0 and 1",
+                        "minimum": 0,
+                        "maximum": 1
+                    }
+                },
+                "required": ["value", "confidence"]
+            }
+
         return {
             "type": "function",
             "function": {
@@ -287,6 +316,7 @@ EXTRACTION RULES:
 2. DO NOT infer or assume information that is not stated
 3. Handle both Russian and English naturally
 4. Be flexible with formats:
+   - Service: Healthcare procedure/service (e.g., "чистка зубов", "teeth cleaning", "пломбирование")
    - Doctor: Can be a name ("Иванов"), specialty ("терапевт"), or "any"
    - Date: Can be relative ("завтра"), absolute ("15.10"), or day ("Monday")
    - Time: Can be specific ("14:00"), period ("afternoon"), or "any time"
@@ -300,6 +330,9 @@ EXAMPLES:
 - "tomorrow at 2pm" → date: {{"value": "tomorrow", "confidence": 1.0}}, time: {{"value": "14:00", "confidence": 1.0}}
 - "к любому врачу" → doctor: {{"value": "any", "type": "any", "confidence": 1.0}}
 - "на следующей неделе" → date: {{"value": "next week", "confidence": 0.7}}
+- "хочу сделать чистку зубов" → service: {{"value": "чистку зубов", "normalized": "cleaning", "confidence": 1.0}}
+- "записаться на пломбу на завтра" → service: {{"value": "пломбу", "normalized": "filling", "confidence": 1.0}}, date: {{"value": "завтра", "confidence": 1.0}}
+- "teeth cleaning on Monday" → service: {{"value": "teeth cleaning", "normalized": "cleaning", "confidence": 1.0}}, date: {{"value": "Monday", "confidence": 1.0}}
 
 Remember: Extract ONLY what's in the message. If nothing relevant is mentioned, call the function with no parameters."""
 
@@ -330,5 +363,9 @@ Remember: Extract ONLY what's in the message. If nothing relevant is mentioned, 
                 # Preserve doctor type if present
                 if slot_name == "doctor" and "type" in slot_data:
                     result[slot_name]["type"] = slot_data["type"]
+
+                # Preserve service normalized name if present
+                if slot_name == "service" and "normalized" in slot_data:
+                    result[slot_name]["normalized"] = slot_data["normalized"]
 
         return result

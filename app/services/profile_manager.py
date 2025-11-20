@@ -19,7 +19,7 @@ class PatientProfile(BaseModel):
     """Patient hard facts (Layer 1)"""
     first_name: str = ""
     last_name: str = ""
-    bio_summary: str = ""
+    bio_summary: Optional[str] = ""  # ✅ Allow None from database
     medical_history: Dict[str, Any] = Field(default_factory=dict)
     hard_preferences: Dict[str, Any] = Field(default_factory=dict)
 

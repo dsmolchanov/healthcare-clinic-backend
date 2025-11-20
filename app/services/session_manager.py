@@ -7,6 +7,9 @@ from typing import Optional, Dict, Tuple
 from datetime import datetime, timedelta
 from enum import Enum
 import logging
+import asyncio
+from app.services.locks import BoundaryLock
+from app.services.session_summarizer import SessionSummarizer
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +108,8 @@ class SessionManager:
     def __init__(self, redis_client, supabase_client):
         self.redis = redis_client
         self.supabase = supabase_client
+        self.boundary_lock = BoundaryLock(redis_client)  # NEW: Token-based lock
+        self.summarizer = SessionSummarizer()  # NEW: Session summary generator
 
     def _make_session_key(self, phone: str, clinic_id: str) -> str:
         return f"session:{clinic_id}:{phone}"
@@ -166,15 +171,21 @@ class SessionManager:
 
         elif reset_type == ResetType.SOFT:
             logger.info(
-                f"🔄 SOFT RESET: Clearing episode data (score={split_score:.2f}, gap={time_gap_hours:.1f}h)"
+                f"🔄 SOFT RESET: Creating new session (score={split_score:.2f}, gap={time_gap_hours:.1f}h)"
             )
 
-            # Update heartbeat but return soft reset flag
-            # Caller should clear episode-level constraints
-            self.redis.hset(key, 'last_activity', current_time.isoformat())
-            self.redis.hset(key, 'state', SessionState.ACTIVE.value)
+            # Phase 6: Soft reset now creates new session (like hard reset)
+            # But with summary context injection from previous session
 
-            return session_id, False, ResetType.SOFT
+            # Archive old session (with summary generation)
+            await self._archive_session(session_id, current_time)
+
+            # Create new session with previous session link
+            new_session_id, _ = await self._create_new_session(
+                phone, clinic_id, current_time, previous_session_id=session_id
+            )
+
+            return new_session_id, True, ResetType.SOFT  # is_new_session=True now
 
         else:
             # Update heartbeat - normal continuation
@@ -221,14 +232,50 @@ class SessionManager:
 
         return session_id, new_session
 
-    async def _archive_session(self, session_id: str, current_time: datetime):
-        """Archive session in Supabase"""
-        self.supabase.table('conversation_sessions').update({
-            'ended_at': current_time.isoformat(),
-            'status': 'ended'
-        }).eq('id', session_id).execute()
+    async def _archive_session(
+        self,
+        session_id: str,
+        current_time: datetime,
+        generate_summary: bool = True  # NEW parameter
+    ):
+        """
+        Archive session and optionally generate AI summary.
 
-        logger.info(f"🗄️ Archived session {session_id}")
+        IMPORTANT: This function returns immediately and does NOT block on summary generation.
+        Summary is generated asynchronously in background.
+        """
+
+        # Check if already archived (idempotency)
+        try:
+            result = self.supabase.table('conversation_sessions').select('status, ended_at').eq(
+                'id', session_id
+            ).maybe_single().execute()
+
+            if result.data and result.data.get('status') in ('closed', 'ended'):
+                logger.info(f"Session {session_id[:8]} already archived, skipping")
+                return
+        except Exception as e:
+            logger.warning(f"Error checking session status: {e}")
+
+        # Archive session SYNCHRONOUSLY (fast DB update)
+        updates = {
+            'ended_at': current_time.isoformat(),
+            'status': 'closed'  # Changed from 'ended' to 'closed' per plan
+        }
+
+        if generate_summary:
+            updates['summary_status'] = 'pending'  # Mark as pending
+
+        self.supabase.table('conversation_sessions').update(updates).eq('id', session_id).execute()
+
+        logger.info(f"🗄️ Archived session {session_id[:8]}")
+
+        # Generate summary ASYNCHRONOUSLY (fire-and-forget, non-blocking)
+        if generate_summary:
+            asyncio.create_task(
+                self.summarizer.generate_and_store_summary(session_id, current_time)
+            )
+            logger.debug(f"🔄 Queued summary generation for session {session_id[:8]} (async)")
 
     async def get_carryover_data(self, session_id: str) -> Dict:
         """

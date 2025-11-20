@@ -76,7 +76,11 @@ class AsyncMessageLogger:
 
         # Platform event tracking
         log_platform_events: bool = True,
-        agent_id: Optional[str] = None
+        agent_id: Optional[str] = None,
+
+        # Organization/Clinic tracking (✅ NEW)
+        organization_id: Optional[str] = None,
+        clinic_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Log message to all relevant tables in ONE async RPC call.
@@ -150,7 +154,11 @@ class AsyncMessageLogger:
 
                 # Platform
                 'p_log_platform_events': log_platform_events,
-                'p_agent_id': agent_id
+                'p_agent_id': agent_id,
+
+                # Organization/Clinic (✅ NEW)
+                'p_organization_id': organization_id,
+                'p_clinic_id': clinic_id
             }
 
             # Single RPC call - writes to all 3 tables in one transaction

@@ -40,10 +40,12 @@ class SlotSource(str, Enum):
     - LLM_EXTRACT: Extracted from user message by LLM
     - USER_CONFIRM: Explicitly confirmed by user
     - DB_LOOKUP: Retrieved from database query
+    - AUTO_RESOLVED: System-resolved (e.g., service → doctor mapping)
     """
     LLM_EXTRACT = "llm_extract"
     USER_CONFIRM = "user_confirm"
     DB_LOOKUP = "db_lookup"
+    AUTO_RESOLVED = "auto_resolved"
 
 
 # State Transition Rules

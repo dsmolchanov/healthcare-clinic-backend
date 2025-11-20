@@ -739,7 +739,28 @@ class ConversationMemoryManager:
 
         # Execute with deduplication
         return await once(dedup_key, _fetch_session)
-    
+
+    async def get_session_by_id(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get session by explicit ID (no phone/clinic lookup).
+
+        Args:
+            session_id: Explicit session UUID
+
+        Returns:
+            Session dict or None if not found
+        """
+        try:
+            result = self.supabase.table('conversation_sessions').select('*').eq(
+                'id', session_id
+            ).maybe_single().execute()
+
+            return result.data if result.data else None
+
+        except Exception as e:
+            logger.error(f"Error getting session by ID {session_id}: {e}")
+            return None
+
     async def store_message(
         self,
         session_id: str,
@@ -933,27 +954,65 @@ class ConversationMemoryManager:
         self,
         phone_number: str,
         clinic_id: str,
-        limit: int = 10,
+        time_window_hours: int = 3,  # NEW DEFAULT: 3 hours
         include_all_sessions: bool = True,
-        time_window_hours: int = 24
+        session_id: Optional[str] = None,  # NEW: Explicit session override
+        max_messages: int = 100,  # NEW: Safety limit (replaces limit)
+        max_tokens: int = 4000,  # NEW: Token budget (prevents overflow)
+        **kwargs  # For backward compatibility
     ) -> List[Dict[str, Any]]:
         """
-        Get conversation history for a phone number with time-based filtering.
+        Get conversation history using time-based filtering with token budgeting.
 
         Args:
-            time_window_hours: Only include messages from last N hours (default 24)
-                              Set to None to disable time filtering
+            phone_number: User's phone number
+            clinic_id: Clinic context
+            time_window_hours: Fetch messages from last N hours (default 3)
+            include_all_sessions: If True, search across all sessions (default True)
+            session_id: Explicit session ID to use (prevents race conditions)
+            max_messages: Safety limit to prevent fetching thousands of messages
+            max_tokens: Maximum tokens allowed in context (default 4000)
+            **kwargs: Backward compatibility (accepts deprecated 'limit' parameter)
+
+        Returns:
+            Messages within time window, truncated to fit token budget
         """
+
+        # Backward compatibility shim
+        if 'limit' in kwargs and kwargs['limit'] is not None:
+            import warnings
+            max_messages = int(kwargs['limit'])
+            warnings.warn(
+                "`limit` parameter is deprecated; use `max_messages` instead",
+                DeprecationWarning,
+                stacklevel=2
+            )
 
         clean_phone = phone_number.replace("@s.whatsapp.net", "")
 
         # Calculate cutoff time for message filtering
+        from datetime import timezone
         cutoff_time = None
         if time_window_hours is not None:
-            cutoff_time = datetime.utcnow() - timedelta(hours=time_window_hours)
+            now = datetime.now(timezone.utc)
+            cutoff_time = now - timedelta(hours=time_window_hours)
 
         try:
-            if include_all_sessions:
+            if session_id:
+                # Use explicitly provided session_id (prevents race condition)
+                query = self.supabase.table('conversation_messages').select('*').eq(
+                    'session_id', session_id
+                )
+
+                # Add time filter to prevent loading stale messages
+                if cutoff_time:
+                    query = query.gte('created_at', cutoff_time.isoformat())
+
+                messages_result = query.order(
+                    'created_at', desc=False  # Oldest first
+                ).limit(max_messages).execute()
+
+            elif include_all_sessions:
                 # Get all messages from all sessions for this phone number
                 sessions_result = self.supabase.table('conversation_sessions').select('id').eq(
                     'user_identifier', clean_phone
@@ -977,14 +1036,14 @@ class ConversationMemoryManager:
 
                 messages_result = query.order(
                     'created_at', desc=False  # Oldest first
-                ).limit(limit).execute()
+                ).limit(max_messages).execute()
 
             else:
                 # Get only current session messages with time filter
-                session = await self.get_or_create_session(phone_number, clinic_id)
+                current_session = await self.get_or_create_session(phone_number, clinic_id)
 
                 query = self.supabase.table('conversation_messages').select('*').eq(
-                    'session_id', session['id']
+                    'session_id', current_session['id']
                 )
 
                 # Add time filter to prevent loading stale messages from old active sessions
@@ -993,9 +1052,32 @@ class ConversationMemoryManager:
 
                 messages_result = query.order(
                     'created_at', desc=False
-                ).limit(limit).execute()
+                ).limit(max_messages).execute()
 
-            return messages_result.data if messages_result.data else []
+            messages = messages_result.data if messages_result.data else []
+
+            # Apply token budget (truncate if needed)
+            if messages and max_tokens:
+                from app.utils.token_counter import count_message_tokens, truncate_to_budget
+
+                token_count = count_message_tokens(messages)
+
+                if token_count > max_tokens:
+                    logger.warning(
+                        f"Context exceeds budget: {token_count} > {max_tokens} tokens, truncating"
+                    )
+                    messages = truncate_to_budget(messages, max_tokens)
+                else:
+                    logger.info(
+                        f"Context budget: {len(messages)} messages, {token_count}/{max_tokens} tokens"
+                    )
+
+            logger.info(
+                f"Fetched {len(messages)} messages from last {time_window_hours}h "
+                f"(cutoff: {cutoff_time.isoformat() if cutoff_time else 'none'})"
+            )
+
+            return messages
 
         except Exception as e:
             logger.error(f"Error getting conversation history: {e}")

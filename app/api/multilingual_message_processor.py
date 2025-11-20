@@ -203,37 +203,58 @@ class MultilingualMessageProcessor:
         self.current_to_phone = request.to_phone
         self.current_message_sid = request.message_sid
 
+        # PHASE 1 FIX: Distributed lock + explicit session plumbing
         resolved_request_clinic_id = self._get_clinic_id_from_organization(request.clinic_id)
+        effective_clinic_id = resolved_request_clinic_id or request.clinic_id
 
-        # Get or create persistent session (needs to run first)
-        session = await self.memory_manager.get_or_create_session(
-            phone_number=request.from_phone,
-            clinic_id=resolved_request_clinic_id or request.clinic_id,
-            channel=request.channel
+        # Step 1: Acquire distributed lock for entire boundary section
+        async with self.session_manager.boundary_lock.acquire(request.from_phone, effective_clinic_id):
+
+            # Step 2: Check boundary FIRST (within lock)
+            from app.services.session_manager import ResetType
+
+            managed_session_id, is_new_session, reset_type = await self.session_manager.check_and_manage_boundary(
+                phone=request.from_phone,
+                clinic_id=effective_clinic_id,
+                message=request.body,
+                current_time=datetime.utcnow()
+            )
+
+            # Step 3: Get session by EXPLICIT ID (never rely on "current" session)
+            session = await self.memory_manager.get_session_by_id(managed_session_id)
+
+            if not session:
+                # Boundary created new session but it's not in cache yet - fetch it
+                session = await self.memory_manager.get_or_create_session(
+                    phone_number=request.from_phone,
+                    clinic_id=effective_clinic_id,
+                    channel=request.channel
+                )
+
+            # Step 4: Use managed_session_id for ALL operations (single source of truth)
+            session_id = managed_session_id
+
+        # Lock released - boundary decision made, session determined
+
+        # Generate correlation ID for request tracing
+        correlation_id = str(uuid.uuid4())[:8]
+
+        # Mask phone for PII safety
+        masked_phone = f"{request.from_phone[:3]}***{request.from_phone[-4:]}" if len(request.from_phone) > 7 else f"{request.from_phone[:3]}***"
+
+        logger.info(
+            f"[{correlation_id}] Session boundary check: phone={masked_phone}, "
+            f"session_id={managed_session_id[:8]}, is_new={is_new_session}, "
+            f"reset_type={reset_type}"
         )
 
-        session_id = session['id']
+        if is_new_session:
+            logger.info(f"[{correlation_id}] 🆕 NEW SESSION created (previous session archived)")
+        elif reset_type == ResetType.SOFT:
+            logger.info(f"[{correlation_id}] 🔄 SOFT RESET (constraints cleared)")
 
-        raw_clinic_identifier = (
-            (session.get('metadata') or {}).get('clinic_id')
-            or session.get('clinic_id')
-            or resolved_request_clinic_id
-            or request.clinic_id
-        )
-
-        effective_clinic_id = self._get_clinic_id_from_organization(raw_clinic_identifier)
-
-        # Phase 0: Check session boundary (prevents old state from polluting new conversations)
-        from app.services.session_manager import ResetType
-        managed_session_id, is_new_session, reset_type = await self.session_manager.check_and_manage_boundary(
-            phone=request.from_phone,
-            clinic_id=effective_clinic_id or request.clinic_id,
-            message=request.body,
-            current_time=datetime.utcnow()
-        )
-
-        # CRITICAL FIX: Use managed_session_id for all constraint operations
-        session_id = managed_session_id
+        # Phase 6: Inject previous session summary for soft resets
+        previous_session_summary = None
 
         # Handle session resets
         if reset_type == ResetType.HARD:
@@ -262,19 +283,30 @@ class MultilingualMessageProcessor:
                     )
 
         elif reset_type == ResetType.SOFT:
-            # SOFT RESET (4 hours): Clear EPISODE data AND exclusions
-            # PHASE 2.5.3: Exclusions should also be cleared on soft reset to prevent
-            # old "Забудьте про Дана" from affecting new conversations
-            logger.info(f"🔄 SOFT RESET: Clearing episode + exclusions for session {managed_session_id}")
+            # SOFT RESET (4 hours): New session created, inject previous summary
+            # Phase 6: Soft reset now creates a new session (changed from just clearing constraints)
+            logger.info(f"🔄 SOFT RESET: New session created: {managed_session_id}")
 
-            # Clear ALL constraints (episode + exclusions)
-            # Only hard safety bans (from patient profile) persist across hard resets
+            # Clear constraints for new session
             await self.constraints_manager.clear_constraints(managed_session_id)
 
-            logger.info(f"✅ Cleared all episode data and exclusions (4-hour soft reset)")
+            # Get previous session summary to inject as context
+            if session and session.get('metadata', {}).get('previous_session_id'):
+                previous_session_id = session['metadata']['previous_session_id']
+
+                try:
+                    # Fetch previous session summary
+                    prev_session = await self.memory_manager.get_session_by_id(previous_session_id)
+
+                    if prev_session and prev_session.get('session_summary'):
+                        previous_session_summary = prev_session['session_summary']
+                        logger.info(f"📋 Injected previous session summary ({len(previous_session_summary)} chars)")
+
+                except Exception as e:
+                    logger.warning(f"Failed to get previous session summary: {e}")
 
         elif is_new_session:
-            # Fallback for legacy code path
+            # Fallback for legacy code path (first time user)
             logger.info(f"🆕 New session detected: {managed_session_id}")
             await self.constraints_manager.clear_constraints(managed_session_id)
 
@@ -332,32 +364,38 @@ class MultilingualMessageProcessor:
             detected_language=None  # Will be detected later
         )
 
-        # Kick off message storage (fire-and-forget)
-        store_msg_task = asyncio.create_task(
-            self.memory_manager.store_message(
-                session_id=session_id,
-                role='user',
-                content=request.body,
-                phone_number=request.from_phone,
-                metadata={
-                    'message_sid': request.message_sid,
-                    'profile_name': request.profile_name,
-                    'clinic_id': effective_clinic_id,
-                    'from_number': request.from_phone,
-                    'channel': request.channel,
-                    'instance_name': request.metadata.get('instance_name') if isinstance(request.metadata, dict) else None
-                }
-            )
+        # CRITICAL FIX: AWAIT message storage to ensure it's saved before fetching history
+        # This prevents race condition where we fetch history before current message is saved
+        await self.memory_manager.store_message(
+            session_id=session_id,
+            role='user',
+            content=request.body,
+            phone_number=request.from_phone,
+            metadata={
+                'message_sid': request.message_sid,
+                'profile_name': request.profile_name,
+                'clinic_id': effective_clinic_id,
+                'from_number': request.from_phone,
+                'channel': request.channel,
+                'instance_name': request.metadata.get('instance_name') if isinstance(request.metadata, dict) else None
+            }
         )
 
         # Memory-specific queries still run in parallel (not part of clinic bundle)
         # CRITICAL: include_all_sessions=False to prevent context leakage between sessions
         # Each session should be isolated - don't load messages from previous sessions
+        # PHASE 1 FIX: Now fetch history with CORRECT session_id (after lock released)
+        # PHASE 3: Added token budgeting to prevent context overflow
+        from app.config import MESSAGE_HISTORY_DEFAULT_WINDOW, MESSAGE_HISTORY_MAX_MESSAGES, MESSAGE_HISTORY_MAX_TOKENS
+
         history_task = self.memory_manager.get_conversation_history(
             phone_number=request.from_phone,
             clinic_id=effective_clinic_id,
-            limit=20,
-            include_all_sessions=False  # Session isolation - prevent hallucinations from old conversations
+            session_id=session_id,  # Explicitly pass correct session from boundary check
+            time_window_hours=MESSAGE_HISTORY_DEFAULT_WINDOW,  # 3 hours default
+            include_all_sessions=False,  # Session isolation - prevent hallucinations from old conversations
+            max_messages=MESSAGE_HISTORY_MAX_MESSAGES,  # 100 safety limit
+            max_tokens=MESSAGE_HISTORY_MAX_TOKENS  # 4000 token budget (Phase 3)
         )
 
         prefs_task = self.memory_manager.get_user_preferences(
@@ -428,8 +466,10 @@ class MultilingualMessageProcessor:
                 logger.error(f"Parallel I/O error in task {i}: {result}")
 
         # Format history for AI context
+        # CRITICAL FIX: Use ALL messages (up to max_messages limit), not just last 10
+        # Token budget is already enforced in get_conversation_history()
         session_messages = []
-        for msg in conversation_history[-10:]:  # Use last 10 messages for context
+        for msg in conversation_history:  # Use ALL fetched messages (already limited by token budget)
             session_messages.append({
                 'role': msg.get('role', 'user'),
                 'content': msg.get('content', '')
@@ -784,7 +824,11 @@ DO NOT attempt to answer complex questions yourself.
 
             # Platform events
             log_platform_events=True,
-            agent_id=response_metadata.get('agent_id')
+            agent_id=response_metadata.get('agent_id'),
+
+            # Organization/Clinic tracking (✅ NEW)
+            organization_id=clinic_profile.get('organization_id'),
+            clinic_id=effective_clinic_id
         )
 
         assistant_message_id = result.get('message_id') if result.get('success') else None
@@ -1097,11 +1141,22 @@ ENFORCEMENT RULES:
         # Phase 3: Build constraints section FIRST (before all other context)
         constraints_section = self._build_constraints_section(constraints) if constraints else ""
 
+        # Phase 6: Build previous session summary section (for soft resets)
+        previous_summary_section = ""
+        if previous_session_summary:
+            previous_summary_section = f"""
+
+PREVIOUS CONVERSATION SUMMARY (from earlier session):
+{previous_session_summary}
+
+Note: This is context from a recent conversation (4-72 hours ago). Use this to maintain continuity but don't assume details are still current - verify if needed.
+"""
+
         # Build system prompt for multilingual support with memory
         system_prompt = f"""You ARE {clinic_name}, speaking directly to patients. You represent the clinic itself, not a separate assistant or intermediary. When patients message you, they are messaging the clinic directly.
 
 CRITICAL LANGUAGE RULE: You MUST maintain conversation language consistency. Use the language of the conversation (from previous messages). Only switch languages if the user clearly switches to a different language with a complete sentence. Single words or medical terms (like "veneer", "implant", "consultation") DO NOT indicate a language switch - these are universal terms. Stay in the current conversation language unless the user explicitly writes a full sentence in a different language.
-{profile_section}{constraints_section}{additional_context}{conversation_summary}{preferences_section}{knowledge_section}
+{profile_section}{constraints_section}{previous_summary_section}{additional_context}{conversation_summary}{preferences_section}{knowledge_section}
 Clinic Information:
 - Name: {clinic_name}
 - Location: {profile_location}
@@ -1122,6 +1177,8 @@ Instructions:
    - Users ask about pricing or costs (use query_service_prices tool)
    - Users ask about doctors, staff, or clinic details (use get_clinic_info tool)
    - Users want to check appointment availability (use check_availability tool)
+   - Users ask about previous conversations or past interactions (use get_previous_conversations_summary tool)
+   - Users need specific details from past messages (use search_detailed_conversation_history tool)
    - You need up-to-date information from the database
 6. **CRITICAL - DOCTOR IDS**: When get_clinic_info returns doctor information, it includes doctor_id fields (UUIDs). You MUST extract and remember these doctor_ids. When calling check_availability for a specific doctor, ALWAYS use the doctor_id from the get_clinic_info response, NOT the doctor's name.
 7. **CRITICAL: When tools return doctor information with specializations, you MUST quote the specialization EXACTLY as provided. DO NOT paraphrase, abbreviate, or add extra details to medical specializations. Copy them word-for-word.**
@@ -1169,9 +1226,21 @@ IMPORTANT BEHAVIORS:
 
             # Import tool schemas for function calling
             from app.api.tool_schemas import get_tool_schemas
+            from app.tools import conversation_history_tools
+
+            # Set context for history tools (Phase 4)
+            conversation_history_tools.set_context(
+                phone_number=request.from_phone,
+                clinic_id=effective_clinic_id
+            )
 
             # Get available tools for this clinic
             tool_schemas = get_tool_schemas(clinic_id)
+
+            # Add conversation history tools (Phases 4-5)
+            tool_schemas.append(conversation_history_tools.get_previous_conversations_summary.tool_schema)
+            tool_schemas.append(conversation_history_tools.search_detailed_conversation_history.tool_schema)
+
             logger.info(f"Loaded {len(tool_schemas)} tool schemas for clinic {clinic_id}")
 
             # Phase 8: Add timeout to LLM call (budget: 20s max for tool calling + memory retrieval)
@@ -1522,6 +1591,60 @@ IMPORTANT BEHAVIORS:
                                     result_text = f"❌ Rescheduling failed: {result.get('error', 'Unknown error')}"
 
                                 logger.info(f"✅ reschedule_appointment tool returned: {result_text}")
+                                tool_results.append({
+                                    "tool_call_id": tool_call.id,
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "content": result_text
+                                })
+
+                            elif tool_name == "get_previous_conversations_summary":
+                                # Phase 4: Search previous conversation summaries
+                                result = await conversation_history_tools.get_previous_conversations_summary(**tool_args)
+
+                                if result.get('found'):
+                                    # Format summaries for LLM
+                                    summaries = result['summaries']
+                                    formatted_summaries = []
+                                    for summary in summaries:
+                                        date_str = summary['date'][:10]  # Just the date part
+                                        formatted_summaries.append(
+                                            f"• {date_str}: {summary['summary']}"
+                                        )
+
+                                    result_text = f"Found {len(summaries)} previous conversation(s):\n\n" + "\n\n".join(formatted_summaries)
+                                else:
+                                    result_text = result['message']
+
+                                logger.info(f"✅ get_previous_conversations_summary returned: {result.get('count', 0)} results")
+                                tool_results.append({
+                                    "tool_call_id": tool_call.id,
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "content": result_text
+                                })
+
+                            elif tool_name == "search_detailed_conversation_history":
+                                # Phase 5: Deep search of full message history
+                                result = await conversation_history_tools.search_detailed_conversation_history(**tool_args)
+
+                                if result.get('found'):
+                                    # Format messages for LLM
+                                    messages = result['messages']
+                                    formatted_messages = []
+                                    for msg in messages:
+                                        formatted_messages.append(
+                                            f"[{msg['date']} {msg['time']}] {msg['role'].upper()}: {msg['content']}"
+                                        )
+
+                                    result_text = f"Found {result['count']} message(s)"
+                                    if result.get('has_more'):
+                                        result_text += f" (showing first {result['count']} of {result['total']} total)"
+                                    result_text += ":\n\n" + "\n\n".join(formatted_messages)
+                                else:
+                                    result_text = result['message']
+
+                                logger.info(f"✅ search_detailed_conversation_history returned: {result.get('count', 0)} results")
                                 tool_results.append({
                                     "tool_call_id": tool_call.id,
                                     "role": "tool",
