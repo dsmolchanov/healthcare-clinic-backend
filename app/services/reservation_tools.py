@@ -136,16 +136,89 @@ class ReservationTools:
             stage_config = stage_config if isinstance(stage_config, dict) else {}
             is_multi_stage = stage_config.get('total_stages', 1) > 1
 
-            # Use intelligent scheduler to find slots
-            strategy = SchedulingStrategy.AI_OPTIMIZED
-            slots = await self.scheduler.find_available_slots(
-                service_id=service.get('id') if service else None,
-                start_date=start_date,
-                end_date=end_date,
-                doctor_id=doctor_id,
-                duration_minutes=service.get('duration_minutes', 30) if service else 30,
-                strategy=strategy
-            )
+            # Handle "no doctor preference" case with workload-based selection
+            eligible_doctors = None
+            recommended_doctor = None
+
+            if doctor_id is None:
+                logger.info(f"No doctor preference specified - finding eligible doctors for service {service.get('id')}")
+
+                # Find all eligible doctors for this service
+                eligible_doctors = await self._get_eligible_doctors_for_service(
+                    clinic_id=self.clinic_id,
+                    service_id=service.get('id')
+                )
+
+                if not eligible_doctors:
+                    return {
+                        "success": False,
+                        "error": "no_eligible_doctors",
+                        "message": f"No doctors are currently available for {service_name}. Please contact the clinic.",
+                        "available_slots": []
+                    }
+
+                # Calculate workloads for each eligible doctor
+                eligible_doctors = await self._calculate_doctor_workloads(
+                    doctors=eligible_doctors,
+                    target_date=start_date
+                )
+
+                # Sort by workload (least-busy first, i.e., highest workload_score)
+                eligible_doctors = sorted(
+                    eligible_doctors,
+                    key=lambda d: d.get('workload_score', 0),
+                    reverse=True
+                )
+
+                # Recommended doctor is the least-busy one
+                recommended_doctor = eligible_doctors[0] if eligible_doctors else None
+
+                logger.info(
+                    f"Found {len(eligible_doctors)} eligible doctors. "
+                    f"Recommended: {recommended_doctor.get('name') if recommended_doctor else 'None'} "
+                    f"(workload: {recommended_doctor.get('workload_label', 'unknown') if recommended_doctor else 'N/A'})"
+                )
+
+                # Aggregate slots from all eligible doctors, prioritizing least-busy
+                slots = []
+                strategy = SchedulingStrategy.AI_OPTIMIZED
+
+                for doctor in eligible_doctors:
+                    doctor_slots = await self.scheduler.find_available_slots(
+                        service_id=service.get('id') if service else None,
+                        start_date=start_date,
+                        end_date=end_date,
+                        doctor_id=doctor['id'],
+                        duration_minutes=service.get('duration_minutes', 30) if service else 30,
+                        strategy=strategy
+                    )
+
+                    # Add doctor info to each slot
+                    for slot in (doctor_slots or []):
+                        if isinstance(slot, dict):
+                            slot['doctor_id'] = doctor['id']
+                            slot['doctor_name'] = doctor['name']
+                            slot['doctor_specialization'] = doctor.get('specialization', '')
+                            slot['workload_score'] = doctor.get('workload_score', 0.5)
+                            slot['workload_label'] = doctor.get('workload_label', 'unknown')
+                            slots.append(slot)
+
+                # Sort slots by workload_score (higher = less busy = better) then by datetime
+                slots.sort(
+                    key=lambda s: (-s.get('workload_score', 0), s.get('datetime', ''))
+                )
+
+            else:
+                # Existing path: specific doctor requested
+                strategy = SchedulingStrategy.AI_OPTIMIZED
+                slots = await self.scheduler.find_available_slots(
+                    service_id=service.get('id') if service else None,
+                    start_date=start_date,
+                    end_date=end_date,
+                    doctor_id=doctor_id,
+                    duration_minutes=service.get('duration_minutes', 30) if service else 30,
+                    strategy=strategy
+                )
 
             # Ensure slots is a list (defensive check)
             if not slots or not isinstance(slots, list):
@@ -180,7 +253,7 @@ class ReservationTools:
                     verified_slots.append(slot)
 
             # Format response
-            return {
+            response = {
                 "success": True,
                 "service": {
                     "id": service['id'],
@@ -200,6 +273,30 @@ class ReservationTools:
                 },
                 "recommendation": verified_slots[0] if verified_slots else None
             }
+
+            # Add doctor selection info when no doctor preference was specified
+            if eligible_doctors is not None:
+                response["available_doctors"] = [
+                    {
+                        "id": d['id'],
+                        "name": d['name'],
+                        "specialization": d.get('specialization', ''),
+                        "workload_score": d.get('workload_score', 0.5),
+                        "workload_label": d.get('workload_label', 'unknown'),
+                        "appointment_count": d.get('appointment_count', 0)
+                    }
+                    for d in eligible_doctors
+                ]
+                response["recommended_doctor"] = {
+                    "id": recommended_doctor['id'],
+                    "name": recommended_doctor['name'],
+                    "specialization": recommended_doctor.get('specialization', ''),
+                    "workload_label": recommended_doctor.get('workload_label', 'unknown'),
+                    "reason": "least_busy"
+                } if recommended_doctor else None
+                response["doctor_selection_mode"] = "workload_balanced"
+
+            return response
 
         except Exception as e:
             logger.error(f"Error checking availability: {str(e)}")
@@ -859,6 +956,135 @@ class ReservationTools:
             }
 
     # Helper methods
+
+    async def _get_eligible_doctors_for_service(
+        self,
+        clinic_id: str,
+        service_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all active doctors who can provide a specific service at this clinic.
+
+        Args:
+            clinic_id: Clinic ID
+            service_id: Service ID
+
+        Returns:
+            List of doctor dictionaries with id, name, and specialization
+        """
+        try:
+            # Query doctor_services join table to find eligible doctors
+            result = self.supabase.schema('healthcare').table('doctor_services').select(
+                'doctor_id, doctors(id, first_name, last_name, specialization, is_active)'
+            ).eq('service_id', service_id).execute()
+
+            doctors = []
+            for row in result.data or []:
+                doctor_data = row.get('doctors')
+                if doctor_data and doctor_data.get('is_active', True):
+                    doctors.append({
+                        'id': doctor_data['id'],
+                        'name': f"Dr. {doctor_data.get('first_name', '')} {doctor_data.get('last_name', '')}".strip(),
+                        'specialization': doctor_data.get('specialization', '')
+                    })
+
+            # If no doctors found via doctor_services, try to find all active doctors at clinic
+            # (fallback for clinics without explicit service-doctor mappings)
+            if not doctors:
+                logger.warning(
+                    f"No doctor-service mappings found for service {service_id}, "
+                    f"falling back to all active doctors at clinic {clinic_id}"
+                )
+                fallback_result = self.supabase.schema('healthcare').table('doctors').select(
+                    'id, first_name, last_name, specialization'
+                ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
+
+                for doc in fallback_result.data or []:
+                    doctors.append({
+                        'id': doc['id'],
+                        'name': f"Dr. {doc.get('first_name', '')} {doc.get('last_name', '')}".strip(),
+                        'specialization': doc.get('specialization', '')
+                    })
+
+            logger.info(f"Found {len(doctors)} eligible doctors for service {service_id}")
+            return doctors
+
+        except Exception as e:
+            logger.error(f"Error getting eligible doctors for service: {e}")
+            return []
+
+    async def _calculate_doctor_workloads(
+        self,
+        doctors: List[Dict[str, Any]],
+        target_date: datetime
+    ) -> List[Dict[str, Any]]:
+        """
+        Calculate workload scores for doctors based on their appointment count.
+
+        Uses the same logic as PreferenceScorer.score_least_busy():
+        - 0 appointments = 1.0 (least busy)
+        - 8+ appointments = 0.0 (most busy)
+
+        Args:
+            doctors: List of doctor dictionaries with 'id' field
+            target_date: Target date to check appointments
+
+        Returns:
+            List of doctors with workload_score and appointment_count added
+        """
+        try:
+            doctor_ids = [d['id'] for d in doctors]
+
+            if not doctor_ids:
+                return doctors
+
+            # Get appointment counts for each doctor on the target date
+            date_str = target_date.strftime('%Y-%m-%d')
+
+            # Query appointments for all eligible doctors on the target date
+            result = self.supabase.schema('healthcare').table('appointments').select(
+                'doctor_id'
+            ).in_('doctor_id', doctor_ids).eq(
+                'appointment_date', date_str
+            ).neq('status', 'cancelled').execute()
+
+            # Count appointments per doctor
+            appointment_counts = {}
+            for apt in result.data or []:
+                doc_id = apt['doctor_id']
+                appointment_counts[doc_id] = appointment_counts.get(doc_id, 0) + 1
+
+            # Calculate workload scores (matching PreferenceScorer.score_least_busy logic)
+            MAX_APPOINTMENTS = 8
+
+            for doctor in doctors:
+                count = appointment_counts.get(doctor['id'], 0)
+                # Score: 0 appointments = 1.0, 8+ = 0.0
+                workload_score = max(0.0, 1.0 - (count / MAX_APPOINTMENTS))
+
+                doctor['appointment_count'] = count
+                doctor['workload_score'] = workload_score
+                doctor['workload_label'] = (
+                    'light' if workload_score > 0.7 else
+                    'moderate' if workload_score > 0.3 else
+                    'heavy'
+                )
+
+            logger.info(
+                f"Calculated workloads for {len(doctors)} doctors on {date_str}: "
+                f"counts={appointment_counts}"
+            )
+
+            return doctors
+
+        except Exception as e:
+            logger.error(f"Error calculating doctor workloads: {e}")
+            # Return doctors without workload info on error
+            for doctor in doctors:
+                doctor['appointment_count'] = 0
+                doctor['workload_score'] = 0.5
+                doctor['workload_label'] = 'unknown'
+            return doctors
 
     async def _get_service_by_name(
         self,
