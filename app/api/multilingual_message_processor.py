@@ -886,6 +886,22 @@ DO NOT attempt to answer complex questions yourself.
         saturday_hours = hours.get('saturday') or "Not provided"
         sunday_hours = hours.get('sunday') or "Not provided"
 
+        # Get current date/time context for the LLM
+        from datetime import datetime
+        now = datetime.now()
+        current_date = now.strftime('%Y-%m-%d')
+        current_day = now.strftime('%A')  # e.g., "Sunday"
+        current_time = now.strftime('%H:%M')
+
+        # Determine today's hours based on the day of the week
+        day_lower = current_day.lower()
+        if day_lower == 'sunday':
+            todays_hours = sunday_hours
+        elif day_lower == 'saturday':
+            todays_hours = saturday_hours
+        else:
+            todays_hours = weekday_hours
+
         # Build knowledge context section with enhanced formatting
         knowledge_section = ""
         if knowledge_context:
@@ -1065,6 +1081,11 @@ You ARE {clinic_name}, speaking directly to patients. You represent the clinic i
 
 CRITICAL LANGUAGE RULE: You MUST maintain conversation language consistency. Use the language of the conversation (from previous messages). Only switch languages if the user clearly switches to a different language with a complete sentence. Single words or medical terms (like "veneer", "implant", "consultation") DO NOT indicate a language switch - these are universal terms. Stay in the current conversation language unless the user explicitly writes a full sentence in a different language.
 {profile_section}{constraints_section}{previous_summary_section}{additional_context}{conversation_summary}{preferences_section}{knowledge_section}
+CURRENT DATE/TIME:
+- Today: {current_day}, {current_date}
+- Current Time: {current_time}
+- Today's Hours: {todays_hours}
+
 Clinic Information:
 - Name: {clinic_name}
 - Location: {profile_location}
@@ -1083,11 +1104,23 @@ Instructions:
    - **CRITICAL FOR APPOINTMENTS**: If the user is in the middle of booking an appointment (asked about a doctor, agreed to book), you MUST complete that appointment booking before addressing new topics. If they ask about something else mid-booking, acknowledge it but remind them "Let me finish booking your appointment with Dr. [Name] first, then I can help with [new topic]."
 5. **USE TOOLS when needed**: You have access to tools for querying service prices and clinic information. Use them when:
    - Users ask about pricing or costs (use query_service_prices tool). **ALWAYS say "Our standard rate starts at..." or "The base price is..." to indicate it's an estimate. Add a disclaimer that a consultation is required.**
-   - Users want to check appointment availability (use check_availability tool). **You MUST call this tool IMMEDIATELY when asked. You do NOT need a doctor_id to check general availability. Do not just say you will check.**
+   - Users want to check appointment availability OR want to book an appointment (use check_availability tool). **You MUST call this tool IMMEDIATELY when user mentions booking, scheduling, or making an appointment. Pass the service_name from the user's message (e.g., "cleaning", "consultation"). Do NOT ask follow-up questions first - call the tool immediately!**
+   - **User confirms they want to book a slot** (use book_appointment tool). **CRITICAL: When user says "yes", "book it", "confirm", or provides their name/phone, you MUST call book_appointment with: service_id (from check_availability), datetime_str (ISO format), patient_info (name, phone). Do NOT just say "I'll book it" - actually call the tool!**
+   - User wants to cancel an appointment (use cancel_appointment tool)
+   - User wants to reschedule an appointment (use reschedule_appointment tool)
    - Users ask about doctors, staff, or clinic details (use get_clinic_info tool)
    - Users ask about previous conversations or past interactions (use get_previous_conversations_summary tool)
    - Users need specific details from past messages (use search_detailed_conversation_history tool)
    - You need up-to-date information from the database
+
+**BOOKING FLOW - MUST FOLLOW**:
+1. User asks to book → call check_availability to get available slots (returns service_id, datetime options)
+2. Present slots to user → wait for confirmation
+3. User confirms slot + provides name/phone → IMMEDIATELY call book_appointment with:
+   - service_id: UUID from check_availability result
+   - datetime_str: Selected slot in ISO format (e.g., "2025-11-24T14:00:00")
+   - patient_info: object with "name" and "phone" fields
+4. Report confirmation to user with appointment details
 6. **CRITICAL - DOCTOR IDS**:
    - **General Availability**: If the user asks for availability without naming a doctor, call check_availability WITHOUT a doctor_id. DO NOT call get_clinic_info first.
    - **Specific Doctor**: ONLY if the user specifically requests a doctor by name, you must use get_clinic_info to find their doctor_id. Then use that ID in check_availability.
