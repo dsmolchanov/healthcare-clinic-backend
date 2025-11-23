@@ -126,7 +126,9 @@ async def process_webhook_by_token(webhook_token: str, body_bytes: bytes):
     try:
         # Parse webhook body
         data = json.loads(body_bytes)
-        message_data = data.get("message", {})
+        # Evolution API payload structure: {"event": "...", "instance": "...", "data": {...}}
+        # The actual message data is inside data["data"], not data["message"]
+        message_data = data.get("data", {}) or data.get("message", {})
 
         if not message_data:
             print(f"[Token Async] ⚠️  No message data, ignoring")
@@ -353,7 +355,9 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
 
         # IDEMPOTENCY CHECK: Reject duplicate messages using Redis SETNX
         # Extract message ID for deduplication
-        message_data = data.get("message", {})
+        # Evolution API payload structure: {"event": "...", "instance": "...", "data": {...}}
+        # The actual message data is inside data["data"], not data["message"]
+        message_data = data.get("data", {}) or data.get("message", {})
         key = message_data.get("key", {})
         message_id = key.get("id")
 
