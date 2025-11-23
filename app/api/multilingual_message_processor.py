@@ -674,7 +674,7 @@ DO NOT attempt to answer complex questions yourself.
 
         # Update patient with extracted name and detected language
         if extracted_first or detected_language:
-            await self._upsert_patient_from_whatsapp(
+            await self.profile_manager.upsert_patient_from_whatsapp(
                 clinic_id=effective_clinic_id or request.clinic_id,
                 phone=request.from_phone,
                 profile_name=request.profile_name,
