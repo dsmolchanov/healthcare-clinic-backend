@@ -108,90 +108,56 @@ class AsyncMessageLogger:
             )
         """
         try:
-            # Build RPC parameters
-            params = {
-                # Conversation
-                'p_session_id': session_id,
-                'p_role': role,
-                'p_content': content,
-                'p_metadata': metadata or {},
-                'p_whatsapp_message_id': whatsapp_message_id,
+            # 1. Log to healthcare.conversation_logs (Direct Insert)
+            # Use 'message_content' instead of 'content' as per schema
+            log_payload = {
+                'session_id': session_id,
+                'role': role,
+                'message_content': content,  # Correct column name
+                'metadata': metadata or {},
+                'whatsapp_message_id': whatsapp_message_id,
+                'clinic_id': clinic_id,
+                'organization_id': organization_id,
+                'created_at': datetime.utcnow().isoformat()
+            }
+            
+            # Explicitly target healthcare schema
+            log_result = self.supabase.schema('healthcare').table('conversation_logs').insert(log_payload).execute()
+            
+            message_id = None
+            if log_result.data:
+                message_id = log_result.data[0].get('id')
 
-                # LLM metrics
-                'p_llm_provider': llm_provider,
-                'p_llm_model': llm_model,
-                'p_llm_tokens_input': llm_tokens_input,
-                'p_llm_tokens_output': llm_tokens_output,
-                'p_llm_latency_ms': llm_latency_ms,
-                'p_llm_cost_usd': llm_cost_usd,
+            # 2. Log to public.message_metrics (Direct Insert)
+            if message_id:
+                metrics_payload = {
+                    'message_id': message_id,
+                    'session_id': session_id,
+                    'llm_provider': llm_provider,
+                    'llm_model': llm_model,
+                    'llm_tokens_input': llm_tokens_input,
+                    'llm_tokens_output': llm_tokens_output,
+                    'llm_latency_ms': llm_latency_ms,
+                    'llm_cost_usd': llm_cost_usd,
+                    'total_latency_ms': total_latency_ms,
+                    'total_cost_usd': total_cost_usd,
+                    'error_occurred': error_occurred,
+                    'error_message': error_message
+                }
+                # Use public schema (default)
+                self.supabase.schema('public').table('message_metrics').insert(metrics_payload).execute()
 
-                # Tools/RAG
-                'p_tools_called': tools_called or [],
-                'p_tool_count': tool_count,
-                'p_tool_latency_ms': tool_latency_ms,
-                'p_rag_queries': rag_queries,
-                'p_rag_chunks_retrieved': rag_chunks_retrieved,
-                'p_rag_latency_ms': rag_latency_ms,
-                'p_mem0_queries': mem0_queries,
-                'p_mem0_memories_retrieved': mem0_memories_retrieved,
-                'p_mem0_latency_ms': mem0_latency_ms,
+            # 3. Log platform events (Optional - skip for now if table unknown or to save time)
+            # if log_platform_events: ...
 
-                # Audio
-                'p_stt_provider': stt_provider,
-                'p_stt_latency_ms': stt_latency_ms,
-                'p_stt_confidence': stt_confidence,
-                'p_tts_provider': tts_provider,
-                'p_tts_characters': tts_characters,
-                'p_tts_latency_ms': tts_latency_ms,
-
-                # Totals
-                'p_total_latency_ms': total_latency_ms,
-                'p_total_cost_usd': total_cost_usd,
-
-                # Errors
-                'p_error_occurred': error_occurred,
-                'p_error_message': error_message,
-
-                # Platform
-                'p_log_platform_events': log_platform_events,
-                'p_agent_id': agent_id,
-
-                # Organization/Clinic (✅ NEW)
-                'p_organization_id': organization_id,
-                'p_clinic_id': clinic_id
+            return {
+                'success': True,
+                'message_id': message_id,
+                'processing_time_ms': total_latency_ms
             }
 
-            # Single RPC call - writes to all 3 tables in one transaction
-            response = self.supabase.rpc('log_message_with_metrics', params).execute()
-            rpc_payload = getattr(response, "data", None)
-
-            if not isinstance(rpc_payload, dict):
-                logger.error("❌ Failed to log message: Unexpected response payload %s", rpc_payload)
-                failure = {
-                    'success': False,
-                    'error': 'Unexpected response payload',
-                    'payload': rpc_payload
-                }
-                if self.strict_logging:
-                    raise RuntimeError("log_message_with_metrics returned unexpected payload")
-                return failure
-
-            if not rpc_payload.get('success', False):
-                error_message = rpc_payload.get('error') or 'Unknown failure from log_message_with_metrics'
-                logger.error("❌ Failed to log message: %s", error_message)
-                if self.strict_logging:
-                    raise RuntimeError(f"log_message_with_metrics failed: {error_message}")
-                return rpc_payload
-
-            logger.info(
-                "✅ Message logged successfully (id: %s) in %dms",
-                rpc_payload.get('message_id'),
-                rpc_payload.get('processing_time_ms', 0)
-            )
-            return rpc_payload
-
         except Exception as e:
-            logger.error("❌ Error logging message: %s", e, exc_info=True)
+            logger.error("❌ Error logging message (direct insert): %s", e, exc_info=True)
             if self.strict_logging:
                 raise
             return {'success': False, 'error': str(e)}

@@ -1,0 +1,149 @@
+# Golden Set - Ideal Conversations
+# This file contains examples of "perfect" interactions between a user and the healthcare agent.
+# These scenarios cover common use cases and edge cases, demonstrating the ideal flow, tone, and tool usage.
+# Can be used with run_evals.py (evaluates the final response) or for regression testing.
+
+scenarios:
+  - name: "Golden - Full Booking Flow"
+    description: "A complete, ideal flow from initial request to confirmed booking."
+    messages:
+      - role: "user"
+        content: "Hi, I need to schedule a dental cleaning."
+      - role: "assistant"
+        content: "I can certainly help you with that. When were you hoping to come in?"
+      - role: "user"
+        content: "Do you have anything available next Tuesday morning?"
+      - role: "assistant"
+        content: "Let me check our availability for next Tuesday morning. One moment please."
+        # Implicit tool call: check_availability(service_name="cleaning", preferred_date="[Next Tuesday Date]")
+      - role: "assistant"
+        content: "I have a couple of openings for a cleaning next Tuesday, November 25th. I have a 9:00 AM and a 10:30 AM. Do either of those work for you?"
+      - role: "user"
+        content: "10:30 AM sounds perfect."
+      - role: "assistant"
+        content: "Great. I'll book you for a dental cleaning on Tuesday, November 25th at 10:30 AM. Could I just get your full name to confirm the appointment?"
+      - role: "user"
+        content: "It's Sarah Connor."
+      - role: "assistant"
+        content: "Thank you, Sarah. I've booked your appointment for Tuesday, November 25th at 10:30 AM. You'll receive a confirmation message shortly. Is there anything else I can help you with?"
+    expected_behavior: "The agent should confirm the booking using the book_appointment tool and close the interaction politely."
+    criteria:
+      - "Calls book_appointment with correct details (Sarah Connor, cleaning, correct datetime)"
+      - "Confirms the details to the user"
+      - "Polite closing"
+
+  - name: "Golden - Pricing to Booking"
+    description: "User asks for price first, then decides to book."
+    messages:
+      - role: "user"
+        content: "How much does a teeth whitening session cost?"
+      - role: "assistant"
+        content: "Let me check the current pricing for you."
+        # Implicit tool call: get_pricing(service_name="teeth whitening")
+      - role: "assistant"
+        content: "Our teeth whitening service is $250.00. It typically takes about 60 minutes. Would you like to schedule an appointment?"
+      - role: "user"
+        content: "Yeah, that sounds reasonable. Can I book it for this Friday?"
+      - role: "assistant"
+        content: "Let me see what we have available for this Friday."
+        # Implicit tool call: check_availability(service_name="teeth whitening", preferred_date="[This Friday Date]")
+      - role: "assistant"
+        content: "For this Friday, I have an opening at 2:00 PM. Does that work for you?"
+      - role: "user"
+        content: "Yes, 2 PM is fine."
+    expected_behavior: "The agent should proceed to collect necessary details (name) if not already known, or book if known."
+    criteria:
+      - "Acknowledges the time selection"
+      - "Asks for name/details if missing OR calls book_appointment if user is identified"
+      - "Professional tone"
+
+  - name: "Golden - Handling Unavailability"
+    description: "User requests a time that is not available, agent handles it gracefully."
+    messages:
+      - role: "user"
+        content: "I need an emergency appointment for a toothache. Can I come in right now?"
+      - role: "assistant"
+        content: "I'm sorry to hear you're in pain. Let me check our immediate availability."
+        # Implicit tool call: check_availability(service_name="emergency", preferred_date="[Today]")
+      - role: "assistant"
+        content: "I'm afraid we don't have any openings right this moment. The earliest slot I have is today at 3:30 PM. Would that work for you, or should I check tomorrow morning?"
+      - role: "user"
+        content: "3:30 PM is too late. What about tomorrow?"
+      - role: "assistant"
+        content: "Let me check tomorrow morning for you."
+        # Implicit tool call: check_availability(service_name="emergency", preferred_date="[Tomorrow]")
+      - role: "assistant"
+        content: "For tomorrow morning, I have an 8:15 AM slot available. Would you like to grab that?"
+      - role: "user"
+        content: "Yes, please. 8:15 AM tomorrow."
+    expected_behavior: "The agent should secure the 8:15 AM slot."
+    criteria:
+      - "Shows empathy for the emergency"
+      - "Correctly pivots to checking tomorrow"
+      - "Secures the booking"
+
+  - name: "Golden - Rescheduling (Complex)"
+    description: "User wants to change an existing appointment."
+    messages:
+      - role: "user"
+        content: "Hi, I have an appointment for a cleaning on Thursday but I can't make it."
+      - role: "assistant"
+        content: "I can help you reschedule that. Let me find your appointment first. What is your phone number?"
+      - role: "user"
+        content: "555-0199."
+      - role: "assistant"
+        content: "Thank you. Let me look that up."
+        # Implicit tool call: search_appointments(patient_phone="555-0199")
+      - role: "assistant"
+        content: "I found your appointment for a cleaning this Thursday at 10 AM. Would you like to cancel it or reschedule to a different time?"
+      - role: "user"
+        content: "Reschedule please. Do you have anything on Friday instead?"
+      - role: "assistant"
+        content: "Checking Friday for you..."
+        # Implicit tool call: check_availability(service_name="cleaning", preferred_date="[Friday]")
+      - role: "assistant"
+        content: "I have a 1:00 PM slot on Friday. Does that work?"
+      - role: "user"
+        content: "Yes, that works."
+    expected_behavior: "The agent should cancel the old appointment and book the new one."
+    criteria:
+      - "Calls cancel_appointment for the old ID"
+      - "Calls book_appointment for the new slot"
+      - "Confirms the change to the user"
+
+  - name: "Golden - Out of Hours Inquiry"
+    description: "User asks for an appointment on a Sunday (Closed)."
+    messages:
+      - role: "user"
+        content: "Are you open on Sundays? I need a checkup."
+      - role: "assistant"
+        content: "Let me check our business hours."
+        # Implicit tool call: get_business_hours(day_of_week="Sunday")
+      - role: "assistant"
+        content: "We are actually closed on Sundays. We are open Monday through Friday from 9 AM to 5 PM, and Saturdays from 10 AM to 2 PM. Would you like to schedule something for Monday?"
+      - role: "user"
+        content: "Okay, let's do Monday morning."
+    expected_behavior: "The agent should proceed to check Monday availability."
+    criteria:
+      - "Correctly identifies Sunday as closed"
+      - "Proactively offers Monday"
+      - "Checks availability for Monday"
+
+  - name: "Golden - Spanish Speaker"
+    description: "Seamless language switching."
+    messages:
+      - role: "user"
+        content: "Hello."
+      - role: "assistant"
+        content: "Hello! How can I help you today?"
+      - role: "user"
+        content: "Quisiera hacer una cita para una limpieza."
+      - role: "assistant"
+        content: "¡Claro que sí! Puedo ayudarle con eso. ¿Para cuándo le gustaría venir?"
+      - role: "user"
+        content: "El próximo lunes por favor."
+    expected_behavior: "The agent should continue in Spanish and check availability."
+    criteria:
+      - "Responds in Spanish"
+      - "Correctly interprets 'next Monday'"
+      - "Calls check_availability"

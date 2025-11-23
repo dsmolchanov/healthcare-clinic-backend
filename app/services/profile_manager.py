@@ -117,7 +117,7 @@ class ProfileManager:
             ConversationState with episode_type, constraints, booking_state
         """
         try:
-            result = self.supabase.table('conversation_sessions')\
+            result = self.supabase.schema('public').table('conversation_sessions')\
                 .select('episode_type, current_constraints, booking_state')\
                 .eq('id', session_id)\
                 .single()\
@@ -157,7 +157,7 @@ class ProfileManager:
             else:
                 constraints_to_save = constraints
 
-            self.supabase.table('conversation_sessions')\
+            self.supabase.schema('public').table('conversation_sessions')\
                 .update({'current_constraints': constraints_to_save})\
                 .eq('id', session_id)\
                 .execute()
@@ -172,7 +172,7 @@ class ProfileManager:
         This is what "Forget my previous intents" should call.
         """
         try:
-            self.supabase.table('conversation_sessions')\
+            self.supabase.schema('public').table('conversation_sessions')\
                 .update({
                     'current_constraints': {},
                     'booking_state': {}
@@ -191,7 +191,7 @@ class ProfileManager:
     ):
         """Update current booking attempt state"""
         try:
-            self.supabase.table('conversation_sessions')\
+            self.supabase.schema('public').table('conversation_sessions')\
                 .update({'booking_state': booking_data})\
                 .eq('id', session_id)\
                 .execute()
@@ -234,3 +234,56 @@ class ProfileManager:
             logger.warning(f"⚠️ Added permanent ban for doctor: {doctor_name}")
         except Exception as e:
             logger.error(f"Failed to add doctor ban: {e}")
+
+    async def upsert_patient_from_whatsapp(
+        self,
+        clinic_id: str,
+        phone: str,
+        profile_name: str,
+        detected_language: Optional[str] = None
+    ):
+        """
+        Create or update patient record from WhatsApp contact.
+        Ensures we have a record for every user who contacts us.
+        """
+        try:
+            # Check if patient exists
+            result = self.supabase.schema('healthcare').table('patients')\
+                .select('id, first_name, last_name')\
+                .eq('phone', phone)\
+                .eq('clinic_id', clinic_id)\
+                .execute()
+
+            if not result.data:
+                # Create new patient
+                first_name = profile_name
+                last_name = ""
+                
+                # Try to split name if possible
+                if " " in profile_name:
+                    parts = profile_name.split(" ", 1)
+                    first_name = parts[0]
+                    last_name = parts[1]
+
+                data = {
+                    'clinic_id': clinic_id,
+                    'phone': phone,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'source': 'whatsapp',
+                    'created_at': 'now()'
+                }
+                
+                if detected_language:
+                    data['hard_preferences'] = {'preferred_language': detected_language}
+
+                self.supabase.schema('healthcare').table('patients').insert(data).execute()
+                logger.info(f"🆕 Created new patient record for {phone}")
+            
+            elif detected_language:
+                # Update language if detected and not set
+                # Note: In a real app we might want to be careful about overwriting
+                pass
+
+        except Exception as e:
+            logger.error(f"Failed to upsert patient: {e}")

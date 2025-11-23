@@ -3,8 +3,11 @@ import os
 import yaml
 import json
 import sys
+import argparse
 from datetime import datetime
 from unittest.mock import MagicMock, AsyncMock, patch
+from contextlib import ExitStack
+from dotenv import load_dotenv
 
 # Ensure paths are correct
 sys.path.append(os.getcwd())
@@ -13,134 +16,282 @@ from app.api.multilingual_message_processor import MultilingualMessageProcessor,
 from app.services.router_service import RouterService
 from evaluation.judge import LLMJudge
 
+# Load environment variables
+load_dotenv()
+
 # Mock environment variables if not present
 if "OPENAI_API_KEY" not in os.environ:
     print("⚠️ OPENAI_API_KEY not found in environment. Please set it to run evals.")
     sys.exit(1)
 
 async def run_evals():
+    # Parse arguments
+    parser = argparse.ArgumentParser(description="Run evaluations for Healthcare Agent")
+    parser.add_argument("scenario_file", nargs="?", default="apps/healthcare-backend/evaluation/scenarios.yaml", help="Path to scenarios YAML file")
+    parser.add_argument("--real-data", action="store_true", help="Run against real Supabase data (disable DB/Tool mocks)")
+    parser.add_argument("--clinic-id", default="test-clinic", help="Clinic ID to test against (default: test-clinic)")
+    args = parser.parse_args()
+
     # Load scenarios
     try:
-        with open("apps/healthcare-backend/evaluation/scenarios.yaml", "r") as f:
+        print(f"📂 Loading scenarios from: {args.scenario_file}")
+        with open(args.scenario_file, "r") as f:
             data = yaml.safe_load(f)
             scenarios = data["scenarios"]
     except FileNotFoundError:
-        print("❌ Scenarios file not found at apps/healthcare-backend/evaluation/scenarios.yaml")
+        print(f"❌ Scenarios file not found at {args.scenario_file}")
         sys.exit(1)
 
     # Initialize Judge
     judge = LLMJudge()
 
-    # Setup Processor with Mocks
-    print("🔧 Initializing Agent with Real Router & Mocks...")
+    print(f"🔧 Initializing Agent (Real Data: {args.real_data})...")
     
-    with patch('app.memory.conversation_memory.get_memory_manager') as mock_mm_get, \
-         patch('app.api.async_message_logger.AsyncMessageLogger') as mock_logger_cls, \
-         patch('app.services.response_analyzer.ResponseAnalyzer') as mock_analyzer_cls, \
-         patch('app.services.escalation_handler.EscalationHandler') as mock_escalation_cls, \
-         patch('app.services.followup_scheduler.FollowupScheduler'), \
-         patch('app.api.multilingual_message_processor.SessionManager') as mock_sm_cls, \
-         patch('app.api.multilingual_message_processor.ConstraintsManager'), \
-         patch('app.api.multilingual_message_processor.ConstraintExtractor') as mock_ce_cls, \
-         patch('app.api.multilingual_message_processor.ToolStateGate'), \
-         patch('app.api.multilingual_message_processor.StateEchoFormatter'), \
-         patch('app.services.cache_service.CacheService') as mock_cache_cls, \
-         patch('app.api.multilingual_message_processor.get_llm_factory') as mock_get_factory, \
-         patch('app.api.multilingual_message_processor.get_supabase_client') as mock_get_supabase:
-
-        # --- Configure Mocks ---
-        
-        # Memory Manager
-        mock_mm = MagicMock()
-        mock_mm.get_or_create_session = AsyncMock(return_value={'id': 'test-session', 'metadata': {}})
-        mock_mm.get_session_by_id = AsyncMock(return_value={'id': 'test-session', 'metadata': {}})
-        mock_mm.store_message = AsyncMock()
-        mock_mm.get_user_preferences = AsyncMock(return_value={})
-        mock_mm.get_memory_context = AsyncMock(return_value=[])
-        mock_mm_get.return_value = mock_mm
-
-        # Session Manager
-        mock_sm = MagicMock()
-        mock_sm.check_and_manage_boundary = AsyncMock(return_value=('test-session', False, 'none'))
-        mock_lock = MagicMock()
-        mock_lock.acquire = MagicMock()
-        mock_lock.acquire.return_value.__aenter__ = AsyncMock(return_value=None)
-        mock_lock.acquire.return_value.__aexit__ = AsyncMock(return_value=None)
-        mock_sm.boundary_lock = mock_lock
-        mock_sm_cls.return_value = mock_sm
-
-        # Cache Service
-        mock_cache = MagicMock()
-        mock_cache.hydrate_context = AsyncMock(return_value={
-            'clinic': {
-                'id': 'test-clinic',
-                'name': 'Test Dental Clinic',
-                'phone': '+15550000000',
-                'location': '123 Test St',
-                'services': ['Dental Cleaning', 'Root Canal', 'Teeth Whitening'],
-                'hours': {'weekdays': '9 AM - 5 PM'},
-                'service_aliases': {'cleaning': 'Dental Cleaning'}
-            },
-            'patient': {
-                'id': 'test-patient',
-                'first_name': 'John',
-                'last_name': 'Doe',
-                'phone': '+15551112222',
-                'preferred_language': 'en'
-            },
-            'session_state': {},
-            'services': [],
-            'doctors': [],
-            'faqs': []
-        })
-        mock_cache_cls.return_value = mock_cache
-
-        # Constraint Extractor
-        mock_ce = MagicMock()
-        mock_ce.detect_meta_reset.return_value = False
-        mock_ce_cls.return_value = mock_ce
-
-        # Escalation Handler
-        mock_escalation = MagicMock()
-        mock_escalation.check_if_should_escalate = AsyncMock(return_value={'should_escalate': False, 'reason': None})
-        mock_escalation_cls.return_value = mock_escalation
-
-        # Response Analyzer
+    with ExitStack() as stack:
+        # --- ALWAYS MOCK THESE ---
+        # Mock Logger to avoid polluting metrics
+        stack.enter_context(patch('app.api.async_message_logger.AsyncMessageLogger'))
+        # Mock Analyzer to avoid extra latency/complexity if not needed for core logic
         mock_analyzer = MagicMock()
         mock_analyzer.analyze_agent_response = AsyncMock(return_value={'turn_status': 'user_turn'})
-        mock_analyzer_cls.return_value = mock_analyzer
-
-        # LLM Factory - REAL LLM CALLS
-        from app.services.llm.adapters.openai_adapter import OpenAIAdapter
-        from app.services.llm.base_adapter import LLMCapability, LLMProvider
+        stack.enter_context(patch('app.services.response_analyzer.ResponseAnalyzer', return_value=mock_analyzer))
+        # Mock Escalation Handler
+        mock_escalation = MagicMock()
+        mock_escalation.check_if_should_escalate = AsyncMock(return_value={'should_escalate': False, 'reason': None})
+        stack.enter_context(patch('app.services.escalation_handler.EscalationHandler', return_value=mock_escalation))
+        # Mock Followup Scheduler
+        stack.enter_context(patch('app.services.followup_scheduler.FollowupScheduler'))
+        # Mock Constraints Manager (usually internal logic, but can be mocked)
+        stack.enter_context(patch('app.api.multilingual_message_processor.ConstraintsManager'))
+        # Mock Constraint Extractor
+        # Mock ConstraintExtractor unless using real data
+        if not args.real_data:
+            mock_ce = MagicMock()
+            mock_ce.detect_meta_reset.return_value = False
+            stack.enter_context(patch('app.api.multilingual_message_processor.ConstraintExtractor', return_value=mock_ce))
+        else:
+            # For real data, we might want to mock it if it's not fully configured, 
+            # but to avoid MagicMock serialization errors, we should let it run or use a better mock.
+            # For now, let's NOT mock it and assume it works or fails gracefully.
+            pass
+        # Mock State Echo Formatter
+        stack.enter_context(patch('app.api.multilingual_message_processor.StateEchoFormatter'))
+        # Mock Langfuse
+        stack.enter_context(patch('app.api.multilingual_message_processor.Langfuse'))
         
-        real_adapter = OpenAIAdapter(LLMCapability(
+        # Mock LLM Factory - We ALWAYS mock this to inject our capturing wrapper
+        # This allows us to capture tool calls even when using real tools
+        mock_get_factory = stack.enter_context(patch('app.api.multilingual_message_processor.get_llm_factory'))
+
+        # --- CONDITIONAL MOCKS ---
+        if not args.real_data:
+            print("  - Mocking Database, Tools, and Session State")
+            
+            # Memory Manager
+            mock_mm = MagicMock()
+            mock_mm.get_or_create_session = AsyncMock(return_value={'id': 'test-session', 'metadata': {}})
+            mock_mm.get_session_by_id = AsyncMock(return_value={'id': 'test-session', 'metadata': {}})
+            mock_mm.store_message = AsyncMock()
+            mock_mm.get_user_preferences = AsyncMock(return_value={})
+            mock_mm.get_memory_context = AsyncMock(return_value=[])
+            mock_mm.get_conversation_history = AsyncMock(return_value=[])
+            stack.enter_context(patch('app.memory.conversation_memory.get_memory_manager', return_value=mock_mm))
+
+            # Session Manager
+            mock_sm = MagicMock()
+            mock_sm.check_and_manage_boundary = AsyncMock(return_value=('test-session', False, 'none'))
+            mock_lock = MagicMock()
+            mock_lock.acquire = MagicMock()
+            mock_lock.acquire.return_value.__aenter__ = AsyncMock(return_value=None)
+            mock_lock.acquire.return_value.__aexit__ = AsyncMock(return_value=None)
+            mock_sm.boundary_lock = mock_lock
+            stack.enter_context(patch('app.api.multilingual_message_processor.SessionManager', return_value=mock_sm))
+
+            # Tool State Gate (Patched in Executor)
+            mock_gate = MagicMock()
+            mock_gate.validate_tool_call.return_value = (True, None, None)
+            stack.enter_context(patch('app.services.tools.executor.ToolStateGate', return_value=mock_gate))
+
+            # MessageContextHydrator (Replaces CacheService mock)
+            mock_hydrator = MagicMock()
+            mock_hydrator.hydrate = AsyncMock(return_value={
+                'clinic': {
+                    'id': args.clinic_id,
+                    'name': 'Test Dental Clinic',
+                    'phone': '+15550000000',
+                    'location': '123 Test St',
+                    'services': ['Dental Cleaning', 'Root Canal', 'Teeth Whitening'],
+                    'hours': {'weekdays': '9 AM - 5 PM'},
+                    'service_aliases': {'cleaning': 'Dental Cleaning'}
+                },
+                'patient': {
+                    'id': 'test-patient',
+                    'first_name': 'John',
+                    'last_name': 'Doe',
+                    'phone': '+15551112222',
+                    'preferred_language': 'en'
+                },
+                'session_state': {},
+                'services': [],
+                'doctors': [],
+                'faqs': [],
+                'history': [],
+                'preferences': {},
+                'profile': None,
+                'conversation_state': None
+            })
+            stack.enter_context(patch('app.services.message_context_hydrator.MessageContextHydrator', return_value=mock_hydrator))
+
+            # Supabase Client
+            stack.enter_context(patch('app.api.multilingual_message_processor.get_supabase_client'))
+
+            # Tools
+            # ClinicInfoTool (Patched in Handler)
+            mock_clinic_tool = MagicMock()
+            mock_clinic_tool.get_clinic_info = AsyncMock(return_value={
+                'name': 'Test Dental Clinic',
+                'address': '123 Test St',
+                'hours': {'weekdays': '9 AM - 5 PM'},
+                'phone': '+15550000000',
+                'email': 'contact@testclinic.com'
+            })
+            mock_clinic_tool.get_doctor_count = AsyncMock(return_value={
+                'total_doctors': 2,
+                'specializations': {'General': [{'name': 'Dr. Smith', 'id': 'doc-1'}]},
+                'doctor_list': ['Dr. Smith'],
+                'doctor_details': [{'name': 'Dr. Smith', 'id': 'doc-1', 'specialization': 'General'}]
+            })
+            stack.enter_context(patch('app.services.tools.clinic_info_handler.ClinicInfoTool', return_value=mock_clinic_tool))
+            # Also mock ClinicDataCache in handler
+            mock_cdc = MagicMock()
+            mock_cdc.get_services = AsyncMock(return_value=[{'name': 'Dental Cleaning'}, {'name': 'Root Canal'}])
+            stack.enter_context(patch('app.services.tools.clinic_info_handler.ClinicDataCache', return_value=mock_cdc))
+
+            # PriceQueryTool (Patched in Handler)
+            mock_price_tool = MagicMock()
+            mock_price_tool.get_services_by_query = AsyncMock(return_value=[
+                {'name': 'Dental Cleaning', 'price': 100.0, 'base_price': 100.0},
+                {'name': 'Root Canal', 'price': 500.0, 'base_price': 500.0}
+            ])
+            stack.enter_context(patch('app.services.tools.price_handler.PriceQueryTool', return_value=mock_price_tool))
+
+            # ReservationTools (Patched in Handlers)
+            mock_reservation_tools = MagicMock()
+            mock_reservation_tools.check_availability_tool = AsyncMock(return_value={
+                'success': True,
+                'available_slots': [
+                    {'date': '2025-11-23', 'start_time': '10:00', 'doctor_name': 'Dr. Smith'},
+                    {'date': '2025-11-23', 'start_time': '14:00', 'doctor_name': 'Dr. Smith'}
+                ],
+                'recommendation': 'We have morning and afternoon slots available.'
+            })
+            mock_reservation_tools.book_appointment_tool = AsyncMock(return_value={
+                'success': True,
+                'appointment_id': 'appt-123',
+                'appointment': {'date': '2025-11-23', 'start_time': '10:00', 'doctor_name': 'Dr. Smith'},
+                'confirmation_message': 'Appointment booked successfully'
+            })
+            # Patch in both handlers
+            stack.enter_context(patch('app.services.tools.availability_handler.ReservationTools', return_value=mock_reservation_tools))
+            stack.enter_context(patch('app.services.tools.booking_handler.ReservationTools', return_value=mock_reservation_tools))
+            
+        else:
+            print("  - ⚠️ Using REAL Supabase Connection and Tools")
+            # When using real data, we DON'T mock the tools or DB services.
+            # However, we still need to ensure the environment is set up correctly.
+
+        # --- LLM FACTORY SETUP (Shared) ---
+        from app.services.llm.adapters.openai_adapter import OpenAIAdapter
+        from app.services.llm.base_adapter import ModelCapability, LLMProvider
+        
+        real_adapter = OpenAIAdapter(ModelCapability(
             provider=LLMProvider.OPENAI,
             model_name="gpt-4o",
-            api_key=os.environ["OPENAI_API_KEY"]
+            api_key=os.environ["OPENAI_API_KEY"],
+            display_name="GPT-4o",
+            input_price_per_1m=5.0,
+            output_price_per_1m=15.0,
+            max_input_tokens=128000,
+            max_output_tokens=4096,
+            supports_streaming=True,
+            supports_tool_calling=True,
+            tool_calling_success_rate=0.95,
+            supports_parallel_tools=True,
+            supports_json_mode=True,
+            supports_structured_output=True,
+            supports_thinking_mode=False,
+            api_endpoint="https://api.openai.com/v1",
+            requires_api_key_env_var="OPENAI_API_KEY",
+            base_url_override=None
         ))
 
+        # Wrap generate_with_tools to capture tool calls
+        original_generate_with_tools = real_adapter.generate_with_tools
+        captured_tool_calls = []
+
+        async def capturing_generate(*args, **kwargs):
+            # OpenAIAdapter returns LLMResponse
+            llm_response = await original_generate_with_tools(*args, **kwargs)
+            
+            # Capture tools
+            if llm_response.tool_calls:
+                captured_tool_calls.extend([t.model_dump() for t in llm_response.tool_calls])
+            
+            # Processor expects LLMResponse object
+            return llm_response
+
         mock_factory = MagicMock()
-        mock_factory.generate_with_tools = real_adapter.generate 
+        mock_factory.generate_with_tools = capturing_generate 
+        
+        async def capturing_generate_simple(*args, **kwargs):
+            return await real_adapter.generate(*args, **kwargs)
+        mock_factory.generate = capturing_generate_simple
+        
         mock_get_factory.return_value = mock_factory
 
         # Initialize Processor
         processor = MultilingualMessageProcessor()
         
-        # Mock internal async methods
+        # Mock internal async methods that might cause side effects or aren't needed for e2e
         processor._upsert_patient_from_whatsapp = AsyncMock()
-        processor._extract_and_update_constraints = AsyncMock(return_value=MagicMock(
-            excluded_doctors=[], excluded_services=[], desired_service=None, time_window_start=None
-        ))
+        
+        # If mocking, we mock constraint extraction. If real, we let it run? 
+        # We mocked ConstraintExtractor above in both cases to simplify.
+        # But processor._extract_and_update_constraints calls it.
+        # Let's mock the internal method to be safe and consistent with previous runs, 
+        # unless we want to test constraint extraction too.
+        # For now, let's keep it mocked to focus on tool execution.
+        # Use real ConversationConstraints object instead of MagicMock to avoid JSON serialization errors
+        from app.services.conversation_constraints import ConversationConstraints
+        processor._extract_and_update_constraints = AsyncMock(return_value=ConversationConstraints())
 
         # --- REAL ROUTER SETUP ---
+        # Even with real data, we might want to mock the router's internal language service if it's complex,
+        # but here we use the real RouterService class.
+        # In the original script, we mocked language_service.
         mock_lang_service = MagicMock()
         mock_lang_service.match_service_alias.return_value = None
         mock_lang_service.is_affirmative.return_value = False
         mock_lang_service.is_negative.return_value = False
         
-        real_router = RouterService(language_service=mock_lang_service, session_service=mock_sm)
-        processor.router_service = real_router
+        # If real data, we might want real SessionManager?
+        # If we didn't mock SessionManager above (in real mode), we should pass the real one?
+        # processor.router_service is initialized inside processor.__init__.
+        # If we want to inject our mocked language service but keep real session manager:
+        if args.real_data:
+            # We need to access the real session manager created inside processor
+            # But processor creates it internally.
+            # We can just replace the router service.
+            # Note: processor.session_manager is the real one in real mode.
+            real_router = RouterService(language_service=mock_lang_service, session_service=processor.session_manager)
+            processor.router_service = real_router
+        else:
+            # In mock mode, mock_sm is the session manager
+            real_router = RouterService(language_service=mock_lang_service, session_service=mock_sm)
+            processor.router_service = real_router
+
+        # Ensure message_logger methods are async mocks
+        processor.message_logger.log_message_with_metrics = AsyncMock()
 
         print("🚀 Starting Evaluations...\n")
         
@@ -159,17 +310,21 @@ async def run_evals():
                     if msg['role'] == 'user':
                         print(f"  Turn {i+1}: User says '{msg['content']}'")
                         
-                        # Update mock memory with current history
-                        mock_mm.get_conversation_history.return_value = conversation_history
+                        # Update mock memory with current history (only if mocked)
+                        if not args.real_data:
+                            mock_mm.get_conversation_history = AsyncMock(return_value=conversation_history)
                         
                         req = MessageRequest(
                             from_phone='+15551112222',
                             to_phone='+15550000000',
                             body=msg['content'],
                             message_sid=f"msg-{datetime.now().timestamp()}",
-                            clinic_id='test-clinic',
+                            clinic_id=args.clinic_id,
                             clinic_name='Test Dental Clinic'
                         )
+
+                        # Clear captured tool calls for this turn
+                        captured_tool_calls.clear()
 
                         # Process Message
                         response = await processor.process_message(req)
@@ -177,6 +332,8 @@ async def run_evals():
                         last_agent_response = agent_response_text
                         
                         print(f"  Agent says: {agent_response_text}")
+                        if captured_tool_calls:
+                            print(f"  Tools called: {[t['name'] for t in captured_tool_calls]}")
                         
                         # Update history
                         conversation_history.append({"role": "user", "content": msg['content']})
@@ -190,7 +347,7 @@ async def run_evals():
                                 agent_response=agent_response_text,
                                 expected_behavior=scenario['expected_behavior'],
                                 criteria=scenario['criteria'],
-                                tool_calls=None # Placeholder for tool calls
+                                tool_calls=captured_tool_calls
                             )
 
                             print(f"  Score: {eval_result['score']}/10")
@@ -234,7 +391,9 @@ async def run_evals():
 
         # Save Results
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        output_file = f"apps/healthcare-backend/evaluation/results-{timestamp}.json"
+        # Use absolute path relative to script location
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        output_file = os.path.join(script_dir, f"results-{timestamp}.json")
         with open(output_file, "w") as f:
             json.dump({
                 "timestamp": timestamp,
