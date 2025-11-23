@@ -240,11 +240,17 @@ class ProfileManager:
         clinic_id: str,
         phone: str,
         profile_name: str,
-        detected_language: Optional[str] = None
+        detected_language: Optional[str] = None,
+        extracted_first_name: Optional[str] = None,
+        extracted_last_name: Optional[str] = None
     ):
         """
         Create or update patient record from WhatsApp contact.
         Ensures we have a record for every user who contacts us.
+
+        Args:
+            extracted_first_name: AI-extracted first name (takes precedence over profile_name parsing)
+            extracted_last_name: AI-extracted last name (takes precedence over profile_name parsing)
         """
         try:
             # Check if patient exists
@@ -255,15 +261,18 @@ class ProfileManager:
                 .execute()
 
             if not result.data:
-                # Create new patient
-                first_name = profile_name
-                last_name = ""
-                
-                # Try to split name if possible
-                if " " in profile_name:
-                    parts = profile_name.split(" ", 1)
-                    first_name = parts[0]
-                    last_name = parts[1]
+                # Create new patient - prefer extracted names over profile_name parsing
+                if extracted_first_name:
+                    first_name = extracted_first_name
+                    last_name = extracted_last_name or ""
+                else:
+                    first_name = profile_name
+                    last_name = ""
+                    # Fallback: try to split name if possible
+                    if " " in profile_name:
+                        parts = profile_name.split(" ", 1)
+                        first_name = parts[0]
+                        last_name = parts[1]
 
                 data = {
                     'clinic_id': clinic_id,
@@ -273,17 +282,36 @@ class ProfileManager:
                     'source': 'whatsapp',
                     'created_at': 'now()'
                 }
-                
+
                 if detected_language:
                     data['hard_preferences'] = {'preferred_language': detected_language}
 
                 self.supabase.schema('healthcare').table('patients').insert(data).execute()
                 logger.info(f"🆕 Created new patient record for {phone}")
-            
-            elif detected_language:
-                # Update language if detected and not set
-                # Note: In a real app we might want to be careful about overwriting
-                pass
+
+            else:
+                # Patient exists - update with extracted names if provided and current names are missing/generic
+                patient = result.data[0]
+                update_data = {}
+
+                # Update first name if extracted and current is missing or same as profile_name
+                if extracted_first_name and (not patient.get('first_name') or patient.get('first_name') == profile_name):
+                    update_data['first_name'] = extracted_first_name
+
+                # Update last name if extracted and current is missing
+                if extracted_last_name and not patient.get('last_name'):
+                    update_data['last_name'] = extracted_last_name
+
+                # Update language if detected
+                if detected_language:
+                    update_data['hard_preferences'] = {'preferred_language': detected_language}
+
+                if update_data:
+                    self.supabase.schema('healthcare').table('patients')\
+                        .update(update_data)\
+                        .eq('id', patient['id'])\
+                        .execute()
+                    logger.info(f"📝 Updated patient record for {phone}: {list(update_data.keys())}")
 
         except Exception as e:
             logger.error(f"Failed to upsert patient: {e}")
