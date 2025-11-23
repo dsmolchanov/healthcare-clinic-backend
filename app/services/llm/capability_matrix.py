@@ -17,7 +17,7 @@ class CapabilityMatrix:
         if model_name in self._cache:
             return self._cache[model_name]
 
-        result = self.supabase.table('llm_models')\
+        result = self.supabase.schema('public').table('llm_models')\
             .select('*')\
             .eq('model_name', model_name)\
             .eq('is_active', True)\
@@ -33,7 +33,7 @@ class CapabilityMatrix:
 
     async def get_default_model(self) -> ModelCapability:
         """Get the default model (GLM-4.5)"""
-        result = self.supabase.table('llm_models')\
+        result = self.supabase.schema('public').table('llm_models')\
             .select('*')\
             .eq('is_default', True)\
             .eq('is_active', True)\
@@ -56,7 +56,7 @@ class CapabilityMatrix:
     ) -> ModelCapability:
         """Select best model matching requirements"""
 
-        query = self.supabase.table('llm_models')\
+        query = self.supabase.schema('public').table('llm_models')\
             .select('*')\
             .eq('is_active', True)\
             .eq('is_production_ready', True)
