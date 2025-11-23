@@ -1,6 +1,6 @@
 from typing import Dict, List, Any, Optional
 from langfuse import observe
-from app.services.llm.base_adapter import LLMAdapter, LLMResponse, LLMProvider
+from app.services.llm.base_adapter import LLMAdapter, LLMResponse, LLMProvider, ModelCapability
 from app.services.llm.capability_matrix import CapabilityMatrix
 from app.services.llm.adapters.glm_adapter import GLMAdapter
 from app.services.llm.adapters.gemini_adapter import GeminiAdapter
@@ -15,6 +15,61 @@ logger = logging.getLogger(__name__)
 class LLMFactory:
     """Unified LLM factory with multi-provider support"""
 
+    # Hardcoded model capabilities to avoid database dependency
+    BUILTIN_MODELS: Dict[str, 'ModelCapability'] = {}
+
+    @classmethod
+    def _get_builtin_capabilities(cls) -> Dict[str, 'ModelCapability']:
+        """Lazily initialize builtin model capabilities"""
+        if not cls.BUILTIN_MODELS:
+            cls.BUILTIN_MODELS = {
+                'gpt-4o-mini': ModelCapability(
+                    provider='openai',
+                    model_name='gpt-4o-mini',
+                    display_name='GPT-4o Mini',
+                    input_price_per_1m=0.15,
+                    output_price_per_1m=0.60,
+                    max_input_tokens=128000,
+                    max_output_tokens=16384,
+                    avg_output_speed_tokens_per_sec=100.0,
+                    avg_ttft_seconds=0.3,
+                    p95_latency_ms=2000,
+                    supports_streaming=True,
+                    supports_tool_calling=True,
+                    tool_calling_success_rate=0.98,
+                    supports_parallel_tools=True,
+                    supports_json_mode=True,
+                    supports_structured_output=True,
+                    supports_thinking_mode=False,
+                    api_endpoint='https://api.openai.com/v1/chat/completions',
+                    requires_api_key_env_var='OPENAI_API_KEY',
+                    base_url_override=None
+                ),
+                'gpt-4o': ModelCapability(
+                    provider='openai',
+                    model_name='gpt-4o',
+                    display_name='GPT-4o',
+                    input_price_per_1m=2.50,
+                    output_price_per_1m=10.00,
+                    max_input_tokens=128000,
+                    max_output_tokens=16384,
+                    avg_output_speed_tokens_per_sec=80.0,
+                    avg_ttft_seconds=0.5,
+                    p95_latency_ms=3000,
+                    supports_streaming=True,
+                    supports_tool_calling=True,
+                    tool_calling_success_rate=0.99,
+                    supports_parallel_tools=True,
+                    supports_json_mode=True,
+                    supports_structured_output=True,
+                    supports_thinking_mode=False,
+                    api_endpoint='https://api.openai.com/v1/chat/completions',
+                    requires_api_key_env_var='OPENAI_API_KEY',
+                    base_url_override=None
+                ),
+            }
+        return cls.BUILTIN_MODELS
+
     def __init__(self, supabase_client):
         self.supabase = supabase_client
         self.capability_matrix = CapabilityMatrix(supabase_client)
@@ -25,17 +80,32 @@ class LLMFactory:
         if model_name in self._adapter_cache:
             return self._adapter_cache[model_name]
 
-        # Load capability
-        capability = await self.capability_matrix.load_model(model_name)
+        # First try builtin models (no database query needed)
+        builtin = self._get_builtin_capabilities()
+        if model_name in builtin:
+            capability = builtin[model_name]
+            logger.info(f"Using builtin capability for {model_name}")
+        else:
+            # Fallback to database lookup
+            try:
+                capability = await self.capability_matrix.load_model(model_name)
+            except Exception as e:
+                logger.warning(f"Failed to load model {model_name} from database: {e}")
+                # Default to gpt-4o-mini if model not found
+                if 'gpt-4o-mini' in builtin:
+                    logger.info(f"Falling back to gpt-4o-mini")
+                    capability = builtin['gpt-4o-mini']
+                else:
+                    raise
 
         # Create provider-specific adapter
-        if capability.provider == LLMProvider.GLM:
+        if capability.provider == LLMProvider.GLM or capability.provider == 'glm':
             adapter = GLMAdapter(capability)
-        elif capability.provider == LLMProvider.GOOGLE:
+        elif capability.provider == LLMProvider.GOOGLE or capability.provider == 'google':
             adapter = GeminiAdapter(capability)
-        elif capability.provider == LLMProvider.OPENAI:
+        elif capability.provider == LLMProvider.OPENAI or capability.provider == 'openai':
             adapter = OpenAIAdapter(capability)
-        elif capability.provider == LLMProvider.CEREBRAS:
+        elif capability.provider == LLMProvider.CEREBRAS or capability.provider == 'cerebras':
             # Cerebras disabled due to httpx 0.28.1 compatibility issues
             logger.warning(f"Cerebras provider disabled, falling back to OpenAI")
             raise ValueError(f"Cerebras provider temporarily disabled")
