@@ -14,7 +14,7 @@ Benefits:
 
 import json
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
@@ -57,15 +57,15 @@ class ClinicDataCache:
 
             doctors = []
             try:
-                # Use 'active' column (current schema)
-                result = supabase_client.table('doctors').select(
+                # Use 'active' column (current schema) - doctors is in healthcare schema
+                result = supabase_client.schema('healthcare').table('doctors').select(
                     'id,first_name,last_name,specialization,phone,email'
                 ).eq('clinic_id', clinic_id).eq('active', True).execute()
                 doctors = result.data if result.data else []
             except Exception as e:
                 if 'active' in str(e):
                     logger.debug("Falling back to 'is_active' column for doctors")
-                    result = supabase_client.table('doctors').select(
+                    result = supabase_client.schema('healthcare').table('doctors').select(
                         'id,first_name,last_name,specialization,phone,email'
                     ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
                     doctors = result.data if result.data else []
@@ -80,13 +80,13 @@ class ClinicDataCache:
 
         except Exception as e:
             logger.error(f"Error getting/caching doctors: {e}")
-            # Final fallback - try active column
+            # Final fallback - try active column (healthcare schema)
             try:
-                result = supabase_client.table('doctors').select(
+                result = supabase_client.schema('healthcare').table('doctors').select(
                     'id,first_name,last_name,specialization'
                 ).eq('clinic_id', clinic_id).eq('active', True).execute()
                 return result.data if result.data else []
-            except:
+            except Exception:
                 return []
 
     async def get_services(self, clinic_id: str, supabase_client) -> List[Dict[str, Any]]:

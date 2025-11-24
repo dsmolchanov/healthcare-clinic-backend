@@ -3,7 +3,7 @@
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional
-from app.config import get_supabase_client
+from app.database import get_healthcare_client
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,7 @@ class SessionSummarizer:
     """Generates concise summaries of conversation sessions."""
 
     def __init__(self):
-        self.supabase = get_supabase_client()
+        self.supabase = get_healthcare_client()
         self._llm = None  # Lazy-loaded
 
     async def _get_llm(self):
@@ -124,7 +124,7 @@ Generate summary:"""
             # Generate summary
             summary = await self.generate_summary(messages, session_metadata)
 
-            # Store summary with status
+            # Store summary with status (healthcare schema)
             self.supabase.table('conversation_sessions').update({
                 'session_summary': summary,
                 'summary_generated_at': current_time.isoformat(),
@@ -147,7 +147,7 @@ Generate summary:"""
     async def _get_session_messages(self, session_id: str) -> List[Dict]:
         """Fetch all messages for a session."""
         try:
-            result = self.supabase.table('conversation_messages').select(
+            result = self.supabase.schema('healthcare').table('conversation_logs').select(
                 'role, message_content, created_at'
             ).eq('session_id', session_id).order('created_at', desc=False).execute()
 
@@ -157,7 +157,7 @@ Generate summary:"""
             return []
 
     async def _get_session_metadata(self, session_id: str) -> Dict:
-        """Fetch session metadata."""
+        """Fetch session metadata from healthcare schema."""
         try:
             result = self.supabase.table('conversation_sessions').select(
                 'metadata, user_identifier, started_at, ended_at'

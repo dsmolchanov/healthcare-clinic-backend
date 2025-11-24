@@ -1,96 +1,165 @@
 """
-Database management and client
+Database management and Supabase client factory.
+
+IMPORTANT: This is the ONLY module allowed to import `create_client` directly.
+All other modules must use the helpers provided here.
 """
 
 import os
-from typing import Dict, Any, List, Optional
-import asyncio
+from typing import Dict, Any
 from contextlib import asynccontextmanager
 import logging
+
+import httpx
 from supabase import create_client, Client
+from supabase.client import ClientOptions
 
 try:
     import asyncpg
     ASYNCPG_AVAILABLE = True
 except ImportError:
     ASYNCPG_AVAILABLE = False
-    
+
 logger = logging.getLogger(__name__)
+
+
+# Schema constants
+class Schema:
+    """Database schema constants for explicit schema binding."""
+    PUBLIC = 'public'
+    HEALTHCARE = 'healthcare'
+    CORE = 'core'
+
 
 # Database connection pool
 _db_pool = None
+# Cached clients per schema
 _supabase_clients: Dict[str, Client] = {}
 
 
-def create_supabase_client(schema: str = 'healthcare') -> Client:
-    """Create a new Supabase client (sync version for compatibility)"""
-    global _supabase_clients
+def _build_http_client() -> httpx.Client:
+    """Build optimized HTTP client with HTTP/1.1 and tight timeouts."""
+    return httpx.Client(
+        http2=False,  # Use HTTP/1.1 to avoid handshake delays
+        timeout=httpx.Timeout(
+            connect=1.5,
+            read=2.5,
+            write=2.5,
+            pool=5.0
+        ),
+        limits=httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=30.0
+        ),
+        follow_redirects=True
+    )
 
-    if schema in _supabase_clients:
-        return _supabase_clients[schema]
 
-    # Get credentials
+def _get_credentials() -> tuple:
+    """Get Supabase credentials from environment."""
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
 
     if not supabase_url or not supabase_key:
         raise ValueError("SUPABASE_URL and SUPABASE_ANON_KEY/SERVICE_ROLE_KEY must be set")
 
-    try:
-        from supabase.client import ClientOptions
+    return supabase_url, supabase_key
 
-        # Configure client to use healthcare schema
+
+def create_supabase_client(schema: str = Schema.HEALTHCARE) -> Client:
+    """
+    Create or get cached Supabase client for specified schema (sync version).
+
+    Args:
+        schema: Database schema to use ('healthcare', 'public', 'core')
+
+    Returns:
+        Configured Supabase client
+
+    Raises:
+        ValueError: If credentials not configured or ClientOptions unavailable for healthcare
+    """
+    global _supabase_clients
+
+    if schema in _supabase_clients:
+        return _supabase_clients[schema]
+
+    supabase_url, supabase_key = _get_credentials()
+
+    # CRITICAL: For healthcare schema, we MUST have ClientOptions support
+    # Do NOT fall back to default schema for PHI data
+    try:
         options = ClientOptions(
             schema=schema,
             auto_refresh_token=True,
             persist_session=False
         )
-
-        client = create_client(supabase_url, supabase_key, options=options)
-        _supabase_clients[schema] = client
-        logger.info(f"Connected to Supabase: {supabase_url} (using {schema} schema)")
-    except ImportError:
-        # Fallback to regular client without options
+    except ImportError as e:
+        if schema == Schema.HEALTHCARE:
+            raise ValueError(
+                f"Cannot create healthcare client without ClientOptions support. "
+                f"PHI data requires explicit schema binding. Error: {e}"
+            )
+        # For non-PHI schemas, allow fallback with warning
+        logger.warning(f"ClientOptions not available, using default schema instead of '{schema}'")
         client = create_client(supabase_url, supabase_key)
         _supabase_clients[schema] = client
-        logger.info(f"Connected to Supabase: {supabase_url} (using default schema)")
+        return client
 
-    return _supabase_clients[schema]
+    client = create_client(supabase_url, supabase_key, options=options)
 
-
-async def get_supabase(schema: str = 'healthcare') -> Client:
-    """Get or create Supabase client"""
-    global _supabase_clients
-
-    if schema in _supabase_clients:
-        return _supabase_clients[schema]
-    
-    # Get credentials
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-    
-    if not supabase_url or not supabase_key:
-        raise ValueError("SUPABASE_URL and SUPABASE_ANON_KEY/SERVICE_ROLE_KEY must be set")
-    
+    # Apply HTTP/1.1 optimization
     try:
-        from supabase.client import ClientOptions
-        
-        # Configure client to use healthcare schema
-        options = ClientOptions(
-            schema=schema,
-            auto_refresh_token=True,
-            persist_session=False
-        )
-        
-        client = create_client(supabase_url, supabase_key, options=options)
-        _supabase_clients[schema] = client
-        logger.info(f"Connected to Supabase: {supabase_url} (using {schema} schema)")
-        
+        http_client = _build_http_client()
+        if hasattr(client, '_postgrest') and hasattr(client._postgrest, 'session'):
+            client._postgrest.session = http_client
     except Exception as e:
-        logger.error(f"Failed to create Supabase client: {e}")
-        raise
-    
-    return _supabase_clients[schema]
+        logger.warning(f"Could not apply HTTP optimization: {e}")
+
+    _supabase_clients[schema] = client
+    logger.info(f"Connected to Supabase: {supabase_url} (schema: {schema})")
+
+    return client
+
+
+async def get_supabase(schema: str = Schema.HEALTHCARE) -> Client:
+    """
+    Get or create Supabase client for specified schema (async version).
+
+    This is the preferred method for async services.
+    """
+    # Delegates to sync version since Supabase client creation is synchronous
+    return create_supabase_client(schema)
+
+
+# ============================================================================
+# Convenience helpers - these are the PREFERRED entry points
+# ============================================================================
+
+def get_healthcare_client() -> Client:
+    """Get Supabase client bound to healthcare schema (PHI data)."""
+    return create_supabase_client(Schema.HEALTHCARE)
+
+
+def get_main_client() -> Client:
+    """Get Supabase client bound to public schema (non-PHI data)."""
+    return create_supabase_client(Schema.PUBLIC)
+
+
+def get_core_client() -> Client:
+    """Get Supabase client bound to core schema (organizations, agents)."""
+    return create_supabase_client(Schema.CORE)
+
+
+async def get_healthcare_client_async() -> Client:
+    """Async version of get_healthcare_client()."""
+    return await get_supabase(Schema.HEALTHCARE)
+
+
+async def get_main_client_async() -> Client:
+    """Async version of get_main_client()."""
+    return await get_supabase(Schema.PUBLIC)
 
 async def init_db_pool():
     """Initialize database connection pool"""

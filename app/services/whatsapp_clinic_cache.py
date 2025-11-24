@@ -18,9 +18,9 @@ Cache structure:
 
 import json
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from app.config import get_redis_client
-from app.db.supabase_client import get_supabase_client
+from app.database import get_healthcare_client
 
 logger = logging.getLogger(__name__)
 
@@ -220,10 +220,10 @@ class WhatsAppClinicCache:
         logger.info(f"Token cache miss for {webhook_token[:8]}..., fetching from DB...")
 
         try:
-            supabase = get_supabase_client()
+            supabase = get_healthcare_client()
 
             # Single indexed query (NOT N+1!)
-            result = supabase.schema('healthcare').table('integrations').select(
+            result = supabase.table('integrations').select(
                 'organization_id, clinic_id, config, phone_number, display_name'
             ).eq('type', 'whatsapp').eq('enabled', True).eq(
                 'webhook_token', webhook_token  # Indexed lookup!
@@ -276,7 +276,7 @@ class WhatsAppClinicCache:
         Returns:
             Dict with warmup statistics
         """
-        supabase = get_supabase_client()
+        supabase = get_healthcare_client()
         stats = {
             "total": 0,
             "cached": 0,
@@ -287,7 +287,7 @@ class WhatsAppClinicCache:
 
         try:
             # Query healthcare.integrations for WhatsApp configurations
-            result = supabase.schema('healthcare').table('integrations').select(
+            result = supabase.table('integrations').select(
                 'id, organization_id, clinic_id, type, config, enabled, webhook_token, phone_number, display_name'
             ).eq('type', 'whatsapp').eq('enabled', True).execute()
 
@@ -403,10 +403,10 @@ class WhatsAppClinicCache:
         logger.info(f"Cache miss for {instance_name}, fetching from DB...")
 
         try:
-            supabase = get_supabase_client()
+            supabase = get_healthcare_client()
 
             # Look up integration by instance name
-            result = supabase.schema('healthcare').table('integrations').select(
+            result = supabase.table('integrations').select(
                 'organization_id, config'
             ).eq('type', 'whatsapp').eq('enabled', True).execute()
 

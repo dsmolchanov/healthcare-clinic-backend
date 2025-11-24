@@ -470,7 +470,8 @@ class ConversationMemoryManager:
         def _update():
             return (
                 self.supabase
-                .table('conversation_messages')
+                .schema('healthcare')
+                .table('conversation_logs')
                 .update({'metadata': metadata})
                 .eq('id', message_id)
                 .execute()
@@ -702,7 +703,7 @@ class ConversationMemoryManager:
                     logger.info(f"Got/created session {session_id} for {clean_phone}")
 
                     # Fetch full session details
-                    session_result = self.supabase.table('conversation_sessions').select('*').eq(
+                    session_result = self.supabase.schema('public').table('conversation_sessions').select('*').eq(
                         'id', session_id
                     ).single().execute()
 
@@ -751,7 +752,7 @@ class ConversationMemoryManager:
             Session dict or None if not found
         """
         try:
-            result = self.supabase.table('conversation_sessions').select('*').eq(
+            result = self.supabase.schema('public').table('conversation_sessions').select('*').eq(
                 'id', session_id
             ).maybe_single().execute()
 
@@ -835,6 +836,7 @@ class ConversationMemoryManager:
                     try:
                         lookup = (
                             self.supabase
+                            .schema('public')
                             .table('conversation_sessions')
                             .select('metadata')
                             .eq('id', actual_session_uuid)
@@ -856,7 +858,8 @@ class ConversationMemoryManager:
                 await self._schedule_mem0_warmup(clinic_id, resolved_phone)
 
                 # Store using new RPC (writes to healthcare.conversation_logs)
-                result = self.supabase.rpc('log_message_with_metrics', {
+                # Use healthcare schema explicitly since the RPC is defined there
+                result = self.supabase.schema('healthcare').rpc('log_message_with_metrics', {
                     'p_session_id': actual_session_uuid,
                     'p_role': role,
                     'p_content': content,
@@ -1000,7 +1003,7 @@ class ConversationMemoryManager:
         try:
             if session_id:
                 # Use explicitly provided session_id (prevents race condition)
-                query = self.supabase.table('conversation_messages').select('*').eq(
+                query = self.supabase.schema('healthcare').table('conversation_logs').select('*').eq(
                     'session_id', session_id
                 )
 
@@ -1014,7 +1017,7 @@ class ConversationMemoryManager:
 
             elif include_all_sessions:
                 # Get all messages from all sessions for this phone number
-                sessions_result = self.supabase.table('conversation_sessions').select('id').eq(
+                sessions_result = self.supabase.schema('public').table('conversation_sessions').select('id').eq(
                     'user_identifier', clean_phone
                 ).eq(
                     'metadata->>clinic_id', clinic_id
@@ -1026,7 +1029,7 @@ class ConversationMemoryManager:
                 session_ids = [s['id'] for s in sessions_result.data]
 
                 # Get messages from all sessions with time filter
-                query = self.supabase.table('conversation_messages').select('*').in_(
+                query = self.supabase.schema('healthcare').table('conversation_logs').select('*').in_(
                     'session_id', session_ids
                 )
 
@@ -1042,7 +1045,7 @@ class ConversationMemoryManager:
                 # Get only current session messages with time filter
                 current_session = await self.get_or_create_session(phone_number, clinic_id)
 
-                query = self.supabase.table('conversation_messages').select('*').eq(
+                query = self.supabase.schema('healthcare').table('conversation_logs').select('*').eq(
                     'session_id', current_session['id']
                 )
 
@@ -1104,7 +1107,7 @@ class ConversationMemoryManager:
         """
 
         def _query():
-            query = self.supabase.table('conversation_messages').select('metadata, created_at')
+            query = self.supabase.schema('healthcare').table('conversation_logs').select('metadata, created_at')
             query = query.eq('metadata->>from_number', phone_number)
 
             if clinic_id:
@@ -1265,7 +1268,7 @@ class ConversationMemoryManager:
             threshold = datetime.utcnow() - timedelta(hours=older_than_hours)
 
             def _delete_query():
-                query = self.supabase.table('conversation_messages')
+                query = self.supabase.schema('healthcare').table('conversation_logs')
                 query = query.delete()
                 query = query.eq('metadata->>from_number', clean_phone)
 
@@ -1555,7 +1558,7 @@ class ConversationMemoryManager:
         
         try:
             # Update session with summary
-            self.supabase.table('conversation_sessions').update({
+            self.supabase.schema('public').table('conversation_sessions').update({
                 'metadata': {
                     'summary': summary
                 },

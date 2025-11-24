@@ -279,7 +279,7 @@ class ProfileManager:
                     'phone': phone,
                     'first_name': first_name,
                     'last_name': last_name,
-                    'source': 'whatsapp',
+                    'date_of_birth': '1900-01-01',  # Placeholder DOB for new patients via WhatsApp
                     'created_at': 'now()'
                 }
 

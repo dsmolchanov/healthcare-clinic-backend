@@ -3,9 +3,10 @@ Application Configuration
 Centralized configuration for Redis and other services
 """
 import os
+import warnings
 from redis import Redis
-from supabase import create_client, Client
 from typing import Optional
+from supabase import Client
 
 # Redis Configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -16,7 +17,6 @@ MESSAGE_HISTORY_MAX_WINDOW = int(os.getenv("MESSAGE_HISTORY_MAX_WINDOW", "24"))
 MESSAGE_HISTORY_MAX_MESSAGES = int(os.getenv("MESSAGE_HISTORY_MAX_MESSAGES", "100"))
 MESSAGE_HISTORY_MAX_TOKENS = int(os.getenv("MESSAGE_HISTORY_MAX_TOKENS", "4000"))
 
-_supabase_client: Optional[Client] = None
 
 def get_redis_client() -> Redis:
     """
@@ -34,21 +34,19 @@ def get_redis_client() -> Redis:
         health_check_interval=30  # Health check every 30 seconds
     )
 
+
+# DEPRECATED - use app.database instead
 def get_supabase_client() -> Optional[Client]:
     """
-    Get cached Supabase client instance
+    DEPRECATED: Use app.database.get_healthcare_client() or get_main_client() instead.
 
-    Returns:
-        Client: Supabase client or None if not configured
+    This function does not support schema selection and defaults to public.
     """
-    global _supabase_client
-    if _supabase_client is None:
-        url = os.environ.get("SUPABASE_URL", "")
-        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
-
-        if not url or not key:
-            return None
-
-        _supabase_client = create_client(url, key)
-
-    return _supabase_client
+    warnings.warn(
+        "get_supabase_client() is deprecated. Use app.database.get_healthcare_client() "
+        "or app.database.get_main_client() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    from app.database import get_main_client
+    return get_main_client()

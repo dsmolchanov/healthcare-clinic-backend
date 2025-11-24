@@ -6,7 +6,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, Depends, H
 from typing import Optional
 import logging
 from app.websocket.manager import manager, websocket_endpoint
-from app.services.sync_service import DataSyncService
 from app.core.auth import get_current_user
 
 logger = logging.getLogger(__name__)

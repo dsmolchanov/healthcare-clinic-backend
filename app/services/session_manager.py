@@ -216,7 +216,7 @@ class SessionManager:
             'status': 'active'
         }
 
-        response = self.supabase.table('conversation_sessions').insert(new_session).execute()
+        response = self.supabase.schema('healthcare').table('conversation_sessions').insert(new_session).execute()
         session_id = response.data[0]['id']
 
         # Create in Redis for fast access
@@ -247,7 +247,7 @@ class SessionManager:
 
         # Check if already archived (idempotency)
         try:
-            result = self.supabase.table('conversation_sessions').select('status, ended_at').eq(
+            result = self.supabase.schema('healthcare').table('conversation_sessions').select('status, ended_at').eq(
                 'id', session_id
             ).maybe_single().execute()
 
@@ -266,7 +266,7 @@ class SessionManager:
         if generate_summary:
             updates['summary_status'] = 'pending'  # Mark as pending
 
-        self.supabase.table('conversation_sessions').update(updates).eq('id', session_id).execute()
+        self.supabase.schema('healthcare').table('conversation_sessions').update(updates).eq('id', session_id).execute()
 
         logger.info(f"🗄️ Archived session {session_id[:8]}")
 
@@ -303,7 +303,7 @@ class SessionManager:
 
         try:
             # Get session from Supabase to find previous session
-            session_response = self.supabase.table('conversation_sessions').select('*').eq('id', session_id).limit(1).execute()
+            session_response = self.supabase.schema('healthcare').table('conversation_sessions').select('*').eq('id', session_id).limit(1).execute()
 
             if not session_response.data:
                 return carryover

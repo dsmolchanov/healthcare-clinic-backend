@@ -3,7 +3,7 @@
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
-from app.config import get_supabase_client
+from app.database import get_healthcare_client
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,8 @@ class SummarySearchService:
     """Searches previous session summaries for user queries."""
 
     def __init__(self):
-        self.supabase = get_supabase_client()
+        # conversation_sessions is now in healthcare schema
+        self.supabase = get_healthcare_client()
 
     async def search_summaries(
         self,
@@ -59,10 +60,14 @@ class SummarySearchService:
 
             # Add text search if query provided (multilingual config)
             if query:
-                # Use 'simple' config for multilingual support
-                query_builder = query_builder.text_search(
-                    'session_summary', query, config='simple', type='websearch'
-                )
+                # Use text_search without config parameter (deprecated in newer Supabase client)
+                try:
+                    query_builder = query_builder.text_search(
+                        'session_summary', query
+                    )
+                except TypeError:
+                    # Fallback: use ilike for basic text matching if text_search fails
+                    query_builder = query_builder.ilike('session_summary', f'%{query}%')
 
             result = query_builder.limit(limit).execute()
 

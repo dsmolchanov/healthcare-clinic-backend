@@ -975,13 +975,13 @@ class ReservationTools:
         try:
             # Query doctor_services join table to find eligible doctors
             result = self.supabase.schema('healthcare').table('doctor_services').select(
-                'doctor_id, doctors(id, first_name, last_name, specialization, is_active)'
+                'doctor_id, doctors(id, first_name, last_name, specialization, active)'
             ).eq('service_id', service_id).execute()
 
             doctors = []
             for row in result.data or []:
                 doctor_data = row.get('doctors')
-                if doctor_data and doctor_data.get('is_active', True):
+                if doctor_data and doctor_data.get('active', True):
                     doctors.append({
                         'id': doctor_data['id'],
                         'name': f"Dr. {doctor_data.get('first_name', '')} {doctor_data.get('last_name', '')}".strip(),
@@ -997,7 +997,7 @@ class ReservationTools:
                 )
                 fallback_result = self.supabase.schema('healthcare').table('doctors').select(
                     'id, first_name, last_name, specialization'
-                ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
+                ).eq('clinic_id', clinic_id).eq('active', True).execute()
 
                 for doc in fallback_result.data or []:
                     doctors.append({

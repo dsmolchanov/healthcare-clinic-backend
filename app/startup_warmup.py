@@ -48,10 +48,10 @@ async def warmup_clinic_data(clinic_ids: List[str] = None):
 
                 # OPTIMIZATION: Use get_clinic_bundle RPC for single database call
                 # This replaces 4 separate queries (clinic, doctors, services, faqs) with 1 RPC
-                # NOTE: RPC is in public schema, need to use public schema client
+                # NOTE: RPC is in healthcare schema
                 from app.database import get_supabase
-                public_supabase = await get_supabase(schema='public')
-                result = public_supabase.rpc('get_clinic_bundle', {'p_clinic_id': clinic_id}).execute()
+                healthcare_supabase = await get_supabase(schema='healthcare')
+                result = healthcare_supabase.rpc('get_clinic_bundle', {'p_clinic_id': clinic_id}).execute()
 
                 if not result.data:
                     logger.warning(f"No data returned for clinic {clinic_id}")

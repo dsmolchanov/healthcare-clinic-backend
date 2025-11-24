@@ -1,6 +1,6 @@
 """
 Business Rules Engine for Healthcare Platform
-Validates and enforces operational constraints across Supabase and NocoDB
+Validates and enforces operational constraints
 """
 
 from typing import Dict, Any, List, Optional, Callable

@@ -2,8 +2,8 @@
 
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional
-from app.config import get_supabase_client
+from typing import Dict
+from app.database import get_healthcare_client
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,8 @@ class FullHistorySearchService:
     """Searches full message history (deeper than summaries)."""
 
     def __init__(self):
-        self.supabase = get_supabase_client()
+        # conversation_sessions is now in healthcare schema
+        self.supabase = get_healthcare_client()
 
     async def search_full_history(
         self,

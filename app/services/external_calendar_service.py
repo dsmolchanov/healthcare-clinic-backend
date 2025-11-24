@@ -286,6 +286,216 @@ class ExternalCalendarService:
             logger.error(f"Failed to update integration status: {e}")
             # Don't fail the main operation if status update fails
 
+    async def ask_availability(
+        self,
+        datetime_str: str,
+        duration_minutes: int,
+        doctor_id: Optional[str] = None
+    ) -> bool:
+        """
+        Check if a specific time slot is available across all calendar sources.
+
+        This is a simplified availability check for the ask-hold-reserve pattern.
+
+        Args:
+            datetime_str: ISO format datetime string for the slot
+            duration_minutes: Duration of the appointment in minutes
+            doctor_id: Optional doctor ID to check
+
+        Returns:
+            True if the slot is available, False otherwise
+        """
+        try:
+            if not datetime_str or not doctor_id:
+                logger.warning("ask_availability called without datetime_str or doctor_id")
+                return True  # Allow to proceed without verification
+
+            # Parse the datetime
+            start_time = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
+            end_time = start_time + timedelta(minutes=duration_minutes)
+
+            # Check internal availability
+            internal_check = await self._check_internal_availability(doctor_id, start_time, end_time)
+            if not internal_check.get('available', False):
+                logger.info(f"Slot unavailable in internal calendar: {internal_check}")
+                return False
+
+            # Check Google Calendar availability (if available)
+            google_check = await self._check_google_calendar_availability(doctor_id, start_time, end_time)
+            if not google_check.get('available', False) and 'error' not in google_check:
+                logger.info(f"Slot unavailable in Google Calendar: {google_check}")
+                return False
+
+            # Check Outlook availability (if available)
+            outlook_check = await self._check_outlook_calendar_availability(doctor_id, start_time, end_time)
+            if not outlook_check.get('available', False) and 'error' not in outlook_check:
+                logger.info(f"Slot unavailable in Outlook Calendar: {outlook_check}")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error checking availability: {e}")
+            # Return True to allow booking to proceed if calendar check fails
+            return True
+
+    async def hold_slot(
+        self,
+        datetime_str: str,
+        duration_minutes: int,
+        doctor_id: Optional[str] = None,
+        hold_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Create a temporary hold on a slot across calendar sources.
+
+        Args:
+            datetime_str: ISO format datetime string for the slot
+            duration_minutes: Duration of the hold in minutes
+            doctor_id: Optional doctor ID
+            hold_id: Optional hold ID to use
+
+        Returns:
+            Dictionary with hold status
+        """
+        try:
+            if not datetime_str:
+                return {'success': True, 'note': 'No datetime provided'}
+
+            start_time = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
+            end_time = start_time + timedelta(minutes=duration_minutes)
+            reservation_id = hold_id or f"hold_{datetime.now().timestamp()}"
+
+            # Create hold in internal system
+            result = await self._create_internal_hold(
+                reservation_id=reservation_id,
+                doctor_id=doctor_id or '',
+                start_time=start_time,
+                end_time=end_time
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error creating hold: {e}")
+            return {'success': False, 'error': str(e)}
+
+    async def reserve_slot(
+        self,
+        appointment_id: str,
+        datetime_str: str,
+        duration_minutes: int,
+        doctor_id: Optional[str] = None,
+        patient_info: Optional[Dict] = None
+    ) -> Dict[str, Any]:
+        """
+        Reserve a slot and sync to external calendars.
+
+        Args:
+            appointment_id: ID of the appointment
+            datetime_str: ISO format datetime string
+            duration_minutes: Duration in minutes
+            doctor_id: Optional doctor ID
+            patient_info: Optional patient information
+
+        Returns:
+            Dictionary with reservation status
+        """
+        try:
+            # This is called after successful booking, sync to calendar
+            appointment_data = {
+                'id': appointment_id,
+                'doctor_id': doctor_id,
+                'start_time': datetime_str,
+                'duration_minutes': duration_minutes,
+                'patient_name': patient_info.get('name') if patient_info else None,
+                'patient_phone': patient_info.get('phone') if patient_info else None,
+            }
+
+            result = await self.create_calendar_event(appointment_data)
+            return result
+
+        except Exception as e:
+            logger.error(f"Error reserving slot: {e}")
+            return {'success': False, 'error': str(e)}
+
+    async def cancel_reservation(
+        self,
+        appointment_id: str,
+        doctor_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Cancel a calendar reservation.
+
+        Args:
+            appointment_id: ID of the appointment to cancel
+            doctor_id: Optional doctor ID
+
+        Returns:
+            Dictionary with cancellation status
+        """
+        try:
+            # For now, just log the cancellation
+            # TODO: Implement actual calendar event deletion
+            logger.info(f"Cancelling calendar reservation for appointment {appointment_id}")
+            return {'success': True, 'note': 'Calendar cancellation logged'}
+
+        except Exception as e:
+            logger.error(f"Error cancelling reservation: {e}")
+            return {'success': False, 'error': str(e)}
+
+    async def reschedule_reservation(
+        self,
+        appointment_id: str,
+        old_datetime: str,
+        new_datetime: str,
+        doctor_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Reschedule a calendar reservation.
+
+        Args:
+            appointment_id: ID of the appointment
+            old_datetime: Original datetime
+            new_datetime: New datetime
+            doctor_id: Optional doctor ID
+
+        Returns:
+            Dictionary with reschedule status
+        """
+        try:
+            # For now, just log the reschedule
+            # TODO: Implement actual calendar event update
+            logger.info(f"Rescheduling calendar reservation for appointment {appointment_id} from {old_datetime} to {new_datetime}")
+            return {'success': True, 'note': 'Calendar reschedule logged'}
+
+        except Exception as e:
+            logger.error(f"Error rescheduling reservation: {e}")
+            return {'success': False, 'error': str(e)}
+
+    async def release_hold(
+        self,
+        hold_id: str,
+        doctor_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Release a calendar hold.
+
+        Args:
+            hold_id: ID of the hold to release
+            doctor_id: Optional doctor ID
+
+        Returns:
+            Dictionary with release status
+        """
+        try:
+            result = await self._cancel_internal_hold(hold_id)
+            return result
+
+        except Exception as e:
+            logger.error(f"Error releasing hold: {e}")
+            return {'success': False, 'error': str(e)}
+
     async def ask_hold_reserve(
         self,
         doctor_id: str,
