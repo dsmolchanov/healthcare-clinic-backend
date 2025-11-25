@@ -1351,7 +1351,7 @@ async def test_whatsapp():
 # ============================================================================
 
 @app.get("/api/widget-chat")
-async def widget_chat_get(body: str = "", session_id: str = ""):
+async def widget_chat_get(body: str = "", session_id: str = "", clinic_id: str = ""):
     """GET endpoint for widget chat with LangGraph AI - accepts message as query param"""
     logger.info(f"📱 Widget message received: {body}")
 
@@ -1362,6 +1362,12 @@ async def widget_chat_get(body: str = "", session_id: str = ""):
             "backend": "clinic-webhooks.fly.dev"
         }
 
+    if not clinic_id:
+        raise HTTPException(
+            status_code=400,
+            detail="clinic_id required - please complete organization setup"
+        )
+
     # Use session ID or generate one
     if not session_id:
         import time
@@ -1371,9 +1377,8 @@ async def widget_chat_get(body: str = "", session_id: str = ""):
         # Import LangGraph service
         from app.api.langgraph_service import process_message, MessageRequest
 
-        # Get clinic information from database
-        clinic_id = "e0c84f56-235d-49f2-9a44-37c1be579afc"  # Correct clinic ID
-        clinic_name = "Shtern Dental Clinic"
+        # Get clinic information from database using provided clinic_id
+        clinic_name = "Unknown Clinic"
 
         # Get clinic details from Supabase
         try:

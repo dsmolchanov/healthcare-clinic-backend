@@ -70,9 +70,13 @@ class ManualTextRequest(BaseModel):
 
 async def get_clinic_id(clinic_id: Optional[str] = None) -> str:
     """Get clinic ID from request or session"""
-    # In production, this would come from authentication/session
-    # For testing, use the Shtern Dental clinic ID
-    return clinic_id or "2b8f1c5a-92e1-473e-98f6-e3a13e92b7f5"
+    # Require clinic_id to be provided - no fallback
+    if not clinic_id:
+        raise HTTPException(
+            status_code=400,
+            detail="clinic_id required - please complete organization setup"
+        )
+    return clinic_id
 
 @router.post("/upload")
 async def upload_document(

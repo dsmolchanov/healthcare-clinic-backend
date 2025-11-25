@@ -27,10 +27,9 @@ async def import_data_fixed(
     clinic_id = cache_data["clinic_id"]
     logger.info(f"[DEBUG] Received clinic_id from cache_data: {clinic_id}")
 
-    # Handle legacy clinic_id that was deleted
-    if clinic_id == "3e411ecb-3411-4add-91e2-8fa897310cb0":
-        logger.warning(f"Legacy clinic_id detected: {clinic_id}, using correct clinic_id")
-        clinic_id = "e0c84f56-235d-49f2-9a44-37c1be579afc"  # Use the correct clinic ID
+    # Validate clinic_id is provided
+    if not clinic_id:
+        raise ValueError("clinic_id is required for upload operations")
 
     logger.info(f"[DEBUG] Final clinic_id being used: {clinic_id}")
 
