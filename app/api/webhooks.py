@@ -266,28 +266,47 @@ async def execute_booking(state: FSMState) -> Dict[str, Any]:
 
 async def get_clinic_id_from_number(phone_number: str) -> str:
     """
-    Lookup clinic_id from phone number.
-
-    This function maps a phone number to a clinic ID. In production, this would
-    query a database or configuration service. For now, returns default clinic ID.
+    Look up clinic ID from healthcare.integrations table by phone number.
 
     Args:
-        phone_number: Phone number to lookup
+        phone_number: WhatsApp business phone number (normalized format)
 
     Returns:
-        Clinic ID string
+        clinic_id if found
+
+    Raises:
+        ValueError: If no integration found for phone number
     """
-    # TODO: Implement actual lookup from database
-    # For now, return default clinic ID from environment
-    default_clinic_id = os.getenv("DEFAULT_CLINIC_ID", "default_clinic")
+    # Normalize phone number (remove spaces, dashes, parentheses)
+    normalized_phone = ''.join(filter(str.isdigit, phone_number))
 
-    # Future implementation could look like:
-    # result = supabase.table('clinic_phone_mappings').select('clinic_id').eq('phone_number', phone_number).execute()
-    # if result.data:
-    #     return result.data[0]['clinic_id']
+    # Try with + prefix, without prefix, and original format
+    for phone_variant in [f"+{normalized_phone}", normalized_phone, phone_number]:
+        try:
+            result = supabase.table('integrations').select(
+                'clinic_id, organization_id, config, display_name'
+            ).eq('type', 'whatsapp').eq('enabled', True).eq(
+                'phone_number', phone_variant
+            ).limit(1).execute()
 
-    logger.info(f"Using default clinic_id: {default_clinic_id} for number: {phone_number}")
-    return default_clinic_id
+            if result.data and len(result.data) > 0:
+                clinic_id = result.data[0]['clinic_id']
+                logger.info(
+                    f"Found clinic for phone {phone_number}: "
+                    f"clinic_id={clinic_id}, "
+                    f"organization_id={result.data[0].get('organization_id')}"
+                )
+                return clinic_id
+        except Exception as e:
+            logger.warning(f"Error querying integrations for {phone_variant}: {e}")
+            continue
+
+    # Not found - this is an error condition
+    logger.error(f"No integration found for phone number: {phone_number}")
+    raise ValueError(
+        f"No WhatsApp integration configured for phone number {phone_number}. "
+        f"Please configure in the integrations settings."
+    )
 
 
 async def handle_message_legacy(body: Dict[str, Any]) -> Dict[str, str]:
