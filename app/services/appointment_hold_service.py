@@ -6,9 +6,31 @@ P0 Fix #4: Timezone Handling with ZoneInfo
 P0 Fix #5: Supabase Schema/Table Naming
 
 Manages durable, time-boxed slot reservations with proper timezone handling
+
+DEPRECATION NOTICE (Phase E - 2025-11-29):
+==========================================
+This service is deprecated. New code should use:
+    from app.services.unified_appointment_service import UnifiedAppointmentService
+
+The UnifiedAppointmentService provides:
+- Unified holds via resource_reservations.state='HOLD'
+- Atomic confirmation with advisory locks
+- Calendar outbox for async sync
+- Intelligent doctor selection
+
+Migration Guide:
+----------------
+OLD: AppointmentHoldService.create_hold(...)
+NEW: UnifiedAppointmentService._create_unified_hold(...)
+
+OLD: AppointmentHoldService.confirm_hold(...)
+NEW: UnifiedAppointmentService._confirm_hold_atomic(...)
+
+This service continues to work via the appointment_holds_v compatibility view.
 """
 
 import uuid
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Tuple
 import logging
@@ -20,11 +42,19 @@ logger = logging.getLogger(__name__)
 
 class AppointmentHoldService:
     """
+    DEPRECATED: Use UnifiedAppointmentService instead.
+
     Manages appointment holds with TTL and atomic operations
     Implements P0 fixes for correct expiry display and timezone handling
     """
 
     def __init__(self, supabase_client: Client):
+        warnings.warn(
+            "AppointmentHoldService is deprecated. Use UnifiedAppointmentService instead. "
+            "See app/services/unified_appointment_service.py for the new API.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         self.supabase = supabase_client
         self.hold_ttl_minutes = 5  # Configurable
 

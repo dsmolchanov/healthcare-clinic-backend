@@ -1,0 +1,72 @@
+{
+  "timestamp": "20251123-134430",
+  "summary": {
+    "total": 15,
+    "passed": 0,
+    "failed": 15,
+    "success_rate": 0.0
+  },
+  "results": [],
+  "errors": [
+    {
+      "scenario": "Tool Test - Price Query",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Tool Test - Get Doctors",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Tool Test - Business Hours",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Tool Test - Clinic Location",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Tool Test - Check Availability (General)",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Tool Test - Check Availability (Specific Doctor)",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Tool Test - Previous Conversations",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Tool Test - Search History",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "E2E Booking - Happy Path",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "E2E Booking - Specific Doctor Request",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "E2E Booking - Conflict Resolution",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Tool Test - Cancel Appointment",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Tool Test - Reschedule Appointment",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Edge Case - Unknown Service",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    },
+    {
+      "scenario": "Edge Case - Price Without Tool",
+      "error": "Invalid format specifier ' \"User Name\", \"phone\": \"their phone number\"' for object of type 'str'"
+    }
+  ]
+}

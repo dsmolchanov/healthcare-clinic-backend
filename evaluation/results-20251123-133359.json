@@ -1,0 +1,72 @@
+{
+  "timestamp": "20251123-133359",
+  "summary": {
+    "total": 15,
+    "passed": 0,
+    "failed": 15,
+    "success_rate": 0.0
+  },
+  "results": [],
+  "errors": [
+    {
+      "scenario": "Tool Test - Price Query",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Tool Test - Get Doctors",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Tool Test - Business Hours",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Tool Test - Clinic Location",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Tool Test - Check Availability (General)",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Tool Test - Check Availability (Specific Doctor)",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Tool Test - Previous Conversations",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Tool Test - Search History",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "E2E Booking - Happy Path",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "E2E Booking - Specific Doctor Request",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "E2E Booking - Conflict Resolution",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Tool Test - Cancel Appointment",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Tool Test - Reschedule Appointment",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Edge Case - Unknown Service",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "Edge Case - Price Without Tool",
+      "error": "'messages'"
+    }
+  ]
+}

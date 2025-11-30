@@ -14,6 +14,7 @@ class SummarySearchService:
     def __init__(self):
         # conversation_sessions is now in healthcare schema
         self.supabase = get_healthcare_client()
+        print(f"DEBUG: SummarySearchService initialized. self.supabase type: {type(self.supabase)}")
 
     async def search_summaries(
         self,
@@ -69,6 +70,7 @@ class SummarySearchService:
                     # Fallback: use ilike for basic text matching if text_search fails
                     query_builder = query_builder.ilike('session_summary', f'%{query}%')
 
+            print(f"DEBUG: query_builder type: {type(query_builder)}")
             result = query_builder.limit(limit).execute()
 
             if not result.data:

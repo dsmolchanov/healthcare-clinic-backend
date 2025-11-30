@@ -1,12 +1,22 @@
 """
 Appointment Booking Service with Calendar Integration
 Handles appointment scheduling with idempotency and calendar sync
+
+⚠️ DEPRECATION NOTICE:
+This service is deprecated as of Phase C (2025-11-28).
+All functionality has been merged into UnifiedAppointmentService.
+
+New code should use:
+    from app.services.unified_appointment_service import UnifiedAppointmentService
+
+This class is maintained for backward compatibility only and will be removed in a future version.
 """
 
 import os
 import uuid
 import hashlib
 import logging
+import warnings
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta, date, time
 from supabase import create_client, Client
@@ -22,10 +32,38 @@ logger = logging.getLogger(__name__)
 
 class AppointmentBookingService:
     """
-    Manages appointment booking with calendar synchronization
+    ⚠️ DEPRECATED: Use UnifiedAppointmentService instead.
+
+    Manages appointment booking with calendar synchronization.
+    This class is maintained for backward compatibility only.
+
+    Migration Guide:
+    ----------------
+    Old code:
+        booking_service = AppointmentBookingService(supabase)
+        result = await booking_service.book_appointment(phone, clinic_id, details, key)
+
+    New code:
+        from app.services.unified_appointment_service import UnifiedAppointmentService, AppointmentRequest, AppointmentType
+        unified_service = UnifiedAppointmentService(supabase)
+        request = AppointmentRequest(
+            patient_id=patient_id,
+            doctor_id=details['doctor_id'],
+            clinic_id=clinic_id,
+            start_time=datetime.fromisoformat(f"{details['date']} {details['time']}"),
+            end_time=...,
+            appointment_type=AppointmentType.CONSULTATION,
+            patient_phone=phone
+        )
+        result = await unified_service.book_appointment(request, idempotency_key=key, source_channel='whatsapp')
     """
 
     def __init__(self, supabase_client: Client = None):
+        warnings.warn(
+            "AppointmentBookingService is deprecated. Use UnifiedAppointmentService instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         if supabase_client:
             self.supabase = supabase_client
         else:

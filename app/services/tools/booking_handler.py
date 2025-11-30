@@ -1,5 +1,6 @@
 from typing import Any, Dict
 import logging
+import uuid
 from app.services.tools.base import ToolHandler
 from app.services.reservation_tools import ReservationTools
 
@@ -15,16 +16,23 @@ class BookingHandler(ToolHandler):
         if not clinic_id:
             return "Error: clinic_id missing from context"
 
+        # Generate idempotency key for WhatsApp messages
+        conversation_id = context.get('conversation_id', 'unknown')
+        message_id = context.get('message_id', str(uuid.uuid4()))
+
+        # Use standardized format: channel:source:message_id
+        idempotency_key = f"whatsapp:{clinic_id}:{message_id}"
+
         # Extract patient_id from patient_info or session
-        patient_id = None
-        if 'patient_info' in args and 'phone' in args['patient_info']:
-            # TODO: Look up patient_id by phone number
-            pass
+        patient_id = context.get('patient_id') or args.get('patient_info', {}).get('patient_id')
 
         reservation_tools = ReservationTools(
             clinic_id=clinic_id,
             patient_id=patient_id
         )
+
+        # Pass idempotency key to booking
+        args['idempotency_key'] = idempotency_key
 
         result = await reservation_tools.book_appointment_tool(**args)
 

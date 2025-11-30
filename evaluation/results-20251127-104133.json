@@ -1,0 +1,16 @@
+{
+  "timestamp": "20251127-104133",
+  "summary": {
+    "total": 1,
+    "passed": 0,
+    "failed": 1,
+    "success_rate": 0.0
+  },
+  "results": [],
+  "errors": [
+    {
+      "scenario": "E2E Booking - Specific Doctor Request",
+      "error": "1 validation error for MessageResponse\nmessage\n  Input should be a valid string [type=string_type, input_value=<MagicMock name='mock.for...dd__()' id='6165846192'>, input_type=MagicMock]\n    For further information visit https://errors.pydantic.dev/2.12/v/string_type"
+    }
+  ]
+}

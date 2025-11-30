@@ -1,0 +1,13 @@
+scenarios:
+  - name: "Tool Test - Get Doctors"
+    category: "optimization"
+    messages:
+      - role: user
+        content: "Who are the dentists at your clinic?"
+    expected_behavior: |
+      Agent provides list of doctors with names and specializations.
+      Can answer from context (pre-warmed) OR call get_clinic_info.
+    criteria:
+      - "Response includes at least one doctor name"
+      - "Response mentions specialization or availability"
+      - "If tool called, must be get_clinic_info"

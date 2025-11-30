@@ -1,0 +1,14 @@
+scenarios:
+  - name: "Tool Test - Price Query"
+    description: "Validates query_service_prices tool returns real pricing data"
+    messages:
+      - role: user
+        content: "How much does teeth whitening cost?"
+    expected_behavior: |
+      Agent calls query_service_prices with query containing "whitening".
+      Returns actual price from database, not hallucinated.
+    criteria:
+      - "Calls query_service_prices tool"
+      - "Response includes a dollar amount"
+      - "Does NOT say 'I don't have pricing information'"
+      - "Suggests consultation or booking as next step"

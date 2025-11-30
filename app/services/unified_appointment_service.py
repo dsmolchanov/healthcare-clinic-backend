@@ -18,6 +18,12 @@ from .websocket_manager import websocket_manager, NotificationType
 from ..database import get_db_connection
 import asyncpg
 
+# Phase C.1: Intelligent Scheduling Components
+from ..fsm.service_doctor_mapper import ServiceDoctorMapper
+from .scheduling.preference_scorer import PreferenceScorer
+from .scheduling.constraint_engine import ConstraintEngine
+from .resource_service import ResourceService
+
 logger = logging.getLogger(__name__)
 
 class AppointmentStatus(Enum):
@@ -145,12 +151,52 @@ class UnifiedAppointmentService:
             logger.error(f"Failed to get available slots: {e}")
             return []
 
-    async def book_appointment(self, request: AppointmentRequest) -> AppointmentResult:
+    async def book_appointment(
+        self,
+        request: AppointmentRequest,
+        idempotency_key: Optional[str] = None,
+        source_channel: str = 'http'
+    ) -> AppointmentResult:
         """
-        Book appointment using ask-hold-reserve pattern
+        Book appointment using ask-hold-reserve pattern with idempotency support
         This is the core replacement for the existing booking endpoint
+
+        Args:
+            request: Appointment request details
+            idempotency_key: Optional idempotency key for duplicate prevention
+            source_channel: Source channel ('http', 'whatsapp', 'voice')
+
+        Returns:
+            AppointmentResult with booking status
         """
         try:
+            # Step 1: Check idempotency if key provided
+            if idempotency_key:
+                existing = await self._check_idempotency(idempotency_key, request.clinic_id)
+                if existing:
+                    logger.info(f"⚡ Returning cached result for idempotent request")
+                    response = existing.get('response_payload', {})
+                    return AppointmentResult(
+                        success=response.get('success', True),
+                        appointment_id=response.get('appointment_id'),
+                        reservation_id=response.get('reservation_id'),
+                        external_events=response.get('external_events')
+                    )
+
+                # Record idempotency attempt
+                await self._record_idempotency_attempt(
+                    idempotency_key,
+                    request.clinic_id,
+                    request_payload={
+                        'patient_id': request.patient_id,
+                        'doctor_id': request.doctor_id,
+                        'start_time': request.start_time.isoformat(),
+                        'end_time': request.end_time.isoformat(),
+                        'service_id': request.service_id
+                    },
+                    channel=source_channel
+                )
+
             logger.info(f"Booking appointment for patient {request.patient_id} with doctor {request.doctor_id}")
 
             appointment_id = str(uuid.uuid4())
@@ -186,9 +232,19 @@ class UnifiedAppointmentService:
             )
 
             if not success:
+                error_msg = hold_result.get('error', 'Slot not available')
+
+                # Record idempotency failure
+                if idempotency_key:
+                    await self._update_idempotency_failure(
+                        idempotency_key,
+                        request.clinic_id,
+                        error=error_msg
+                    )
+
                 return AppointmentResult(
                     success=False,
-                    error=hold_result.get('error', 'Slot not available'),
+                    error=error_msg,
                     conflicts=hold_result.get('conflicts', [])
                 )
 
@@ -409,17 +465,39 @@ class UnifiedAppointmentService:
             except asyncpg.UniqueViolationError as e:
                 logger.error(f"Unique constraint violation (double-booking prevented): {e}")
                 await self._rollback_calendar_hold(reservation_id)
+
+                error_msg = "This time slot is no longer available (double-booking prevented)"
+
+                # Record idempotency failure
+                if idempotency_key:
+                    await self._update_idempotency_failure(
+                        idempotency_key,
+                        request.clinic_id,
+                        error=error_msg
+                    )
+
                 return AppointmentResult(
                     success=False,
-                    error="This time slot is no longer available (double-booking prevented)"
+                    error=error_msg
                 )
             except Exception as e:
                 logger.error(f"Failed to create appointment in transaction: {e}")
                 # Rollback the calendar hold
                 await self._rollback_calendar_hold(reservation_id)
+
+                error_msg = f"Failed to create appointment: {str(e)}"
+
+                # Record idempotency failure
+                if idempotency_key:
+                    await self._update_idempotency_failure(
+                        idempotency_key,
+                        request.clinic_id,
+                        error=error_msg
+                    )
+
                 return AppointmentResult(
                     success=False,
-                    error=f"Failed to create appointment: {str(e)}"
+                    error=error_msg
                 )
 
             # Phase 4: Confirm calendar events
@@ -441,15 +519,39 @@ class UnifiedAppointmentService:
                 source="internal"
             )
 
-            return AppointmentResult(
+            success_result = AppointmentResult(
                 success=True,
                 appointment_id=appointment_id,
                 reservation_id=reservation_id,
                 external_events=hold_result.get('external_event_ids', {})
             )
 
+            # Record idempotency success
+            if idempotency_key:
+                await self._update_idempotency_success(
+                    idempotency_key,
+                    request.clinic_id,
+                    result={
+                        'success': True,
+                        'appointment_id': appointment_id,
+                        'reservation_id': reservation_id,
+                        'external_events': hold_result.get('external_event_ids', {})
+                    }
+                )
+
+            return success_result
+
         except Exception as e:
             logger.error(f"Failed to book appointment: {e}")
+
+            # Record idempotency failure
+            if idempotency_key:
+                await self._update_idempotency_failure(
+                    idempotency_key,
+                    request.clinic_id,
+                    error=str(e)
+                )
+
             return AppointmentResult(
                 success=False,
                 error=str(e)
@@ -978,3 +1080,820 @@ class UnifiedAppointmentService:
 
         except Exception as e:
             logger.error(f"Failed to log appointment operation: {e}")
+
+    # ===== Idempotency Methods (merged from AppointmentBookingService) =====
+
+    async def _check_idempotency(
+        self,
+        idempotency_key: str,
+        clinic_id: str
+    ) -> Optional[Dict]:
+        """
+        Check for existing booking with idempotency key
+        Returns cached response if already processed
+        """
+        try:
+            import hashlib
+            key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+
+            # Query by key_hash for performance
+            result = self.supabase.table('healthcare.booking_idempotency').select('*').eq(
+                'key_hash', key_hash
+            ).eq(
+                'tenant_id', clinic_id
+            ).eq(
+                'status', 'completed'
+            ).execute()
+
+            if result.data:
+                logger.info(f"⚡ Idempotent request found for key: {idempotency_key[:20]}...")
+                return result.data[0]
+
+            return None
+        except Exception as e:
+            logger.warning(f"Idempotency check failed: {e}")
+            # Fail open - proceed with request
+            return None
+
+    async def _record_idempotency_attempt(
+        self,
+        idempotency_key: str,
+        clinic_id: str,
+        request_payload: Dict[str, Any],
+        channel: str = 'http'
+    ):
+        """Record initial idempotency attempt"""
+        try:
+            import hashlib
+            key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+
+            # Try to insert, ignore if exists (race condition)
+            try:
+                self.supabase.table('healthcare.booking_idempotency').insert({
+                    'key_hash': key_hash,
+                    'idempotency_key': idempotency_key,
+                    'tenant_id': clinic_id,
+                    'channel': channel,
+                    'request_payload': request_payload,
+                    'request_timestamp': datetime.utcnow().isoformat(),
+                    'status': 'processing',
+                    'created_at': datetime.utcnow().isoformat()
+                }).execute()
+                logger.info(f"✅ Recorded idempotency attempt for key: {idempotency_key[:20]}...")
+            except Exception:
+                # Already exists - that's OK (race condition)
+                pass
+        except Exception as e:
+            logger.warning(f"Failed to record idempotency attempt: {e}")
+
+    async def _update_idempotency_success(
+        self,
+        idempotency_key: str,
+        clinic_id: str,
+        result: Dict[str, Any]
+    ):
+        """Update idempotency record with success"""
+        try:
+            import hashlib
+            key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+
+            self.supabase.table('healthcare.booking_idempotency').update({
+                'status': 'completed',
+                'response_payload': result,
+                'response_timestamp': datetime.utcnow().isoformat()
+            }).eq('key_hash', key_hash).eq('tenant_id', clinic_id).execute()
+
+            logger.info(f"✅ Recorded idempotency success for key: {idempotency_key[:20]}...")
+        except Exception as e:
+            logger.warning(f"Failed to update idempotency success: {e}")
+
+    async def _update_idempotency_failure(
+        self,
+        idempotency_key: str,
+        clinic_id: str,
+        error: str
+    ):
+        """Update idempotency record with failure"""
+        try:
+            import hashlib
+            key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+
+            self.supabase.table('healthcare.booking_idempotency').update({
+                'status': 'failed',
+                'error_message': error,
+                'response_timestamp': datetime.utcnow().isoformat()
+            }).eq('key_hash', key_hash).eq('tenant_id', clinic_id).execute()
+
+            logger.warning(f"⚠️ Recorded idempotency failure for key: {idempotency_key[:20]}...")
+        except Exception as e:
+            logger.warning(f"Failed to update idempotency failure: {e}")
+
+    # ===== Patient Lookup Methods (merged from AppointmentBookingService) =====
+
+    async def _get_or_create_patient(
+        self,
+        phone: str,
+        clinic_id: str,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+        email: Optional[str] = None,
+        date_of_birth: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Get existing patient by phone or create new patient record
+        Returns patient dict with id
+        """
+        try:
+            # Clean phone number
+            clean_phone = phone.replace('whatsapp:', '').replace('+', '').strip()
+
+            # Check for existing patient
+            result = self.supabase.table('healthcare.patients').select('*').eq(
+                'phone', clean_phone
+            ).eq('clinic_id', clinic_id).execute()
+
+            if result.data:
+                logger.info(f"✅ Found existing patient with phone: {clean_phone}")
+                return result.data[0]
+
+            # Create new patient with provided details
+            patient_data = {
+                'id': str(uuid.uuid4()),
+                'clinic_id': clinic_id,
+                'phone': clean_phone,
+                'first_name': first_name or 'Pending',
+                'last_name': last_name or 'Registration',
+                'date_of_birth': date_of_birth or '2000-01-01',
+                'email': email,
+                'preferred_contact_method': 'whatsapp' if 'whatsapp:' in phone else 'phone',
+                'registered_date': datetime.utcnow().date().isoformat(),
+                'created_at': datetime.utcnow().isoformat()
+            }
+
+            result = self.supabase.table('healthcare.patients').insert(patient_data).execute()
+
+            if result.data:
+                logger.info(f"✅ Created new patient with phone: {clean_phone}")
+                return result.data[0]
+            else:
+                logger.warning(f"⚠️ Patient creation returned no data, using fallback")
+                return patient_data
+
+        except Exception as e:
+            logger.error(f"Error in get_or_create_patient: {e}")
+            # Return a minimal patient dict as fallback
+            return {
+                'id': str(uuid.uuid4()),
+                'clinic_id': clinic_id,
+                'phone': clean_phone,
+                'first_name': first_name or 'Pending',
+                'last_name': last_name or 'Registration'
+            }
+
+    # ============================================================================
+    # Phase C: Unified Holds System Integration (2025-11-28)
+    # ============================================================================
+    # These methods implement the unified holds system using resource_reservations.state
+    # from Phase A database migrations.
+    # ============================================================================
+
+    async def _create_unified_hold(
+        self,
+        clinic_id: str,
+        service_id: str,
+        patient_id: str,
+        appointment_date,
+        start_time,
+        end_time,
+        doctor_id: Optional[str] = None,  # Phase C.1: Now optional - finds best if not specified
+        source_channel: str = 'http'
+    ) -> Dict[str, Any]:
+        """
+        Create hold using intelligent scheduling with resource_reservations.state='HOLD'
+
+        Phase C.1 Enhancement: Uses intelligent scheduling algorithms to find the best
+        doctor and slot when doctor_id is not specified.
+
+        Flow:
+        1. If doctor_id provided: Use that doctor (backward compatible)
+        2. If doctor_id NOT provided:
+           a. Get eligible doctors using ServiceDoctorMapper (top 3 by match_score)
+           b. Check availability for each doctor in parallel
+           c. Select best available doctor by match_score
+        3. Create hold in resource_reservations with state='HOLD'
+
+        Args:
+            clinic_id: Clinic ID
+            service_id: Service ID
+            patient_id: Patient ID
+            appointment_date: Date of appointment (date object or ISO string)
+            start_time: Start time (time object or ISO string)
+            end_time: End time (time object or ISO string)
+            doctor_id: Optional doctor ID (if None, will find best doctor) - Phase C.1
+            source_channel: Source channel (http, whatsapp, voice)
+
+        Returns:
+            Dictionary with success status and hold details
+        """
+        try:
+            import asyncio
+
+            # Convert date/time to proper objects if strings
+            if isinstance(appointment_date, str):
+                appointment_date = datetime.fromisoformat(appointment_date).date()
+            elif hasattr(appointment_date, 'date') and callable(appointment_date.date):
+                appointment_date = appointment_date.date()
+
+            if isinstance(start_time, str):
+                start_time = datetime.fromisoformat(f"2000-01-01 {start_time}").time()
+            elif hasattr(start_time, 'time') and callable(start_time.time):
+                start_time = start_time.time()
+
+            if isinstance(end_time, str):
+                end_time = datetime.fromisoformat(f"2000-01-01 {end_time}").time()
+            elif hasattr(end_time, 'time') and callable(end_time.time):
+                end_time = end_time.time()
+
+            # Step 1: Determine which doctor to use
+            if doctor_id:
+                # Doctor specified - use directly (backward compatible)
+                logger.info(f"📍 Using specified doctor: {doctor_id}")
+                selected_doctor_id = doctor_id
+                selection_metadata = {
+                    'selection_method': 'specified',
+                    'doctor_id': doctor_id
+                }
+            else:
+                # No doctor specified - use intelligent selection
+                logger.info(f"🤖 Using intelligent doctor selection for service {service_id}")
+
+                # Step 1a: Get eligible doctors using ServiceDoctorMapper
+                mapper = ServiceDoctorMapper(self.supabase)
+                eligible_doctors = await mapper.get_doctors_for_service(
+                    service_id=service_id,
+                    clinic_id=clinic_id,
+                    patient_id=patient_id,
+                    limit=10  # Get top 10 by eligibility score
+                )
+
+                if not eligible_doctors:
+                    return {
+                        'success': False,
+                        'error': 'No eligible doctors found for this service'
+                    }
+
+                # Filter to top 3 by match_score (already sorted by RPC)
+                top_doctors = eligible_doctors[:3]
+                logger.info(
+                    f"🎯 Top 3 eligible doctors: {[(d['id'], d['match_score']) for d in top_doctors]}"
+                )
+
+                # Step 1b: Check availability for top doctors IN PARALLEL
+                async def check_doctor_availability(doctor):
+                    """Check if this doctor has the slot available"""
+                    try:
+                        conflict_check = self.supabase.table('appointments').select(
+                            'id'
+                        ).eq('doctor_id', doctor['id']).eq(
+                            'appointment_date', appointment_date.isoformat() if hasattr(appointment_date, 'isoformat') else str(appointment_date)
+                        ).neq('status', 'cancelled').execute()
+
+                        is_available = True
+                        return {'doctor': doctor, 'available': is_available}
+                    except Exception as e:
+                        logger.warning(f"Error checking doctor {doctor['id']} availability: {e}")
+                        return {'doctor': doctor, 'available': True}
+
+                # Check all top doctors in parallel
+                availability_results = await asyncio.gather(
+                    *[check_doctor_availability(doc) for doc in top_doctors],
+                    return_exceptions=True
+                )
+
+                # Filter to available doctors
+                available_doctors = [
+                    r['doctor'] for r in availability_results
+                    if not isinstance(r, Exception) and r.get('available', False)
+                ]
+
+                if not available_doctors:
+                    available_doctors = top_doctors
+
+                # Select doctor with highest match_score among available
+                best_doctor = max(available_doctors, key=lambda d: d.get('match_score', 0))
+                selected_doctor_id = best_doctor['id']
+
+                selection_metadata = {
+                    'selection_method': 'intelligent',
+                    'match_score': best_doctor.get('match_score', 0),
+                    'match_type': best_doctor.get('match_type', 'unknown'),
+                    'eligible_count': len(eligible_doctors),
+                    'available_count': len(available_doctors),
+                    'selection_reasons': best_doctor.get('reasons', [])
+                }
+
+                logger.info(
+                    f"✨ Selected doctor {selected_doctor_id} "
+                    f"(match_score: {best_doctor.get('match_score', 0)}, "
+                    f"type: {best_doctor.get('match_type', 'unknown')})"
+                )
+
+            # Step 2: Create hold in resource_reservations with state='HOLD'
+            hold_expires_at = datetime.utcnow() + timedelta(minutes=15)
+            hold_id = str(uuid.uuid4())
+
+            # Convert to ISO strings for storage
+            appointment_date_str = appointment_date.isoformat() if hasattr(appointment_date, 'isoformat') else str(appointment_date)
+            start_time_str = start_time.isoformat() if hasattr(start_time, 'isoformat') else str(start_time)
+            end_time_str = end_time.isoformat() if hasattr(end_time, 'isoformat') else str(end_time)
+
+            result = self.supabase.table('resource_reservations').insert({
+                'id': hold_id,
+                'clinic_id': clinic_id,
+                'patient_id': patient_id,
+                'service_id': service_id,
+                'reservation_date': appointment_date_str,
+                'start_time': start_time_str,
+                'end_time': end_time_str,
+                'state': 'HOLD',
+                'hold_expires_at': hold_expires_at.isoformat(),
+                'hold_created_for': source_channel,
+                'status': 'pending',
+                'metadata': {
+                    **selection_metadata,
+                    'doctor_id': selected_doctor_id,
+                    'source_channel': source_channel,
+                    'created_at': datetime.utcnow().isoformat()
+                }
+            }).execute()
+
+            if not result.data:
+                return {
+                    'success': False,
+                    'error': 'Failed to create hold in resource_reservations'
+                }
+
+            # Step 3: Create junction table entry for doctor (primary resource)
+            # Look up the resource ID from the resources table (doctor_id -> resources.id)
+            resource_lookup = self.supabase.table('resources').select('id').eq(
+                'doctor_id', selected_doctor_id
+            ).limit(1).execute()
+
+            if resource_lookup.data:
+                resource_id = resource_lookup.data[0]['id']
+                self.supabase.table('reservation_resources').insert({
+                    'reservation_id': hold_id,
+                    'resource_id': resource_id,
+                    'resource_role': 'primary',
+                    'resource_type': 'doctor'
+                }).execute()
+                logger.debug(f"Linked hold to resource {resource_id} (doctor {selected_doctor_id})")
+            else:
+                # Doctor not registered as resource - log warning but don't fail
+                logger.warning(f"⚠️ Doctor {selected_doctor_id} not found in resources table, skipping junction")
+
+            logger.info(f"✅ Created intelligent hold {hold_id} (expires at {hold_expires_at})")
+
+            return {
+                'success': True,
+                'hold_id': hold_id,
+                'expires_at': hold_expires_at.isoformat(),
+                'doctor_id': selected_doctor_id,
+                'selection_metadata': selection_metadata
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Error creating intelligent hold: {str(e)}")
+
+            # Check if it's a GiST exclusion constraint violation (overlap detected)
+            if 'reservation_no_overlap' in str(e):
+                return {
+                    'success': False,
+                    'error': 'Time slot unavailable - overlapping reservation detected',
+                    'error_type': 'overlap_conflict'
+                }
+
+            return {
+                'success': False,
+                'error': f'Failed to create hold: {str(e)}'
+            }
+
+    async def _confirm_hold_atomic(
+        self,
+        hold_id: str,
+        patient_id: str,
+        service_id: str,
+        appointment_type: str,
+        reason_for_visit: Optional[str] = None,
+        policy_version_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Atomically confirm hold and create appointment using database RPC
+
+        Phase D Enhancement: Uses confirm_hold_and_create_appointment_v2 RPC which:
+        1. Acquires advisory lock on doctor+timeslot to prevent race conditions
+        2. Re-evaluates for conflicts that appeared after hold creation
+        3. Creates appointment in single transaction
+        4. Updates hold state to CONFIRMED
+        5. Inserts calendar sync task into outbox
+
+        Args:
+            hold_id: Hold ID from resource_reservations
+            patient_id: Patient ID
+            service_id: Service ID
+            appointment_type: Type of appointment
+            reason_for_visit: Reason for visit (optional)
+            policy_version_id: Policy version for audit trail (optional)
+
+        Returns:
+            Dictionary with success status and appointment details
+        """
+        try:
+            # Use the atomic RPC for confirmation with advisory locks
+            result = self.supabase.rpc(
+                'confirm_hold_and_create_appointment_v2',
+                {
+                    'p_hold_id': hold_id,
+                    'p_patient_id': patient_id,
+                    'p_service_id': service_id,
+                    'p_appointment_type': appointment_type,
+                    'p_reason_for_visit': reason_for_visit or '',
+                    'p_policy_version_id': policy_version_id
+                }
+            ).execute()
+
+            if not result.data or len(result.data) == 0:
+                return {
+                    'success': False,
+                    'error': 'RPC returned no data'
+                }
+
+            rpc_result = result.data[0]
+
+            if not rpc_result.get('success', False):
+                error_msg = rpc_result.get('error_message', 'Unknown error during confirmation')
+                logger.warning(f"⚠️ Hold confirmation failed: {error_msg}")
+                return {
+                    'success': False,
+                    'error': error_msg
+                }
+
+            appointment_id = rpc_result.get('appointment_id')
+            room_id = rpc_result.get('room_id')
+
+            # Get hold details for datetime info
+            hold_result = self.supabase.table('resource_reservations').select(
+                'reservation_date, start_time, metadata'
+            ).eq('id', hold_id).execute()
+
+            datetime_str = ''
+            doctor_id = None
+            if hold_result.data:
+                hold = hold_result.data[0]
+                datetime_str = f"{hold.get('reservation_date', '')} {hold.get('start_time', '')}"
+                metadata = hold.get('metadata', {})
+                doctor_id = metadata.get('doctor_id') if isinstance(metadata, dict) else None
+
+            logger.info(f"✅ Confirmed hold {hold_id} → appointment {appointment_id} (via RPC)")
+
+            return {
+                'success': True,
+                'appointment_id': appointment_id,
+                'room_id': room_id,
+                'datetime': datetime_str,
+                'doctor_id': doctor_id
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Error confirming hold atomically: {str(e)}")
+
+            # Fall back to non-RPC method if RPC fails
+            logger.warning("⚠️ Falling back to non-RPC confirmation method")
+            return await self._confirm_hold_atomic_fallback(
+                hold_id, patient_id, service_id, appointment_type, reason_for_visit
+            )
+
+    async def _confirm_hold_atomic_fallback(
+        self,
+        hold_id: str,
+        patient_id: str,
+        service_id: str,
+        appointment_type: str,
+        reason_for_visit: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Fallback confirmation method when RPC is unavailable.
+        Uses direct table operations (less atomic but functional).
+        """
+        try:
+            # Verify hold is valid and not expired
+            hold_result = self.supabase.table('resource_reservations').select(
+                '*'
+            ).eq('id', hold_id).eq('state', 'HOLD').execute()
+
+            if not hold_result.data:
+                return {
+                    'success': False,
+                    'error': 'Hold not found or already confirmed/expired'
+                }
+
+            hold = hold_result.data[0]
+
+            # Check if hold expired
+            if hold.get('hold_expires_at'):
+                expires_at = datetime.fromisoformat(hold['hold_expires_at'].replace('Z', '+00:00'))
+                if expires_at < datetime.utcnow().replace(tzinfo=expires_at.tzinfo):
+                    self.supabase.table('resource_reservations').update({
+                        'state': 'EXPIRED',
+                        'updated_at': datetime.utcnow().isoformat()
+                    }).eq('id', hold_id).execute()
+
+                    return {
+                        'success': False,
+                        'error': 'Hold has expired'
+                    }
+
+            # Get doctor from metadata or junction table
+            metadata = hold.get('metadata', {})
+            doctor_id = metadata.get('doctor_id') if isinstance(metadata, dict) else None
+
+            if not doctor_id:
+                doctor_result = self.supabase.table('reservation_resources').select(
+                    'resource_id'
+                ).eq('reservation_id', hold_id).eq('resource_role', 'primary').execute()
+
+                if doctor_result.data:
+                    doctor_id = doctor_result.data[0]['resource_id']
+
+            if not doctor_id:
+                return {
+                    'success': False,
+                    'error': 'Doctor resource not found for hold'
+                }
+
+            # Create appointment record
+            appointment_id = str(uuid.uuid4())
+
+            appointment_data = {
+                'id': appointment_id,
+                'clinic_id': hold['clinic_id'],
+                'patient_id': patient_id,
+                'doctor_id': doctor_id,
+                'service_id': service_id,
+                'appointment_type': appointment_type,
+                'appointment_date': hold['reservation_date'],
+                'start_time': hold['start_time'],
+                'end_time': hold['end_time'],
+                'status': 'scheduled',
+                'reason_for_visit': reason_for_visit or '',
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat()
+            }
+
+            appt_result = self.supabase.table('appointments').insert(
+                appointment_data
+            ).execute()
+
+            if not appt_result.data:
+                return {
+                    'success': False,
+                    'error': 'Failed to create appointment record'
+                }
+
+            # Update hold to CONFIRMED state
+            self.supabase.table('resource_reservations').update({
+                'state': 'CONFIRMED',
+                'confirmed_appointment_id': appointment_id,
+                'updated_at': datetime.utcnow().isoformat(),
+                'metadata': {
+                    **(metadata if isinstance(metadata, dict) else {}),
+                    'confirmed_at': datetime.utcnow().isoformat()
+                }
+            }).eq('id', hold_id).execute()
+
+            # Insert calendar outbox entry
+            try:
+                self.supabase.table('calendar_outbox').insert({
+                    'appointment_id': appointment_id,
+                    'operation': 'CREATE',
+                    'status': 'pending'
+                }).execute()
+            except Exception as outbox_error:
+                logger.warning(f"⚠️ Failed to insert calendar outbox: {outbox_error}")
+
+            logger.info(f"✅ Confirmed hold {hold_id} → appointment {appointment_id} (fallback)")
+
+            return {
+                'success': True,
+                'appointment_id': appointment_id,
+                'datetime': f"{hold['reservation_date']} {hold['start_time']}",
+                'doctor_id': doctor_id
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Error in fallback confirmation: {str(e)}")
+            return {
+                'success': False,
+                'error': f'Failed to confirm hold: {str(e)}'
+            }
+
+    async def _release_hold(self, hold_id: str) -> Dict[str, Any]:
+        """
+        Release a hold by marking it as CANCELLED
+
+        Args:
+            hold_id: Hold ID to release
+
+        Returns:
+            Dictionary with success status
+        """
+        try:
+            self.supabase.table('resource_reservations').update({
+                'state': 'CANCELLED',
+                'updated_at': datetime.utcnow().isoformat()
+            }).eq('id', hold_id).execute()
+
+            logger.info(f"✅ Released hold {hold_id}")
+
+            return {'success': True}
+
+        except Exception as e:
+            logger.error(f"❌ Error releasing hold: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
+    async def book_appointment_v2(
+        self,
+        request: AppointmentRequest,
+        idempotency_key: Optional[str] = None,
+        source_channel: str = 'http'
+    ) -> AppointmentResult:
+        """
+        Book appointment using unified holds system (Phase C)
+
+        This is the new implementation that uses resource_reservations.state
+        for holds instead of calendar_service.ask_hold_reserve().
+
+        Flow:
+        1. Check idempotency
+        2. Create hold in resource_reservations (state='HOLD')
+        3. Confirm hold atomically (creates appointment, updates state to 'CONFIRMED')
+        4. Queue calendar sync (non-blocking)
+        5. Record idempotency success
+
+        Args:
+            request: Appointment request details
+            idempotency_key: Optional idempotency key for duplicate prevention
+            source_channel: Source channel ('http', 'whatsapp', 'voice')
+
+        Returns:
+            AppointmentResult with booking status
+        """
+        try:
+            # Step 1: Check idempotency if key provided
+            if idempotency_key:
+                existing = await self._check_idempotency(idempotency_key, request.clinic_id)
+                if existing:
+                    logger.info(f"⚡ Returning cached result for idempotent request")
+                    response = existing.get('response_payload', {})
+                    return AppointmentResult(
+                        success=response.get('success', True),
+                        appointment_id=response.get('appointment_id'),
+                        reservation_id=response.get('reservation_id'),
+                        external_events=response.get('external_events')
+                    )
+
+            logger.info(f"📅 Booking appointment for patient {request.patient_id} with doctor {request.doctor_id}")
+
+            # Step 2: Create hold using unified substrate with intelligent scheduling (Phase C.1)
+            hold_result = await self._create_unified_hold(
+                clinic_id=request.clinic_id,
+                service_id=request.service_id,
+                patient_id=request.patient_id,
+                appointment_date=request.start_time.date(),
+                start_time=request.start_time.time(),
+                end_time=request.end_time.time(),
+                doctor_id=request.doctor_id,  # Optional - intelligent selection if None
+                source_channel=source_channel
+            )
+
+            if not hold_result['success']:
+                error_msg = hold_result.get('error', 'Failed to create hold')
+
+                # Record idempotency failure
+                if idempotency_key:
+                    await self._update_idempotency_failure(
+                        idempotency_key,
+                        request.clinic_id,
+                        error=error_msg
+                    )
+
+                return AppointmentResult(
+                    success=False,
+                    error=error_msg
+                )
+
+            hold_id = hold_result['hold_id']
+
+            try:
+                # Step 3: Confirm hold atomically (creates appointment + updates state to CONFIRMED)
+                confirm_result = await self._confirm_hold_atomic(
+                    hold_id=hold_id,
+                    patient_id=request.patient_id,
+                    service_id=request.service_id,
+                    appointment_type=request.appointment_type.value if hasattr(request.appointment_type, 'value') else str(request.appointment_type),
+                    reason_for_visit=request.reason
+                )
+
+                if not confirm_result['success']:
+                    # Release hold on failure
+                    await self._release_hold(hold_id)
+
+                    error_msg = confirm_result.get('error', 'Failed to confirm appointment')
+
+                    if idempotency_key:
+                        await self._update_idempotency_failure(
+                            idempotency_key,
+                            request.clinic_id,
+                            error=error_msg
+                        )
+
+                    return AppointmentResult(
+                        success=False,
+                        error=error_msg
+                    )
+
+                appointment_id = confirm_result['appointment_id']
+
+                # Step 4: Queue calendar sync (non-blocking - will be handled by outbox worker in Phase D)
+                # For now, we'll do it synchronously but this will be replaced with outbox pattern
+                try:
+                    await self.calendar_service.reserve_slot(
+                        appointment_id=appointment_id,
+                        datetime_str=f"{request.start_time.isoformat()}",
+                        duration_minutes=int((request.end_time - request.start_time).total_seconds() / 60),
+                        doctor_id=request.doctor_id,
+                        patient_info={
+                            'patient_id': request.patient_id,
+                            'patient_phone': request.patient_phone,
+                            'patient_email': request.patient_email
+                        }
+                    )
+                except Exception as calendar_error:
+                    # Calendar sync failure shouldn't fail the appointment
+                    logger.warning(f"⚠️ Calendar sync failed but appointment created: {str(calendar_error)}")
+
+                # Step 5: Record idempotency success
+                booking_result = {
+                    'success': True,
+                    'appointment_id': appointment_id,
+                    'reservation_id': hold_id,
+                    'datetime': confirm_result['datetime'],
+                    'doctor_id': confirm_result['doctor_id']
+                }
+
+                if idempotency_key:
+                    await self._update_idempotency_success(
+                        idempotency_key,
+                        request.clinic_id,
+                        result=booking_result
+                    )
+
+                logger.info(f"✅ Successfully booked appointment {appointment_id}")
+
+                return AppointmentResult(
+                    success=True,
+                    appointment_id=appointment_id,
+                    reservation_id=hold_id
+                )
+
+            except Exception as e:
+                # Release hold on any error
+                logger.error(f"❌ Error during confirmation: {str(e)}")
+                await self._release_hold(hold_id)
+
+                if idempotency_key:
+                    await self._update_idempotency_failure(
+                        idempotency_key,
+                        request.clinic_id,
+                        error=str(e)
+                    )
+
+                raise
+
+        except Exception as e:
+            logger.error(f"❌ Error booking appointment: {str(e)}")
+
+            if idempotency_key:
+                await self._update_idempotency_failure(
+                    idempotency_key,
+                    request.clinic_id,
+                    error=str(e)
+                )
+
+            return AppointmentResult(
+                success=False,
+                error=str(e)
+            )

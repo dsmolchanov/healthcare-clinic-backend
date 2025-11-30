@@ -30,6 +30,10 @@ class AvailabilityHandler(ToolHandler):
             patient_id=patient_id
         )
 
+        # Default to Consultation if service_name is missing
+        if 'service_name' not in args or not args['service_name']:
+            args['service_name'] = 'Consultation'
+
         result = await reservation_tools.check_availability_tool(**args)
 
         if result.get('success'):

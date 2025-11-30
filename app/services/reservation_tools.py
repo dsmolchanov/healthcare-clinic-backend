@@ -12,8 +12,13 @@ import asyncio
 import json
 from enum import Enum
 
-from app.services.appointment_booking_service import AppointmentBookingService
-from app.services.unified_appointment_service import UnifiedAppointmentService
+# Phase C: Removed deprecated AppointmentBookingService import
+# from app.services.appointment_booking_service import AppointmentBookingService
+from app.services.unified_appointment_service import (
+    UnifiedAppointmentService,
+    AppointmentRequest,
+    AppointmentType
+)
 from app.services.external_calendar_service import ExternalCalendarService
 from app.services.intelligent_scheduler import IntelligentScheduler, SchedulingStrategy
 from app.services.realtime_conflict_detector import RealtimeConflictDetector
@@ -50,7 +55,8 @@ class ReservationTools:
         self.supabase = create_supabase_client()
 
         # Initialize services
-        self.booking_service = AppointmentBookingService(supabase_client=self.supabase)
+        # Phase C: Removed deprecated AppointmentBookingService
+        # self.booking_service = AppointmentBookingService(supabase_client=self.supabase)
         self.unified_service = UnifiedAppointmentService(supabase=self.supabase)
         self.calendar_service = ExternalCalendarService(supabase=self.supabase)
         self.scheduler = IntelligentScheduler(supabase=self.supabase)
@@ -332,6 +338,16 @@ class ReservationTools:
             Dictionary with booking confirmation details
         """
         try:
+            # Check idempotency if key provided
+            if idempotency_key:
+                idem_check = await self._check_idempotency(idempotency_key)
+                if idem_check['already_processed']:
+                    logger.info(f"⚡ Idempotency: Request already processed for key {idempotency_key}")
+                    return idem_check['response_payload']
+
+                # Record idempotency attempt
+                await self._record_idempotency_attempt(idempotency_key)
+
             # Parse datetime
             appointment_datetime = datetime.fromisoformat(datetime_str)
 
@@ -396,15 +412,21 @@ class ReservationTools:
                 if not appointments:
                     # Release hold on failure
                     await self.release_appointment_hold_tool(hold_id, "Multi-stage booking failed")
-                    return {
+                    failure_result = {
                         "success": False,
                         "error": "Failed to book all stages of the appointment"
                     }
 
+                    # Record failure for idempotency
+                    if idempotency_key:
+                        await self._record_idempotency_failure(idempotency_key, failure_result.get('error', 'Multi-stage booking failed'))
+
+                    return failure_result
+
                 # Confirm the hold for all stages
                 await self.confirm_appointment_hold_tool(hold_id, patient_info)
 
-                return {
+                multi_stage_result = {
                     "success": True,
                     "appointment_ids": [apt['id'] for apt in appointments],
                     "appointments": appointments,
@@ -412,58 +434,80 @@ class ReservationTools:
                     "total_stages": stage_config['total_stages'],
                     "confirmation_message": self._format_multi_stage_confirmation(appointments, service)
                 }
+
+                # Record success for idempotency
+                if idempotency_key:
+                    await self._record_idempotency_success(idempotency_key, multi_stage_result)
+
+                return multi_stage_result
             else:
-                # Single appointment booking
-                # Use the booking service to create appointment
-                result = await self.booking_service.book_appointment(
-                    patient_phone=appointment_data['patient_phone'],
+                # Single appointment booking using unified service (Phase C)
+                # Calculate end time from duration
+                end_time = appointment_datetime + timedelta(minutes=service['duration_minutes'])
+
+                # Create AppointmentRequest for unified service
+                request = AppointmentRequest(
+                    patient_id=appointment_data['patient_id'],
+                    doctor_id=appointment_data['doctor_id'],
                     clinic_id=self.clinic_id,
-                    appointment_details={
-                        'doctor_id': appointment_data['doctor_id'],
-                        'service_id': appointment_data['service_id'],
-                        'date': appointment_datetime.date().isoformat(),
-                        'time': appointment_datetime.time().isoformat(),
-                        'duration_minutes': appointment_data['duration_minutes'],
-                        'type': appointment_data.get('appointment_type', 'general'),
-                        'reason': appointment_data.get('notes'),
-                        'first_name': appointment_data.get('patient_name', '').split()[0] if appointment_data.get('patient_name') else 'Pending',
-                        'last_name': ' '.join(appointment_data.get('patient_name', '').split()[1:]) if appointment_data.get('patient_name') and len(appointment_data.get('patient_name', '').split()) > 1 else 'Registration',
-                        'email': appointment_data.get('patient_email')
-                    },
-                    idempotency_key=appointment_data.get('idempotency_key')
+                    start_time=appointment_datetime,
+                    end_time=end_time,
+                    appointment_type=AppointmentType.CONSULTATION,  # Map from service type if available
+                    service_id=appointment_data['service_id'],
+                    reason=appointment_data.get('notes'),
+                    patient_phone=appointment_data.get('patient_phone'),
+                    patient_email=appointment_data.get('patient_email')
                 )
 
-                if result and 'error' not in result:
-                    # Confirm the hold
-                    await self.confirm_appointment_hold_tool(hold_id, patient_info)
+                # Use unified service book_appointment_v2 (Phase C implementation)
+                result = await self.unified_service.book_appointment_v2(
+                    request=request,
+                    idempotency_key=appointment_data.get('idempotency_key'),
+                    source_channel='whatsapp'  # ReservationTools is primarily used by WhatsApp
+                )
 
-                    # Sync with external calendars
-                    await self.calendar_service.reserve_slot(
-                        appointment_id=result['id'],
-                        datetime_str=datetime_str,
-                        duration_minutes=service['duration_minutes'],
-                        doctor_id=doctor_id,
-                        patient_info=patient_info
-                    )
+                if result.success:
+                    # Get appointment details for response
+                    appt_result = self.supabase.schema('healthcare').table('appointments').select('*').eq(
+                        'id', result.appointment_id
+                    ).execute()
 
-                    return {
+                    appointment_record = appt_result.data[0] if appt_result.data else {}
+
+                    booking_result = {
                         "success": True,
-                        "appointment_id": result['id'],
-                        "appointment": result,
-                        "confirmation_message": self._format_confirmation_message(result, service)
+                        "appointment_id": result.appointment_id,
+                        "appointment": appointment_record,
+                        "confirmation_message": self._format_confirmation_message(appointment_record, service)
                     }
+
+                    # Record success for idempotency (already handled by book_appointment_v2, but keeping for compatibility)
+                    if idempotency_key:
+                        await self._record_idempotency_success(idempotency_key, booking_result)
+
+                    return booking_result
                 else:
-                    # Release hold on failure
-                    await self.release_appointment_hold_tool(hold_id, "Booking failed")
-                    return {
+                    # Booking failed (hold already released by book_appointment_v2)
+                    failure_result = {
                         "success": False,
-                        "error": result.get('error', 'Failed to book appointment')
+                        "error": result.error or 'Failed to book appointment'
                     }
+
+                    # Record failure for idempotency (already handled by book_appointment_v2, but keeping for compatibility)
+                    if idempotency_key:
+                        await self._record_idempotency_failure(idempotency_key, failure_result.get('error', 'Unknown error'))
+
+                    return failure_result
 
         except Exception as e:
             logger.error(f"Error booking appointment: {str(e)}")
             if hold_id:
                 await self.release_appointment_hold_tool(hold_id, f"Error: {str(e)}")
+
+            # Record failure for idempotency
+            if idempotency_key:
+                await self._record_idempotency_failure(idempotency_key, str(e))
+
             return {
                 "success": False,
                 "error": f"Failed to book appointment: {str(e)}"
@@ -789,7 +833,7 @@ class ReservationTools:
         hold_duration_minutes: int = 15
     ) -> Dict[str, Any]:
         """
-        Create a temporary hold on an appointment slot.
+        Create a temporary hold on an appointment slot using unified resource_reservations.
 
         Args:
             slot_datetime: Datetime of the slot to hold
@@ -803,25 +847,32 @@ class ReservationTools:
         """
         try:
             slot_dt = datetime.fromisoformat(slot_datetime)
-            expire_at = datetime.now() + timedelta(minutes=hold_duration_minutes)
+            end_dt = slot_dt + timedelta(minutes=duration_minutes)
+            expire_at = datetime.utcnow() + timedelta(minutes=hold_duration_minutes)
 
-            # Create hold in database
+            # Create hold in unified resource_reservations substrate with state='HOLD'
             hold_data = {
                 "clinic_id": self.clinic_id,
-                "slot_datetime": slot_dt.isoformat(),
-                "duration_minutes": duration_minutes,
+                "patient_id": self.patient_id,
                 "service_id": service_id,
-                "doctor_id": doctor_id,
-                "status": "active",
-                "created_at": datetime.now().isoformat(),
-                "expire_at": expire_at.isoformat(),
-                "created_by": "langgraph_agent"
+                "reservation_date": slot_dt.date().isoformat(),
+                "start_time": slot_dt.time().isoformat(),
+                "end_time": end_dt.time().isoformat(),
+                "state": "HOLD",
+                "hold_expires_at": expire_at.isoformat(),
+                "hold_created_for": f"whatsapp_session_{self.clinic_id}",
+                "status": "pending",  # Original status field for compatibility
+                "created_at": datetime.utcnow().isoformat()
             }
 
-            result = self.supabase.table('healthcare.appointment_holds').insert(hold_data).execute()
+            result = self.supabase.table('healthcare.resource_reservations').insert(hold_data).execute()
 
             if result.data:
                 hold = result.data[0]
+
+                # If doctor specified, link via reservation_resources junction table
+                if doctor_id:
+                    await self._link_doctor_to_hold(hold['id'], doctor_id)
 
                 # Also create hold in external calendars
                 await self.calendar_service.hold_slot(
@@ -857,7 +908,7 @@ class ReservationTools:
         confirmation_data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Confirm a held appointment slot.
+        Confirm a held appointment slot by transitioning state from HOLD to CONFIRMED.
 
         Args:
             hold_id: ID of the hold to confirm
@@ -867,18 +918,57 @@ class ReservationTools:
             Dictionary with confirmation status
         """
         try:
-            # Update hold status
-            update_result = self.supabase.table('healthcare.appointment_holds').update({
-                "status": "confirmed",
-                "confirmed_at": datetime.now().isoformat(),
-                "confirmation_data": json.dumps(confirmation_data)
-            }).eq('id', hold_id).execute()
+            # Verify hold exists and hasn't expired
+            hold_result = self.supabase.table('healthcare.resource_reservations').select('*').eq(
+                'id', hold_id
+            ).eq('state', 'HOLD').execute()
+
+            if not hold_result.data:
+                return {
+                    "success": False,
+                    "error": "Hold not found or already confirmed/expired"
+                }
+
+            hold = hold_result.data[0]
+
+            # Check if expired
+            if hold.get('hold_expires_at'):
+                expires_at = datetime.fromisoformat(hold['hold_expires_at'])
+                if expires_at < datetime.utcnow():
+                    # Mark as expired
+                    self.supabase.table('healthcare.resource_reservations').update({
+                        "state": "EXPIRED"
+                    }).eq('id', hold_id).execute()
+                    return {
+                        "success": False,
+                        "error": "Hold has expired"
+                    }
+
+            # Create appointment first if not already linked
+            appointment_id = None
+            if confirmation_data and not hold.get('confirmed_appointment_id'):
+                appointment_id = await self._create_appointment_from_hold(hold, confirmation_data)
+
+            # Transition hold to CONFIRMED state
+            update_data = {
+                "state": "CONFIRMED",
+                "status": "confirmed",  # Keep old status for compatibility
+                "updated_at": datetime.utcnow().isoformat()
+            }
+
+            if appointment_id:
+                update_data["confirmed_appointment_id"] = appointment_id
+
+            update_result = self.supabase.table('healthcare.resource_reservations').update(
+                update_data
+            ).eq('id', hold_id).execute()
 
             if update_result.data:
                 return {
                     "success": True,
                     "hold_id": hold_id,
-                    "status": "confirmed",
+                    "appointment_id": appointment_id,
+                    "state": "CONFIRMED",
                     "message": "Appointment hold confirmed successfully"
                 }
             else:
@@ -900,7 +990,7 @@ class ReservationTools:
         reason: str
     ) -> Dict[str, Any]:
         """
-        Release a held appointment slot.
+        Release a held appointment slot by transitioning state to RELEASED.
 
         Args:
             hold_id: ID of the hold to release
@@ -911,21 +1001,23 @@ class ReservationTools:
         """
         try:
             # Get hold details first
-            hold_result = self.supabase.table('healthcare.appointment_holds').select('*').eq('id', hold_id).execute()
+            hold_result = self.supabase.table('healthcare.resource_reservations').select('*').eq(
+                'id', hold_id
+            ).eq('state', 'HOLD').execute()
 
             if not hold_result.data:
                 return {
                     "success": False,
-                    "error": "Hold not found"
+                    "error": "Hold not found or already released"
                 }
 
             hold = hold_result.data[0]
 
-            # Update hold status
-            update_result = self.supabase.table('healthcare.appointment_holds').update({
-                "status": "released",
-                "released_at": datetime.now().isoformat(),
-                "release_reason": reason
+            # Transition state to RELEASED
+            update_result = self.supabase.table('healthcare.resource_reservations').update({
+                "state": "RELEASED",
+                "status": "released",  # Keep old status for compatibility
+                "updated_at": datetime.utcnow().isoformat()
             }).eq('id', hold_id).execute()
 
             if update_result.data:
@@ -1085,6 +1177,140 @@ class ReservationTools:
                 doctor['workload_score'] = 0.5
                 doctor['workload_label'] = 'unknown'
             return doctors
+
+    async def _link_doctor_to_hold(self, hold_id: str, doctor_id: str):
+        """Link doctor resource to hold via reservation_resources junction table"""
+        try:
+            # First get the doctor's resource_id
+            resource_result = self.supabase.table('healthcare.resources').select('id').eq(
+                'doctor_id', doctor_id
+            ).eq('resource_type', 'doctor').execute()
+
+            if resource_result.data:
+                resource_id = resource_result.data[0]['id']
+
+                # Create link in reservation_resources junction table
+                link_data = {
+                    "reservation_id": hold_id,
+                    "resource_id": resource_id,
+                    "resource_role": "primary"
+                }
+                self.supabase.table('healthcare.reservation_resources').insert(link_data).execute()
+                logger.info(f"✅ Linked doctor {doctor_id} to hold {hold_id}")
+            else:
+                logger.warning(f"⚠️ Doctor resource not found for doctor_id: {doctor_id}")
+        except Exception as e:
+            logger.warning(f"Failed to link doctor to hold: {str(e)}")
+            # Non-fatal - hold still exists
+
+    async def _create_appointment_from_hold(self, hold: Dict, confirmation_data: Dict) -> Optional[str]:
+        """Create appointment record from hold data"""
+        try:
+            appointment_datetime = datetime.fromisoformat(
+                f"{hold['reservation_date']} {hold['start_time']}"
+            )
+
+            appointment_data = {
+                "clinic_id": hold['clinic_id'],
+                "patient_id": hold.get('patient_id') or confirmation_data.get('patient_id'),
+                "service_id": hold.get('service_id'),
+                "appointment_date": hold['reservation_date'],
+                "start_time": hold['start_time'],
+                "end_time": hold['end_time'],
+                "status": "scheduled",
+                "appointment_type": confirmation_data.get('appointment_type', 'consultation'),
+                "reason_for_visit": confirmation_data.get('reason'),
+                "created_at": datetime.utcnow().isoformat()
+            }
+
+            result = self.supabase.table('healthcare.appointments').insert(appointment_data).execute()
+            appointment_id = result.data[0]['id'] if result.data else None
+
+            if appointment_id:
+                logger.info(f"✅ Created appointment {appointment_id} from hold {hold['id']}")
+
+            return appointment_id
+        except Exception as e:
+            logger.error(f"Error creating appointment from hold: {str(e)}")
+            return None
+
+    async def _check_idempotency(self, idempotency_key: str) -> Dict[str, Any]:
+        """Check if request has already been processed via idempotency key"""
+        try:
+            import hashlib
+            key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+
+            result = self.supabase.table('healthcare.booking_idempotency').select('*').eq(
+                'key_hash', key_hash
+            ).eq('tenant_id', self.clinic_id).execute()
+
+            if result.data:
+                record = result.data[0]
+                # Check if completed
+                if record.get('status') == 'completed':
+                    return {
+                        'already_processed': True,
+                        'response_payload': record.get('response_payload', {})
+                    }
+
+            return {'already_processed': False}
+        except Exception as e:
+            logger.warning(f"Error checking idempotency: {str(e)}")
+            # On error, proceed with request (fail open)
+            return {'already_processed': False}
+
+    async def _record_idempotency_attempt(self, idempotency_key: str):
+        """Record initial idempotency attempt"""
+        try:
+            import hashlib
+            key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+
+            # Try to insert, ignore if exists (race condition)
+            try:
+                self.supabase.table('healthcare.booking_idempotency').insert({
+                    'key_hash': key_hash,
+                    'idempotency_key': idempotency_key,
+                    'tenant_id': self.clinic_id,
+                    'channel': 'whatsapp',
+                    'status': 'processing',
+                    'created_at': datetime.utcnow().isoformat()
+                }).execute()
+            except Exception:
+                # Already exists, that's fine
+                pass
+        except Exception as e:
+            logger.warning(f"Error recording idempotency attempt: {str(e)}")
+
+    async def _record_idempotency_success(self, idempotency_key: str, response: Dict):
+        """Record successful booking in idempotency table"""
+        try:
+            import hashlib
+            key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+
+            self.supabase.table('healthcare.booking_idempotency').update({
+                'status': 'completed',
+                'response_payload': response,
+                'response_timestamp': datetime.utcnow().isoformat()
+            }).eq('key_hash', key_hash).execute()
+
+            logger.info(f"✅ Recorded idempotency success for key {idempotency_key}")
+        except Exception as e:
+            logger.warning(f"Error recording idempotency success: {str(e)}")
+
+    async def _record_idempotency_failure(self, idempotency_key: str, error: str):
+        """Record failed booking attempt"""
+        try:
+            import hashlib
+            key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+
+            self.supabase.table('healthcare.booking_idempotency').update({
+                'status': 'failed',
+                'error_message': error
+            }).eq('key_hash', key_hash).execute()
+
+            logger.warning(f"⚠️ Recorded idempotency failure for key {idempotency_key}: {error}")
+        except Exception as e:
+            logger.warning(f"Error recording idempotency failure: {str(e)}")
 
     async def _get_service_by_name(
         self,

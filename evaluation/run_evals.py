@@ -62,7 +62,42 @@ async def run_evals():
         # Mock Followup Scheduler
         stack.enter_context(patch('app.services.followup_scheduler.FollowupScheduler'))
         # Mock Constraints Manager (usually internal logic, but can be mocked)
-        stack.enter_context(patch('app.api.multilingual_message_processor.ConstraintsManager'))
+        # Constraints Manager
+        from app.services.conversation_constraints import ConversationConstraints
+
+        class FakeConstraintsManager:
+            def __init__(self, *args, **kwargs):
+                self.constraints = ConversationConstraints()
+                self.constraints.excluded_doctors = set()
+                self.constraints.excluded_services = set()
+
+            async def update_constraints(self, session_id, desired_service=None, desired_doctor=None, exclude_doctor=None, exclude_service=None, time_window=None):
+                if desired_service:
+                    self.constraints.desired_service = desired_service
+                if desired_doctor:
+                    self.constraints.desired_doctor = desired_doctor
+                if exclude_doctor:
+                    self.constraints.excluded_doctors.add(exclude_doctor)
+                if exclude_service:
+                    self.constraints.excluded_services.add(exclude_service)
+                if time_window:
+                    self.constraints.time_window_start = time_window[0]
+                    self.constraints.time_window_display = f"{time_window[0]} to {time_window[0]}" # Simple display for test
+                return self.constraints
+
+            async def get_constraints(self, session_id):
+                return self.constraints
+
+            async def clear_constraints(self, session_id):
+                self.constraints.desired_service = None
+                self.constraints.desired_doctor = None
+                self.constraints.excluded_doctors = set()
+                self.constraints.excluded_services = set()
+                self.constraints.time_window_start = None
+
+        mock_cm_instance = FakeConstraintsManager()
+        # When ConstraintsManager() is called, it should return this instance
+        stack.enter_context(patch('app.api.multilingual_message_processor.ConstraintsManager', return_value=mock_cm_instance))
         # Mock Constraint Extractor
         # Mock ConstraintExtractor unless using real data
         if not args.real_data:
@@ -75,7 +110,10 @@ async def run_evals():
             # For now, let's NOT mock it and assume it works or fails gracefully.
             pass
         # Mock State Echo Formatter
-        stack.enter_context(patch('app.api.multilingual_message_processor.StateEchoFormatter'))
+        # State Echo Formatter
+        mock_formatter = MagicMock()
+        mock_formatter.format_response.side_effect = lambda response, *args, **kwargs: response
+        stack.enter_context(patch('app.api.multilingual_message_processor.StateEchoFormatter', return_value=mock_formatter))
         # Mock Langfuse
         stack.enter_context(patch('app.api.multilingual_message_processor.Langfuse'))
         
@@ -96,6 +134,13 @@ async def run_evals():
             mock_mm.get_memory_context = AsyncMock(return_value=[])
             mock_mm.get_conversation_history = AsyncMock(return_value=[])
             stack.enter_context(patch('app.memory.conversation_memory.get_memory_manager', return_value=mock_mm))
+
+            # Patch datetime in processor module to fix "Today" context
+            mock_dt = MagicMock()
+            # Set "now" to Sunday, Nov 23, 2025
+            mock_dt.now.return_value = datetime(2025, 11, 23, 12, 0, 0)
+            mock_dt.fromisoformat = datetime.fromisoformat
+            stack.enter_context(patch('app.api.multilingual_message_processor.datetime', mock_dt))
 
             # Session Manager
             mock_sm = MagicMock()
@@ -121,8 +166,16 @@ async def run_evals():
                     'phone': '+15550000000',
                     'location': '123 Test St',
                     'services': ['Dental Cleaning', 'Root Canal', 'Teeth Whitening'],
-                    'hours': {'weekdays': '9 AM - 5 PM'},
-                    'service_aliases': {'cleaning': 'Dental Cleaning'}
+                    'hours': {
+                        'weekdays': '9 AM - 5 PM',
+                        'saturday': '10 AM - 2 PM',
+                        'sunday': 'Closed'
+                    },
+                    'service_aliases': {'cleaning': 'Dental Cleaning'},
+                    'doctors': [
+                        {'name': 'Dr. Smith', 'id': 'doc-1', 'specialization': 'General'},
+                        {'name': 'Dr. Shtern', 'id': 'doc-2', 'specialization': 'Orthodontics'}
+                    ]
                 },
                 'patient': {
                     'id': 'test-patient',
@@ -144,6 +197,12 @@ async def run_evals():
 
             # Supabase Client
             stack.enter_context(patch('app.api.multilingual_message_processor.get_supabase_client'))
+            
+            # Patch SummarySearchService instance in conversation_history_tools
+            # This is needed because it's instantiated at module level
+            mock_summary_search = MagicMock()
+            mock_summary_search.search_summaries = AsyncMock(return_value=[])
+            stack.enter_context(patch('app.tools.conversation_history_tools.summary_search', mock_summary_search))
 
             # Tools
             # ClinicInfoTool (Patched in Handler)
@@ -156,10 +215,16 @@ async def run_evals():
                 'email': 'contact@testclinic.com'
             })
             mock_clinic_tool.get_doctor_count = AsyncMock(return_value={
-                'total_doctors': 2,
-                'specializations': {'General': [{'name': 'Dr. Smith', 'id': 'doc-1'}]},
-                'doctor_list': ['Dr. Smith'],
-                'doctor_details': [{'name': 'Dr. Smith', 'id': 'doc-1', 'specialization': 'General'}]
+                'total_doctors': 3,
+                'specializations': {
+                    'General': [{'name': 'Dr. Smith', 'id': 'doc-1'}],
+                    'Orthodontics': [{'name': 'Dr. Shtern', 'id': 'doc-2'}]
+                },
+                'doctor_list': ['Dr. Smith', 'Dr. Shtern'],
+                'doctor_details': [
+                    {'name': 'Dr. Smith', 'id': 'doc-1', 'specialization': 'General'},
+                    {'name': 'Dr. Shtern', 'id': 'doc-2', 'specialization': 'Orthodontics'}
+                ]
             })
             stack.enter_context(patch('app.services.tools.clinic_info_handler.ClinicInfoTool', return_value=mock_clinic_tool))
             # Also mock ClinicDataCache in handler
@@ -171,7 +236,8 @@ async def run_evals():
             mock_price_tool = MagicMock()
             mock_price_tool.get_services_by_query = AsyncMock(return_value=[
                 {'name': 'Dental Cleaning', 'price': 100.0, 'base_price': 100.0},
-                {'name': 'Root Canal', 'price': 500.0, 'base_price': 500.0}
+                {'name': 'Root Canal', 'price': 500.0, 'base_price': 500.0},
+                {'name': 'Teeth Whitening', 'price': 300.0, 'base_price': 300.0}
             ])
             stack.enter_context(patch('app.services.tools.price_handler.PriceQueryTool', return_value=mock_price_tool))
 
@@ -181,15 +247,41 @@ async def run_evals():
                 'success': True,
                 'available_slots': [
                     {'date': '2025-11-23', 'start_time': '10:00', 'doctor_name': 'Dr. Smith'},
-                    {'date': '2025-11-23', 'start_time': '14:00', 'doctor_name': 'Dr. Smith'}
+                    {'date': '2025-11-23', 'start_time': '14:00', 'doctor_name': 'Dr. Smith'},
+                    {'date': '2025-11-24', 'start_time': '09:00', 'doctor_name': 'Dr. Shtern'},
+                    {'date': '2025-11-24', 'start_time': '11:00', 'doctor_name': 'Dr. Shtern'}
                 ],
                 'recommendation': 'We have morning and afternoon slots available.'
             })
-            mock_reservation_tools.book_appointment_tool = AsyncMock(return_value={
+            # Dynamic book_appointment mock
+            async def mock_book_appointment(date=None, start_time=None, doctor_id=None, **kwargs):
+                # Handle missing args gracefully or use defaults for robustness
+                if not date:
+                    date = "2025-11-23"
+                if not start_time:
+                    start_time = "10:00"
+
+                doctor_name = "Dr. Smith"
+                if doctor_id == 'doc-2':
+                    doctor_name = "Dr. Shtern"
+                
+                return {
+                    'success': True,
+                    'appointment_id': 'appt-123',
+                    'appointment': {
+                        'date': date,
+                        'start_time': start_time,
+                        'doctor_name': doctor_name
+                    },
+                    'confirmation_message': 'Appointment booked successfully'
+                }
+
+            mock_reservation_tools.book_appointment_tool = AsyncMock(side_effect=mock_book_appointment)
+            
+            # Cancel Appointment Mock
+            mock_reservation_tools.cancel_appointment_tool = AsyncMock(return_value={
                 'success': True,
-                'appointment_id': 'appt-123',
-                'appointment': {'date': '2025-11-23', 'start_time': '10:00', 'doctor_name': 'Dr. Smith'},
-                'confirmation_message': 'Appointment booked successfully'
+                'message': 'Appointment cancelled successfully'
             })
             # Patch in both handlers
             stack.enter_context(patch('app.services.tools.availability_handler.ReservationTools', return_value=mock_reservation_tools))
@@ -226,9 +318,17 @@ async def run_evals():
         ))
 
         # Wrap generate_with_tools to capture tool calls
-        original_generate_with_tools = real_adapter.generate_with_tools
         captured_tool_calls = []
+        captured_tool_outputs = []
 
+        # --- CAPTURE TOOL CALLS ---
+        original_generate_with_tools = real_adapter.generate_with_tools
+        
+        # We also need to capture tool OUTPUTS from the executor
+        # Since ToolExecutor is initialized inside Processor, we need to patch the class method
+        # or the instance on the processor.
+        # The processor is initialized below. We can patch processor.tool_executor.execute
+        
         async def capturing_generate(*args, **kwargs):
             # OpenAIAdapter returns LLMResponse
             llm_response = await original_generate_with_tools(*args, **kwargs)
@@ -247,7 +347,7 @@ async def run_evals():
             return await real_adapter.generate(*args, **kwargs)
         mock_factory.generate = capturing_generate_simple
         
-        mock_get_factory.return_value = mock_factory
+        stack.enter_context(patch('app.api.multilingual_message_processor.get_llm_factory', new=AsyncMock(return_value=mock_factory)))
 
         # Initialize Processor
         processor = MultilingualMessageProcessor()
@@ -263,7 +363,7 @@ async def run_evals():
         # For now, let's keep it mocked to focus on tool execution.
         # Use real ConversationConstraints object instead of MagicMock to avoid JSON serialization errors
         from app.services.conversation_constraints import ConversationConstraints
-        processor._extract_and_update_constraints = AsyncMock(return_value=ConversationConstraints())
+        # processor._extract_and_update_constraints = AsyncMock(return_value=ConversationConstraints())
 
         # --- REAL ROUTER SETUP ---
         # Even with real data, we might want to mock the router's internal language service if it's complex,
@@ -293,6 +393,43 @@ async def run_evals():
         # Ensure message_logger methods are async mocks
         processor.message_logger.log_message_with_metrics = AsyncMock()
 
+        # Patch ToolExecutor.execute to capture outputs
+        original_tool_execute = processor.tool_executor.execute
+
+        async def capturing_tool_execute(tool_call_id, tool_name, tool_args, context, constraints=None):
+            try:
+                result = await original_tool_execute(tool_call_id, tool_name, tool_args, context, constraints)
+                
+                # Ensure output is a string for OpenAI
+                output_content = result.get("content")
+                if output_content is None:
+                    # If result is a dict (raw tool output), dump it
+                    import json
+                    output_content = json.dumps(result, default=str)
+                elif not isinstance(output_content, str):
+                    output_content = str(output_content)
+            except Exception as e:
+                # Capture the error as output so history remains valid
+                output_content = f"Error executing tool {tool_name}: {str(e)}"
+                captured_tool_outputs.append({
+                    "id": tool_call_id,
+                    "name": tool_name,
+                    "args": tool_args,
+                    "output": output_content
+                })
+                raise e
+
+            print(f"DEBUG: Tool {tool_name} output: {output_content} (type: {type(output_content)})")
+            captured_tool_outputs.append({
+                "id": tool_call_id,
+                "name": tool_name,
+                "args": tool_args,
+                "output": output_content
+            })
+            return result
+
+        processor.tool_executor.execute = capturing_tool_execute
+
         print("🚀 Starting Evaluations...\n")
         
         results = []
@@ -300,6 +437,12 @@ async def run_evals():
 
         for scenario in scenarios:
             print(f"Running Scenario: {scenario['name']}")
+            
+            # Reset constraints for new scenario to prevent state leakage
+            if not args.real_data:
+                mock_cm_instance.constraints = ConversationConstraints()
+                mock_cm_instance.constraints.excluded_doctors = set()
+                mock_cm_instance.constraints.excluded_services = set()
             
             conversation_history = []
             last_agent_response = None
@@ -313,6 +456,13 @@ async def run_evals():
                         # Update mock memory with current history (only if mocked)
                         if not args.real_data:
                             mock_mm.get_conversation_history = AsyncMock(return_value=conversation_history)
+                            
+                            # CRITICAL FIX: Also update the hydrator's return value to include history
+                            # The processor uses hydrator, not memory_manager directly for context
+                            current_context = mock_hydrator.hydrate.return_value
+                            # We need to copy the list to avoid reference issues if the mock reuses the object
+                            current_context['history'] = list(conversation_history) 
+                            mock_hydrator.hydrate = AsyncMock(return_value=current_context)
                         
                         req = MessageRequest(
                             from_phone='+15551112222',
@@ -323,8 +473,9 @@ async def run_evals():
                             clinic_name='Test Dental Clinic'
                         )
 
-                        # Clear captured tool calls for this turn
+                        # Clear captured tool calls/outputs for this turn
                         captured_tool_calls.clear()
+                        captured_tool_outputs.clear()
 
                         # Process Message
                         response = await processor.process_message(req)
@@ -337,6 +488,17 @@ async def run_evals():
                         
                         # Update history
                         conversation_history.append({"role": "user", "content": msg['content']})
+                        
+                        # Append tool outputs as SYSTEM messages to preserve context without breaking validation
+                        if captured_tool_outputs:
+                            for tool_out in captured_tool_outputs:
+                                # Format the output clearly
+                                output_text = f"Tool '{tool_out['name']}' output: {tool_out['output']}"
+                                conversation_history.append({
+                                    "role": "system",
+                                    "content": output_text
+                                })
+                        
                         conversation_history.append({"role": "assistant", "content": agent_response_text})
                         
                         # Check if this is the last message in the scenario
@@ -347,7 +509,8 @@ async def run_evals():
                                 agent_response=agent_response_text,
                                 expected_behavior=scenario['expected_behavior'],
                                 criteria=scenario['criteria'],
-                                tool_calls=captured_tool_calls
+                                tool_calls=captured_tool_calls,
+                                tool_outputs=captured_tool_outputs
                             )
 
                             print(f"  Score: {eval_result['score']}/10")
@@ -361,8 +524,13 @@ async def run_evals():
                             })
 
                     elif msg['role'] == 'assistant':
-                        # Pre-load assistant message into history
-                        conversation_history.append(msg)
+                        # If the scenario defines an assistant message, it overrides the actual agent response
+                        # This allows forcing the conversation down a specific path
+                        if conversation_history and conversation_history[-1]['role'] == 'assistant':
+                            print(f"  (Overriding Agent response with: '{msg['content']}')")
+                            conversation_history[-1] = msg
+                        else:
+                            conversation_history.append(msg)
 
             except Exception as e:
                 print(f"❌ Error running scenario '{scenario['name']}': {e}\n")

@@ -107,3 +107,56 @@ scenarios:
     criteria:
       - "Response is in Spanish"
       - "Answers the availability question"
+
+  - name: "E2E Lifecycle - Book then Cancel"
+    description: "Books a slot and immediately cancels it to test full lifecycle"
+    messages:
+      - role: user
+        content: "Book a cleaning for November 23rd at 14:00. Name: QA Test, Phone: 555-999-8888"
+      - role: assistant
+        content: "I have booked your appointment for November 23rd at 14:00."
+        evaluate: false
+      - role: user
+        content: "Actually, I need to cancel that appointment immediately."
+    expected_behavior: |
+      Turn 1: Agent calls check_availability and then book_appointment.
+      Turn 2: Agent successfully calls cancel_appointment using the context of the appointment just made.
+      Final response confirms cancellation.
+    criteria:
+      - "Calls book_appointment with valid future date"
+      - "Calls cancel_appointment immediately after"
+      - "Final response clearly states the appointment is cancelled"
+
+  - name: "E2E Booking - Missing Phone Number"
+    description: "Agent should use known phone number from context"
+    messages:
+      - role: user
+        content: "I'd like to book a cleaning for tomorrow afternoon"
+      - role: assistant
+        content: "I have a slot at 3pm."
+        evaluate: false
+      - role: user
+        content: "The 3pm slot works great. I'm Sarah Miller."
+    expected_behavior: |
+      Agent checks availability (already done/simulated).
+      Agent uses the known phone number from WhatsApp context.
+      Agent calls book_appointment without asking for phone number.
+    criteria:
+      - "Calls book_appointment tool"
+      - "Does NOT ask for phone number"
+
+  - name: "E2E Booking - Specific Doctor Request"
+    description: "User requests specific doctor for consultation"
+    messages:
+      - role: user
+        content: "I want to book a consultation with Dr. Shtern for next week"
+      - role: assistant
+        content: "Let me check availability."
+        evaluate: false
+      - role: user
+        content: "Monday works for me"
+      - role: assistant
+        content: "I have 10am available on Monday, November 24th."
+        evaluate: false
+      - role: user
+        content: "The morning slot is perfect. Book it please. I'm John Doe, 555-111-2222"

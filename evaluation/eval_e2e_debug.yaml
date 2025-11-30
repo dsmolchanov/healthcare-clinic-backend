@@ -1,0 +1,27 @@
+scenarios:
+  - name: "E2E Booking - Specific Doctor Request"
+    category: "e2e"
+    messages:
+      - role: user
+        content: "I want to book a consultation with Dr. Shtern for next week"
+      - role: assistant
+        content: "Let me check availability."
+      - role: user
+        content: "Monday works for me"
+      - role: assistant
+        content: "I have 10am available."
+      - role: user
+        content: "The morning slot is perfect. Book it please. I'm John Doe."
+      - role: assistant
+        expected_tools: ["book_appointment"]
+        critique: |
+          The agent should book the appointment using the phone number from the context (555-123-4567) without asking for it.
+          It should confirm the booking with the correct details.
+    expected_behavior: |
+      Agent infers service="Consultation" and doctor="Dr. Shtern" from context.
+      Checks availability for Dr. Shtern.
+      Books appointment without asking "what service?" again.
+    criteria:
+      - "Does NOT ask for service type (inferred as Consultation)"
+      - "Calls check_availability with doctor_id='doc-2'"
+      - "Calls book_appointment with doctor_id='doc-2'"

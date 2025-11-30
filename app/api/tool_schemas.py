@@ -52,7 +52,7 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "get_clinic_info",
-                "description": "Get information about the clinic (doctors, hours, location, services)",
+                "description": "Get information about the clinic (doctors, hours, location, services). Use this ONLY if the information is not already present in the conversation context.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -79,7 +79,7 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                     "properties": {
                         "service_name": {
                             "type": "string",
-                            "description": "Name or type of service (e.g., 'dental cleaning', 'consultation', 'пломба', 'limpieza'). Supports multilingual queries."
+                            "description": "Name or type of service (e.g., 'dental cleaning', 'consultation', 'пломба', 'limpieza'). Supports multilingual queries. If user requests a specific doctor without specifying a service, use 'Consultation'."
                         },
                         "preferred_date": {
                             "type": "string",
@@ -100,7 +100,7 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                             "default": 7
                         }
                     },
-                    "required": ["service_name"]
+                    "required": []
                 }
             }
         },

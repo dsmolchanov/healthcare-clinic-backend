@@ -448,6 +448,11 @@ from app.api import calendar_management
 app.include_router(calendar_management.router)
 app.include_router(memory_health.router)
 
+# Billing & Subscription Management (Stripe Integration)
+from app.api import billing_routes
+app.include_router(billing_routes.router)
+app.include_router(billing_routes.webhooks_router)
+
 # ============================================================================
 # Health Check
 # ============================================================================

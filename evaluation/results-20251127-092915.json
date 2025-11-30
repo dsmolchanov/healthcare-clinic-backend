@@ -1,0 +1,30 @@
+{
+  "timestamp": "20251127-092915",
+  "summary": {
+    "total": 1,
+    "passed": 1,
+    "failed": 0,
+    "success_rate": 100.0
+  },
+  "results": [
+    {
+      "scenario": "Pre-warm Test - Specific Doctor Booking",
+      "result": {
+        "score": 8,
+        "pass": true,
+        "reasoning": "The agent correctly called the 'check_availability' tool with the specific 'doctor_id' for Dr. Shtern, as expected. The tool output provided the available slots, and the agent's response accurately reflected this data, avoiding any hallucination. The agent did not call the 'get_clinic_info' tool, adhering to the criteria. However, the agent did not address the user's request for 'tomorrow morning' directly, which could have been clarified or acknowledged in the response. Overall, the agent met the critical criteria and used the tools correctly, but there was a slight oversight in addressing the user's specific time preference."
+      },
+      "transcript": [
+        {
+          "role": "user",
+          "content": "I want to book a consultation with Dr. Shtern for tomorrow morning."
+        },
+        {
+          "role": "assistant",
+          "content": "I found these available times with Dr. Shtern for a consultation:\n\n- November 24, 2025, at 09:00 AM\n- November 24, 2025, at 11:00 AM\n\nPlease let me know which time works best for you, and I'll proceed with the booking."
+        }
+      ]
+    }
+  ],
+  "errors": []
+}
