@@ -1411,9 +1411,9 @@ IMPORTANT BEHAVIORS:
             except asyncio.TimeoutError:
                 logger.error("LLM call exceeded 20s timeout, using fallback")
                 # Quick template fallback with smart content detection
-                from app.services.intent_router import IntentRouter
-                intent_router = IntentRouter()
-                lang = intent_router._detect_language(user_message)
+                from app.services.language_service import LanguageService
+                language_service = LanguageService()
+                lang = language_service.detect_sync(user_message)
 
                 # Check if user is asking about doctors
                 user_lower = user_message.lower()
@@ -1458,9 +1458,10 @@ IMPORTANT BEHAVIORS:
             ai_response = self._clean_llm_response(ai_response, user_message)
 
             # Phase 8: Use fast heuristic language detection instead of second LLM call
-            from app.services.intent_router import IntentRouter
-            intent_router = IntentRouter()
-            detected_language = intent_router._detect_language(ai_response)
+            # NOTE: Using LanguageService.detect_sync() - single source of truth per Phase 1B
+            from app.services.language_service import LanguageService
+            language_service = LanguageService()
+            detected_language = language_service.detect_sync(ai_response)
 
             return ai_response, detected_language
 
@@ -1524,9 +1525,10 @@ IMPORTANT BEHAVIORS:
             logger.warning("⚠️ Response was empty after cleaning think tags - using multilingual fallback")
 
             # Detect user's language for appropriate fallback
-            from app.services.intent_router import IntentRouter
-            intent_router = IntentRouter()
-            lang = intent_router._detect_language(user_message) if user_message else 'en'
+            # NOTE: Using LanguageService.detect_sync() - single source of truth per Phase 1B
+            from app.services.language_service import LanguageService
+            language_service = LanguageService()
+            lang = language_service.detect_sync(user_message) if user_message else 'en'
 
             # Return helpful fallback in user's language
             fallbacks = {

@@ -126,3 +126,47 @@ class StateEchoFormatter:
             )
 
         return templates['correction_acknowledged'].format(**lines)
+
+    def format_response(
+        self,
+        ai_response: str,
+        constraints: ConversationConstraints,
+        language: str = 'en'
+    ) -> str:
+        """
+        Format AI response with state echo prepended.
+
+        This is the main entry point used by MultilingualMessageProcessor.
+        It prepends a state acknowledgment to the AI response when constraints
+        are present.
+
+        Args:
+            ai_response: The AI-generated response text
+            constraints: Current conversation constraints
+            language: ISO language code (en, es, ru, he)
+
+        Returns:
+            AI response with state echo prepended if constraints exist,
+            otherwise returns the original ai_response unchanged.
+        """
+        # Check if we have meaningful constraints to echo
+        has_meaningful_constraints = (
+            constraints.excluded_doctors
+            or constraints.excluded_services
+            or constraints.desired_service
+            or constraints.desired_doctor
+            or constraints.time_window_start
+        )
+
+        if not has_meaningful_constraints:
+            return ai_response
+
+        # Generate the state echo acknowledgment
+        state_echo = self.format_correction_acknowledgment(constraints, language)
+
+        # If state echo is empty or just whitespace, return original
+        if not state_echo or not state_echo.strip():
+            return ai_response
+
+        # Prepend state echo to AI response with double newline separator
+        return f"{state_echo}\n\n{ai_response}"
