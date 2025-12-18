@@ -614,7 +614,7 @@ DO NOT attempt to answer complex questions yourself.
                 metadata={'reset': True}
             )
 
-        constraints = await self._extract_and_update_constraints(
+        constraints, constraints_changed = await self._extract_and_update_constraints(
             session_id=session_id,
             message=request.body,
             detected_language=detected_language_prelim
@@ -626,7 +626,8 @@ DO NOT attempt to answer complex questions yourself.
                 f"📋 Active constraints: "
                 f"desired={constraints.desired_service}, "
                 f"excluded_docs={list(constraints.excluded_doctors)}, "
-                f"excluded_svc={list(constraints.excluded_services)}"
+                f"excluded_svc={list(constraints.excluded_services)}, "
+                f"changed_this_turn={constraints_changed}"
             )
 
         # Generate AI response with full context (for SCHEDULING, COMPLEX lanes, or fast-path fallback)
@@ -647,14 +648,16 @@ DO NOT attempt to answer complex questions yourself.
             phone_number=request.from_phone
         )
 
-        # Phase 6: Prepend state echo if significant constraints were added
-        if (constraints and (
+        # Phase 6: Prepend state echo ONLY if NEW constraints were added this turn
+        # (not just when existing constraints are present from previous turns)
+        if constraints_changed and constraints and (
             constraints.excluded_doctors
             or constraints.excluded_services
             or constraints.desired_service
             or constraints.time_window_start
-        )):
+        ):
             # Phase 7: Format response with state echo
+            logger.info(f"📢 State echo triggered: constraints changed this turn")
             formatted_response = self.state_echo_formatter.format_response(
                 ai_response,
                 constraints,
@@ -721,7 +724,8 @@ DO NOT attempt to answer complex questions yourself.
             agent_id=response_metadata.get('agent_id'),
 
             # Organization/Clinic tracking (✅ NEW)
-            organization_id=clinic_profile.get('organization_id'),
+            # Prefer clinic_profile.organization_id, fallback to request.metadata
+            organization_id=clinic_profile.get('organization_id') or request.metadata.get('organization_id'),
             clinic_id=effective_clinic_id
         )
 
@@ -1856,50 +1860,40 @@ IMPORTANT BEHAVIORS:
         ai_response: str,
         language: str
     ):
-        """Log conversation to database using RPC function"""
-        try:
-            client = get_supabase_client()
-            if not client:
-                logger.debug("Supabase client unavailable; skipping conversation log")
-                return
+        """
+        DEPRECATED: Log conversation to database using RPC function.
 
-            # Use RPC function to log conversation
-            # Updated parameter names to match new RPC signature
-            result = client.rpc('log_whatsapp_conversation', {
-                'p_clinic_id': clinic_id,
-                'p_from_phone': getattr(self, 'current_from_phone', ''),
-                'p_to_phone': getattr(self, 'current_to_phone', ''),
-                'p_message_content': user_message,  # Changed from p_message
-                'p_ai_response': ai_response,  # Changed from p_response
-                'p_message_sid': getattr(self, 'current_message_sid', f'msg_{session_id}'),
-                'p_detected_language': language,  # Changed from p_language
-                'p_organization_id': None  # Optional, will be looked up from clinic_id
-            }).execute()
+        NOTE: This method is no longer used for primary logging.
+        Messages are now logged via self.message_logger.log_message_with_metrics()
+        which handles both conversation_logs and message_metrics tables.
 
-            if result.data:
-                if result.data.get('success'):
-                    logger.info(f"Conversation logged successfully: session_id={result.data.get('session_id')}")
-                elif result.data.get('error') and 'duplicate key value violates unique constraint' in result.data.get('error', '').lower():
-                    logger.debug("Skipping duplicate WhatsApp conversation log for message_sid=%s", getattr(self, 'current_message_sid', 'unknown'))
-                else:
-                    logger.warning(f"Failed to log conversation: {result.data}")
-        except Exception as e:
-            # If logging fails, just print error (non-critical for MVP)
-            print(f"Could not log to database: {e}")
+        Keeping as no-op to avoid breaking existing call sites.
+        """
+        # Logging is now handled by message_logger.log_message_with_metrics()
+        # This legacy RPC call is disabled as the function doesn't exist
+        pass
 
     async def _extract_and_update_constraints(
         self,
         session_id: str,
         message: str,
         detected_language: str
-    ) -> ConversationConstraints:
-        """Extract constraints from user message and update storage (Phase 2)"""
+    ) -> Tuple[ConversationConstraints, bool]:
+        """
+        Extract constraints from user message and update storage (Phase 2).
+
+        Returns:
+            Tuple of (constraints, constraints_changed) where constraints_changed
+            indicates if any new constraints were added in this turn.
+        """
+        constraints_changed = False
 
         # Detect forget/exclusion patterns
         entities_to_exclude = self.constraint_extractor.detect_forget_pattern(message, detected_language)
 
         if entities_to_exclude:
             logger.info(f"🚫 Detected exclusions: {entities_to_exclude}")
+            constraints_changed = True
 
             # Add each entity to exclusions
             for entity in entities_to_exclude:
@@ -1917,6 +1911,7 @@ IMPORTANT BEHAVIORS:
         if switch_result and len(switch_result) == 2:
             exclude_entity, desired_entity = switch_result
             logger.info(f"🔄 Detected switch: {exclude_entity} → {desired_entity}")
+            constraints_changed = True
 
             await self.constraints_manager.update_constraints(
                 session_id,
@@ -1933,13 +1928,15 @@ IMPORTANT BEHAVIORS:
 
         if time_window:
             logger.info(f"📅 Normalized time window: {time_window[2]}")
+            constraints_changed = True
             await self.constraints_manager.update_constraints(
                 session_id,
                 time_window=time_window
             )
 
-        # Return updated constraints
-        return await self.constraints_manager.get_constraints(session_id)
+        # Return updated constraints and change flag
+        constraints = await self.constraints_manager.get_constraints(session_id)
+        return constraints, constraints_changed
 
     def _build_constraints_section(self, constraints: ConversationConstraints) -> str:
         """

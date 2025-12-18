@@ -648,7 +648,8 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
                         "instance_name": actual_instance,
                         "user_name": push_name,
                         "whatsapp_message_id": key.get("id"),
-                        "session_id": session_id
+                        "session_id": session_id,
+                        "organization_id": actual_organization_id  # For metrics logging
                     }
                 )
 

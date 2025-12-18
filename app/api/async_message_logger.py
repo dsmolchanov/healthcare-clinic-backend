@@ -133,6 +133,8 @@ class AsyncMessageLogger:
                 metrics_payload = {
                     'message_id': message_id,
                     'session_id': session_id,
+                    'organization_id': organization_id,  # Required by table constraint
+                    'clinic_id': clinic_id,
                     'llm_provider': llm_provider,
                     'llm_model': llm_model,
                     'llm_tokens_input': llm_tokens_input,
