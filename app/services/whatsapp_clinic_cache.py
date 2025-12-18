@@ -297,10 +297,11 @@ class WhatsAppClinicCache:
             logger.info(f"🔥 Warming WhatsApp cache for {len(integrations)} instance(s)...")
 
             # Batch clinic lookup to avoid N+1
-            clinic_ids = [i['clinic_id'] for i in integrations]
+            # Filter out None values to prevent "invalid input syntax for type uuid" error
+            clinic_ids = [i['clinic_id'] for i in integrations if i.get('clinic_id')]
             clinics_result = supabase.table('clinics').select(
                 'id, organization_id, name'
-            ).in_('id', clinic_ids).execute()
+            ).in_('id', clinic_ids).execute() if clinic_ids else type('obj', (object,), {'data': []})()
 
             clinics_by_id = {c['id']: c for c in (clinics_result.data or [])}
 
