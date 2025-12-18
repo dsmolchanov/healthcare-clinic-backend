@@ -1,13 +1,22 @@
 """
-Language Processing Service
+Language Processing Service - SINGLE SOURCE OF TRUTH
+
+This is the CANONICAL language detection service.
+All components must use this service for language detection.
 
 Features:
 - Fast language detection (<10ms) with caching
+- Synchronous detection for non-async contexts
+- Character-based detection (Cyrillic, Hebrew, Spanish markers)
+- ML-based detection via langdetect library
 - Fuzzy service alias matching (rapidfuzz, threshold 0.88)
-- I18N template rendering (Jinja2, ru/es/en)
+- I18N template rendering (Jinja2, ru/es/en/he/pt)
 - Currency formatting (Babel)
 
-Language support: Russian (ru), Spanish (es), English (en)
+Language support: Russian (ru), Spanish (es), English (en), Hebrew (he), Portuguese (pt)
+
+IMPORTANT: Do NOT create separate language detection functions elsewhere.
+Use LanguageService.detect_sync() for synchronous contexts.
 """
 
 import logging
@@ -26,26 +35,37 @@ langdetect.DetectorFactory.seed = 0
 
 class LanguageService:
     """
-    Language processing service for multilingual support
+    CANONICAL language processing service for multilingual support.
+
+    This is the SINGLE SOURCE OF TRUTH for language detection.
+    Do NOT create duplicate detection functions elsewhere.
 
     Features:
-    - Language detection with Redis caching
+    - Language detection with Redis caching (async)
+    - Synchronous detection for non-async contexts
+    - Character-based fast detection (Cyrillic, Hebrew)
+    - Keyword-based detection (Spanish, Portuguese markers)
+    - ML-based fallback via langdetect library
     - Fuzzy alias matching for service names
     - I18N template rendering
     - Currency formatting per locale
     """
 
-    def __init__(self, redis_client, templates_dir: str = "templates"):
+    # Supported languages (ISO 639-1 codes)
+    SUPPORTED_LANGUAGES = {'en', 'es', 'ru', 'he', 'pt'}
+    DEFAULT_LANGUAGE = 'es'
+
+    def __init__(self, redis_client=None, templates_dir: str = "templates"):
         """
         Initialize language service
 
         Args:
-            redis_client: Redis client for caching
+            redis_client: Redis client for caching (optional for sync-only usage)
             templates_dir: Directory containing I18N templates
         """
         self.redis = redis_client
-        self.supported_languages = {'ru', 'es', 'en'}
-        self.default_language = 'es'
+        self.supported_languages = self.SUPPORTED_LANGUAGES
+        self.default_language = self.DEFAULT_LANGUAGE
 
         # Initialize Jinja2 for templates
         try:
@@ -74,41 +94,117 @@ class LanguageService:
         """Generate cache key for detected language"""
         return f"lang:{phone_hash}"
 
+    def detect_sync(self, text: str) -> str:
+        """
+        Synchronous language detection without caching.
+
+        Use this for non-async contexts (e.g., response formatting, intent routing).
+        For async contexts with caching, use detect_and_cache().
+
+        Args:
+            text: Text to detect language from
+
+        Returns:
+            ISO language code (en, es, ru, he, pt)
+        """
+        if not text or not text.strip():
+            return self.default_language
+
+        # Fast character-based detection first
+        char_result = self._detect_by_characters(text)
+        if char_result and char_result != 'en':
+            # Non-English detected with confidence (Cyrillic, Hebrew, etc.)
+            return char_result
+
+        # Fall back to langdetect for English/Spanish/Portuguese disambiguation
+        return self._detect_by_langdetect(text)
+
+    def _detect_by_characters(self, text: str) -> Optional[str]:
+        """
+        Fast Unicode character-based detection.
+
+        This is the first pass - detects languages with distinctive scripts.
+        Returns None for ambiguous cases (let langdetect handle).
+        """
+        if not text:
+            return None
+
+        text_len = len(text)
+        if text_len == 0:
+            return None
+
+        # Count Cyrillic characters → Russian
+        cyrillic = sum(1 for c in text if '\u0400' <= c <= '\u04FF')
+        if cyrillic / text_len > 0.3:
+            return 'ru'
+
+        # Count Hebrew characters → Hebrew
+        hebrew = sum(1 for c in text if '\u0590' <= c <= '\u05FF')
+        if hebrew / text_len > 0.3:
+            return 'he'
+
+        # Check Portuguese FIRST (more unique markers like 'você')
+        # Portuguese has distinct markers that don't overlap with Spanish
+        text_lower = text.lower()
+        # Note: 'quanto' is Portuguese (Spanish is 'cuánto' with accent)
+        portuguese_markers = ['você', 'obrigado', 'olá', 'não', 'quanto']
+        if any(m in text_lower for m in portuguese_markers):
+            return 'pt'
+
+        # Spanish indicators (keyword-based for Latin scripts)
+        # Note: 'está' removed as it overlaps with Portuguese
+        spanish_markers = ['hola', 'gracias', 'señor', 'qué', 'cómo', 'cuánto', 'cuándo', 'dónde']
+        if any(m in text_lower for m in spanish_markers):
+            return 'es'
+
+        # Default to English for Latin script without markers
+        return 'en'
+
+    def _detect_by_langdetect(self, text: str) -> str:
+        """
+        ML-based detection via langdetect library.
+
+        Used as fallback when character-based detection is ambiguous.
+        """
+        try:
+            detected = langdetect.detect(text)
+            return detected if detected in self.supported_languages else self.default_language
+        except Exception:
+            return self.default_language
+
     async def detect_and_cache(self, message: str, phone_hash: str) -> str:
         """
-        Detect language with caching for performance
+        Detect language with caching for performance.
+
+        Async version with Redis caching. Use detect_sync() for non-async contexts.
 
         Args:
             message: Text message to detect language from
             phone_hash: Hashed phone number for cache key
 
         Returns:
-            Language code (ru/es/en)
+            Language code (ru/es/en/he/pt)
         """
         # Check cache first
-        cache_key = self._make_language_cache_key(phone_hash)
-        cached_lang = self.redis.get(cache_key)
+        if self.redis:
+            cache_key = self._make_language_cache_key(phone_hash)
+            cached_lang = self.redis.get(cache_key)
 
-        if cached_lang:
-            lang = cached_lang.decode() if isinstance(cached_lang, bytes) else cached_lang
-            logger.debug(f"✅ Language cache HIT: {lang} for {phone_hash[:8]}...")
-            return lang
+            if cached_lang:
+                lang = cached_lang.decode() if isinstance(cached_lang, bytes) else cached_lang
+                logger.debug(f"✅ Language cache HIT: {lang} for {phone_hash[:8]}...")
+                return lang
 
-        # Detect language (fast, <10ms)
+        # Detect language using unified detection
         start_time = time.time()
-        try:
-            detected = langdetect.detect(message)
-            # Normalize to supported languages
-            lang = detected if detected in self.supported_languages else self.default_language
-        except Exception as e:
-            logger.warning(f"Language detection failed: {e}, using default")
-            lang = self.default_language
-
+        lang = self.detect_sync(message)
         detection_ms = (time.time() - start_time) * 1000
         logger.info(f"🌐 Detected language: {lang} in {detection_ms:.2f}ms")
 
         # Cache for 30 days (language preference rarely changes)
-        self.redis.setex(cache_key, 30 * 24 * 3600, lang)
+        if self.redis:
+            cache_key = self._make_language_cache_key(phone_hash)
+            self.redis.setex(cache_key, 30 * 24 * 3600, lang)
 
         return lang
 

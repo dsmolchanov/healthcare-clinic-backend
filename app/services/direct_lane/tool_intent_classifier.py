@@ -6,6 +6,7 @@ import re
 from enum import Enum
 import time
 import logging
+from app.services.language_service import LanguageService
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,8 @@ class ToolIntentClassifier:
     }
 
     def __init__(self):
+        # Initialize LanguageService for unified detection
+        self.language_service = LanguageService()
         # Compile patterns for performance
         self._compiled_patterns = {}
         for lang, patterns in self.PATTERNS.items():
@@ -130,8 +133,8 @@ class ToolIntentClassifier:
         start_time = time.time()
         message_lower = message.lower()
 
-        # Detect language (fast keyword check)
-        language = self._detect_language(message_lower)
+        # Detect language using LanguageService (single source of truth)
+        language = self.language_service.detect_sync(message_lower)
 
         # Get patterns for detected language
         patterns = self._compiled_patterns.get(language, self._compiled_patterns["en"])
@@ -167,13 +170,8 @@ class ToolIntentClassifier:
             duration_ms=duration_ms
         )
 
-    def _detect_language(self, message: str) -> str:
-        """Detect language from message (fast keyword check)"""
-        if any(word in message for word in ["qué", "cuándo", "dónde", "cuánto", "cómo"]):
-            return "es"
-        if any(word in message for word in ["quanto", "quando", "onde", "como"]):
-            return "pt"
-        return "en"
+    # NOTE: _detect_language was removed in Phase 1B.
+    # Use self.language_service.detect_sync() instead (single source of truth).
 
     def _match_faq(
         self,

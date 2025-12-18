@@ -580,19 +580,8 @@ DO NOT attempt to answer complex questions yourself.
                 logger.info(f"Fast-path failed or requested fallback, proceeding to LLM")
 
         # Phase 2: Extract and update constraints from user message
-        # Use simple language detection from message (before full LLM call)
-        def detect_language_simple(text: str) -> str:
-            """Simple language detection based on character sets"""
-            if any(c in text for c in 'абвгдежзийклмнопрстуфхцчшщъыьэюя'):
-                return 'ru'
-            elif any(c in text for c in 'áéíóúñü'):
-                return 'es'
-            elif any('\u0590' <= c <= '\u05FF' for c in text):
-                return 'he'
-            else:
-                return 'en'
-
-        detected_language_prelim = detect_language_simple(request.body)
+        # Use LanguageService for unified language detection (single source of truth)
+        detected_language_prelim = language_service.detect_sync(request.body)
 
         # Check for meta-reset command FIRST (before constraint extraction)
         if self.constraint_extractor.detect_meta_reset(request.body, detected_language_prelim):
@@ -924,7 +913,7 @@ DO NOT attempt to answer complex questions yourself.
         sunday_hours = hours.get('sunday') or "Not provided"
 
         # Get current date/time context for the LLM
-        from datetime import datetime
+        # from datetime import datetime # REMOVED: Uses module-level datetime which can be mocked
         now = datetime.now()
         current_date = now.strftime('%Y-%m-%d')
         current_day = now.strftime('%A')  # e.g., "Sunday"
@@ -1102,6 +1091,12 @@ ENFORCEMENT RULES:
         if previous_session_summary:
             previous_summary_section = f"\n\nPREVIOUS SESSION CONTEXT:\n{previous_session_summary}\n(Use this context if relevant, but prioritize current user request)"
 
+        # Calculate tomorrow for explicit context
+        from datetime import timedelta
+        tomorrow = now + timedelta(days=1)
+        tomorrow_date = tomorrow.strftime('%Y-%m-%d')
+        tomorrow_day = tomorrow.strftime('%A')
+
         # Construct System Prompt
         system_prompt = f"""You are a helpful AI assistant for {clinic_name}.
 Your goal is to assist patients with booking appointments, checking availability, and answering questions about the clinic.
@@ -1119,11 +1114,12 @@ Business Hours:
 
 CURRENT DATE/TIME:
 - Today: {current_day}, {current_date}
+- Tomorrow: {tomorrow_day}, {tomorrow_date}
 - Current Time: {current_time}
 - Today's Hours: {todays_hours}
 
 DATE CALCULATION RULES:
-- "Tomorrow" = {current_date} + 1 day
+- "Tomorrow" = {tomorrow_date} ({tomorrow_day})
 - "Next Tuesday" = The first Tuesday AFTER today ({current_date}).
   - Example: If today is Monday, "Next Tuesday" is tomorrow + 7 days (next week).
   - Example: If today is Wednesday, "Next Tuesday" is the upcoming Tuesday (in 6 days).
@@ -1174,7 +1170,7 @@ Instructions:
 
 **CRITICAL - DOCTOR IDS**:
    - **General Availability**: If the user asks for availability without naming a doctor, call check_availability WITHOUT a doctor_id. DO NOT call get_clinic_info first.
-   - **Specific Doctor**: If the user specifically requests a doctor by name, check the "CLINIC STAFF (DOCTORS)" list above for their ID. If found, use that ID directly in check_availability. Only call get_clinic_info if the doctor is NOT in the list.
+   - **Specific Doctor**: If the user specifically requests a doctor by name, you MUST obtain their ID first. Check the "CLINIC STAFF (DOCTORS)" list above. If found, use that ID. If NOT found, you MUST call get_clinic_info to find the ID. DO NOT call check_availability without a doctor_id if the user requested a specific doctor.
    - **Implied Service (CRITICAL)**: If the user requests a specific doctor but doesn't specify a service (e.g., "I want to see Dr. Shtern"), **YOU MUST ASSUME "Consultation"**. Call check_availability immediately with service_name="Consultation". **DO NOT ASK "what service?"**. This is a strict rule.
    - **Date Logic**: If user says "next Tuesday", calculate the date based on "Today" (provided in context) and pass the specific YYYY-MM-DD string to check_availability.
    - **Phone Number**: You have the user's phone number: {phone_number}. Use this number for the `book_appointment` tool. **DO NOT ASK the user for their phone number.**
@@ -1269,10 +1265,21 @@ IMPORTANT BEHAVIORS:
                     # Loop for multi-step tool execution (max 5 turns)
                     max_tool_turns = 5
                     current_turn = 0
-                    
+
+                    # Phase 1A: Initialize prior_tool_results per message turn
+                    # This tracks results from prior tool calls for dependency validation
+                    prior_tool_results = {}
+
+                    # Reset ToolStateGate per-turn counters
+                    self.tool_executor.state_gate.reset_turn_counters()
+
+                    # Current state for tool permission validation (default to "idle" in AI path)
+                    # NOTE: In future Phase 3A, this will come from UnifiedStateManager
+                    current_flow_state = "idle"
+
                     while current_turn < max_tool_turns:
                         current_turn += 1
-                        
+
                         # Check if LLM wants to call tools
                         if llm_response.tool_calls and len(llm_response.tool_calls) > 0:
                             logger.info(f"LLM requesting {len(llm_response.tool_calls)} tool call(s) (Turn {current_turn})")
@@ -1294,12 +1301,16 @@ IMPORTANT BEHAVIORS:
                                 tool_name = tool_call.name
                                 tool_args = tool_call.arguments if isinstance(tool_call.arguments, dict) else json.loads(tool_call.arguments)
 
-                                result = await self.tool_executor.execute(
+                                # Phase 1A: Execute with full enforcement (state, dependencies, constraints)
+                                result, prior_tool_results = await self.tool_executor.execute(
                                     tool_call_id=tool_call.id,
                                     tool_name=tool_name,
                                     tool_args=tool_args,
                                     context=tool_context,
-                                    constraints=constraints
+                                    constraints=constraints,
+                                    current_state=current_flow_state,
+                                    tool_schemas=tool_schemas,
+                                    prior_tool_results=prior_tool_results
                                 )
                                 tool_results.append(result)
 

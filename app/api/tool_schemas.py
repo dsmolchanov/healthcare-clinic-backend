@@ -2,6 +2,17 @@
 Tool Schemas for LLM Function Calling
 
 Converts Python tools to OpenAI-compatible function schemas for LLM tool calling.
+
+x_meta contains orchestration metadata for hard enforcement:
+- allowed_states: FSM states where this tool is permitted
+- depends_on: Tools that must be called first
+- requires_prior_result: Fields required from prior tool results
+- max_calls_per_turn: Budget limit per message turn
+- danger_level: low/medium/high for safety gates
+- requires_confirmation: Whether user must confirm before execution
+
+IMPORTANT: x_meta.allowed_states is the SINGLE SOURCE OF TRUTH for tool permissions.
+ToolStateGate reads from here - do NOT create separate state-to-tools mappings.
 """
 
 from typing import List, Dict, Any
@@ -15,15 +26,10 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
         clinic_id: Clinic ID to configure tools for
 
     Returns:
-        List of OpenAI function calling format schemas:
-        {
-            "type": "function",
-            "function": {
-                "name": "query_service_prices",
-                "description": "Get pricing information for medical/dental services",
-                "parameters": {...}
-            }
-        }
+        List of OpenAI function calling format schemas with x_meta orchestration metadata.
+
+    NOTE: x_meta.allowed_states is the SINGLE SOURCE OF TRUTH for tool permissions.
+    ToolStateGate reads from here.
     """
     return [
         {
@@ -46,6 +52,19 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                     },
                     "required": ["query"]
                 }
+            },
+            "x_meta": {
+                "category": "information",
+                "priority": 5,
+                "allowed_states": [
+                    "idle", "greeting", "collecting_slots", "presenting_slots",
+                    "awaiting_clarification", "info_seeking"
+                ],
+                "depends_on": [],
+                "max_calls_per_turn": 3,
+                "danger_level": "low",
+                "version": "1.0.0",
+                "requires_confirmation": False
             }
         },
         {
@@ -64,6 +83,19 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                     },
                     "required": ["info_type"]
                 }
+            },
+            "x_meta": {
+                "category": "information",
+                "priority": 5,
+                "allowed_states": [
+                    "idle", "greeting", "collecting_slots", "presenting_slots",
+                    "awaiting_clarification", "info_seeking"
+                ],
+                "depends_on": [],
+                "max_calls_per_turn": 2,
+                "danger_level": "low",
+                "version": "1.0.0",
+                "requires_confirmation": False
             }
         },
 
@@ -102,6 +134,19 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                     },
                     "required": []
                 }
+            },
+            "x_meta": {
+                "category": "appointments",
+                "priority": 10,
+                "allowed_states": [
+                    "idle", "greeting", "collecting_slots", "presenting_slots",
+                    "awaiting_clarification"
+                ],
+                "depends_on": [],
+                "max_calls_per_turn": 2,
+                "danger_level": "low",
+                "version": "1.0.0",
+                "requires_confirmation": False
             }
         },
 
@@ -146,6 +191,19 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                     },
                     "required": ["patient_info", "service_id", "datetime_str"]
                 }
+            },
+            "x_meta": {
+                "category": "appointments",
+                "priority": 20,
+                "allowed_states": ["awaiting_confirmation", "booking"],
+                "depends_on": ["check_availability"],
+                "requires_prior_result": {
+                    "check_availability": ["service_id", "datetime_str", "doctor_id"]
+                },
+                "max_calls_per_turn": 1,
+                "danger_level": "high",
+                "version": "1.0.0",
+                "requires_confirmation": True
             }
         },
 
@@ -173,6 +231,19 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                     },
                     "required": ["appointment_id", "cancellation_reason"]
                 }
+            },
+            "x_meta": {
+                "category": "appointments",
+                "priority": 15,
+                "allowed_states": [
+                    "idle", "greeting", "collecting_slots", "presenting_slots",
+                    "awaiting_clarification", "completed"
+                ],
+                "depends_on": [],
+                "max_calls_per_turn": 1,
+                "danger_level": "medium",
+                "version": "1.0.0",
+                "requires_confirmation": True
             }
         },
 
@@ -204,6 +275,22 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                     },
                     "required": ["appointment_id", "new_datetime"]
                 }
+            },
+            "x_meta": {
+                "category": "appointments",
+                "priority": 15,
+                "allowed_states": [
+                    "idle", "greeting", "collecting_slots", "presenting_slots",
+                    "awaiting_clarification", "completed"
+                ],
+                "depends_on": ["check_availability"],
+                "requires_prior_result": {
+                    "check_availability": ["datetime_str"]
+                },
+                "max_calls_per_turn": 1,
+                "danger_level": "medium",
+                "version": "1.0.0",
+                "requires_confirmation": True
             }
         }
     ]

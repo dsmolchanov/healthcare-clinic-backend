@@ -5,6 +5,7 @@ import logging
 from typing import Optional, Dict, Any
 from enum import Enum
 from app.utils.feature_flags import is_fast_path_enabled
+from app.services.language_service import LanguageService
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,10 @@ INTENT_PATTERNS = {
 class IntentRouter:
     """Fast-path intent detection with 300-500ms budget"""
 
+    def __init__(self):
+        """Initialize with LanguageService for unified language detection."""
+        self.language_service = LanguageService()
+
     def detect_intent(self, text: str, language: str = "en") -> Intent:
         """
         Detect user intent using regex patterns (no LLM)
@@ -166,25 +171,8 @@ class IntentRouter:
         # We're just optimizing the most common ones first
         return None
 
-    def _detect_language(self, text: str) -> str:
-        """Fast language detection (no LLM)"""
-        text_lower = text.lower()
-
-        # Russian
-        if any(ord(c) >= 0x0400 and ord(c) <= 0x04FF for c in text):
-            return 'ru'
-        # Hebrew
-        if any(ord(c) >= 0x0590 and ord(c) <= 0x05FF for c in text):
-            return 'he'
-        # Spanish indicators
-        if any(word in text_lower for word in ['hola', 'gracias', 'señor', 'está', 'qué']):
-            return 'es'
-        # Portuguese
-        if any(word in text_lower for word in ['olá', 'obrigado', 'você', 'está']):
-            return 'pt'
-
-        # Default to English
-        return 'en'
+    # NOTE: _detect_language was removed in Phase 1B.
+    # Use self.language_service.detect_sync() instead (single source of truth).
 
     async def _handle_greeting(
         self,
@@ -197,7 +185,7 @@ class IntentRouter:
         Budget: <300ms
         """
         user_text = message.get('body', '')
-        lang = self._detect_language(user_text)
+        lang = self.language_service.detect_sync(user_text)
         session_id = context.get('session_id')
         user_phone = message.get('from_phone', 'unknown')
         clinic_id = context.get('clinic_id', '')
@@ -442,7 +430,7 @@ class IntentRouter:
         from app.memory.conversation_memory import get_memory_manager
 
         user_text = message.get('body', '')
-        lang = self._detect_language(user_text)
+        lang = self.language_service.detect_sync(user_text)
         session_id = context.get('session_id')
         user_phone = message.get('from_phone', 'unknown')
         clinic_id = context.get('clinic_id')
@@ -549,7 +537,7 @@ class IntentRouter:
         from app.config import get_redis_client
 
         user_text = message.get('body', '')
-        lang = self._detect_language(user_text)
+        lang = self.language_service.detect_sync(user_text)
         session_id = context.get('session_id')
         user_phone = message.get('from_phone', 'unknown')
         clinic_id = context.get('clinic_id', '')

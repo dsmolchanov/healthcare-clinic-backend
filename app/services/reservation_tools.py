@@ -71,7 +71,7 @@ class ReservationTools:
         preferred_date: Optional[str] = None,
         time_preference: Optional[str] = None,
         doctor_id: Optional[str] = None,
-        flexibility_days: int = 7
+        flexibility_days: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Check availability for a service with intelligent slot finding.
@@ -82,10 +82,28 @@ class ReservationTools:
             time_preference: Time preference (morning/afternoon/evening)
             doctor_id: Specific doctor ID if requested
             flexibility_days: Number of days to search for availability
+                              If not specified, auto-determined based on user specificity:
+                              - Specific date + time: 1 day
+                              - Specific date only: 2 days
+                              - No date preference: 7 days
 
         Returns:
             Dictionary with available slots and recommendations
         """
+        # Smart default for flexibility_days based on user specificity
+        if flexibility_days is None:
+            if preferred_date and time_preference:
+                # User specified both date AND time - very specific, search just that day
+                flexibility_days = 1
+                logger.info(f"User specified date+time, using flexibility_days=1")
+            elif preferred_date:
+                # User specified date but not time - search 2 days for flexibility
+                flexibility_days = 2
+                logger.info(f"User specified date only, using flexibility_days=2")
+            else:
+                # No specific date - use wider search
+                flexibility_days = 7
+                logger.info(f"No date preference, using flexibility_days=7")
         # P0 GUARD: Fail fast if doctor_id is None or "None" string
         if doctor_id is not None and (doctor_id == "None" or str(doctor_id).strip() == ""):
             logger.warning(
@@ -185,11 +203,15 @@ class ReservationTools:
                     f"(workload: {recommended_doctor.get('workload_label', 'unknown') if recommended_doctor else 'N/A'})"
                 )
 
-                # Aggregate slots from all eligible doctors, prioritizing least-busy
+                # Aggregate slots from top 3 eligible doctors (sorted by least-busy)
+                # This limits calendar queries from N*8days to 3*8days for faster response
                 slots = []
                 strategy = SchedulingStrategy.AI_OPTIMIZED
+                top_doctors = eligible_doctors[:3]  # Already sorted by workload_score DESC
 
-                for doctor in eligible_doctors:
+                logger.info(f"Checking availability for top {len(top_doctors)} doctors (of {len(eligible_doctors)} eligible)")
+
+                for doctor in top_doctors:
                     doctor_slots = await self.scheduler.find_available_slots(
                         service_id=service.get('id') if service else None,
                         start_date=start_date,

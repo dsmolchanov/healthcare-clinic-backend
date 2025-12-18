@@ -14,6 +14,7 @@ import asyncio
 from app.api.multilingual_message_processor import MessageRequest, MultilingualMessageProcessor
 from app.security.webhook_verification import verify_webhook_signature
 from app.services.message_router import MessageType  # Keep MessageType enum for logging
+from app.services.language_service import LanguageService
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -550,8 +551,9 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
                     await asyncio.sleep(quick_ack_delay)
 
                     # If we got here, the delay expired - send quick ack
-                    # Detect language for quick ack
-                    detected_language = detect_language_simple(text)
+                    # Detect language for quick ack (use LanguageService - single source of truth)
+                    language_service = LanguageService()
+                    detected_language = language_service.detect_sync(text)
                     print(f"[Background] Detected language: {detected_language}")
 
                     # Get language-specific quick ack message from agent config
@@ -1008,32 +1010,8 @@ def extract_org_id_from_instance(instance_name: str) -> str:
     return None
 
 
-def detect_language_simple(text: str) -> str:
-    """
-    Simple language detection based on character set
-
-    Returns:
-        Language code: 'ru', 'he', or 'en'
-    """
-    # Count Cyrillic characters
-    cyrillic_count = sum(1 for c in text if '\u0400' <= c <= '\u04FF')
-    # Count Hebrew characters
-    hebrew_count = sum(1 for c in text if '\u0590' <= c <= '\u05FF')
-
-    total_chars = len(text)
-    if total_chars == 0:
-        return "en"
-
-    # If more than 30% Cyrillic, it's Russian
-    if cyrillic_count / total_chars > 0.3:
-        return "ru"
-
-    # If more than 30% Hebrew, it's Hebrew
-    if hebrew_count / total_chars > 0.3:
-        return "he"
-
-    # Default to English
-    return "en"
+# NOTE: detect_language_simple was removed in Phase 1B.
+# Use LanguageService.detect_sync() instead (single source of truth).
 
 
 @router.get("/test")
