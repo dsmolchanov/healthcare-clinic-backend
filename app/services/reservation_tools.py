@@ -211,25 +211,47 @@ class ReservationTools:
 
                 logger.info(f"Checking availability for top {len(top_doctors)} doctors (of {len(eligible_doctors)} eligible)")
 
-                for doctor in top_doctors:
-                    doctor_slots = await self.scheduler.find_available_slots(
-                        service_id=service.get('id') if service else None,
-                        start_date=start_date,
-                        end_date=end_date,
-                        doctor_id=doctor['id'],
-                        duration_minutes=service.get('duration_minutes', 30) if service else 30,
-                        strategy=strategy
-                    )
+                # PARALLEL: Fire all doctor slot queries concurrently
+                async def get_doctor_slots(doctor):
+                    """Fetch slots for a single doctor and annotate with doctor info."""
+                    try:
+                        doctor_slots = await self.scheduler.find_available_slots(
+                            service_id=service.get('id') if service else None,
+                            start_date=start_date,
+                            end_date=end_date,
+                            doctor_id=doctor['id'],
+                            duration_minutes=service.get('duration_minutes', 30) if service else 30,
+                            strategy=strategy
+                        )
 
-                    # Add doctor info to each slot
-                    for slot in (doctor_slots or []):
-                        if isinstance(slot, dict):
-                            slot['doctor_id'] = doctor['id']
-                            slot['doctor_name'] = doctor['name']
-                            slot['doctor_specialization'] = doctor.get('specialization', '')
-                            slot['workload_score'] = doctor.get('workload_score', 0.5)
-                            slot['workload_label'] = doctor.get('workload_label', 'unknown')
-                            slots.append(slot)
+                        # Annotate slots with doctor info
+                        annotated_slots = []
+                        for slot in (doctor_slots or []):
+                            if isinstance(slot, dict):
+                                slot['doctor_id'] = doctor['id']
+                                slot['doctor_name'] = doctor['name']
+                                slot['doctor_specialization'] = doctor.get('specialization', '')
+                                slot['workload_score'] = doctor.get('workload_score', 0.5)
+                                slot['workload_label'] = doctor.get('workload_label', 'unknown')
+                                annotated_slots.append(slot)
+                        return annotated_slots
+                    except Exception as e:
+                        logger.error(f"Error getting slots for doctor {doctor['id']}: {e}")
+                        return []
+
+                # Run all doctor queries in parallel
+                slot_results = await asyncio.gather(
+                    *[get_doctor_slots(doctor) for doctor in top_doctors],
+                    return_exceptions=True
+                )
+
+                # Flatten results
+                for result in slot_results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Parallel slot query failed: {result}")
+                        continue
+                    if result:
+                        slots.extend(result)
 
                 # Sort slots by workload_score (higher = less busy = better) then by datetime
                 slots.sort(
