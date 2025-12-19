@@ -452,10 +452,32 @@ Parameters: {params}
 
 DO:
 - Call check_availability with EXACTLY these parameters
-- Present results naturally to user
+- Present results naturally to user following SLOT PRESENTATION RULES below
 DO NOT:
 - Ask for more information first
 - Modify the parameters
+
+=== SLOT PRESENTATION RULES ===
+When presenting availability results:
+
+1. GROUP BY TIME: Never list the same time multiple times for different doctors.
+   - BAD: "8:00 with Dr. A, 8:00 with Dr. B, 8:00 with Dr. C"
+   - GOOD: "8:00 (several specialists available)" or just "8:00"
+
+2. HIDE DOCTOR NAMES INITIALLY: Unless user asked for a specific doctor, focus on TIME.
+   - Say: "I have openings at 8:00 and 8:45 tomorrow morning."
+   - NOT: "I have Dr. Mark at 8:00, Dr. Andrea at 8:00..."
+
+3. LIMIT OPTIONS: Present at most 2-3 distinct time options.
+   - If many slots: "I have good availability tomorrow morning between 8:00 and 11:00. Does 8:00 or 9:00 work better?"
+
+4. USE NATURAL LANGUAGE:
+   - "tomorrow morning at 8" not "2025-12-19 at 08:00"
+   - "Thursday afternoon" not "2025-12-19T14:00"
+
+5. ONE QUESTION AT A TIME:
+   - "Does 8:00 tomorrow work for you?"
+   - NOT: "I have 8:00, 8:45, 9:00, 9:30, 10:00 - which one?"
 === END CONTROL ===
 """
 
