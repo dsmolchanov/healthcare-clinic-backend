@@ -51,15 +51,18 @@ class AvailabilityHandler(ToolHandler):
 
     def _format_clustered_slots(self, slots: list, result: dict) -> str:
         """
-        Format slots in a clustered, human-friendly way.
+        Format slots for natural conversation - focus on ONE recommendation.
 
-        Groups slots by time (ignoring doctor), limits to 3-4 distinct times,
-        and provides a summary that helps the LLM present options naturally.
+        A real receptionist says: "Tomorrow at 9 works - should I book it?"
+        NOT: "Here are 10 options, pick one."
         """
-        from datetime import datetime
+        from datetime import datetime, date as date_type
         from collections import OrderedDict
 
-        # Cluster slots by (date, time) - ignore doctor for grouping
+        if not slots:
+            return "NO_AVAILABILITY: No slots found for this timeframe."
+
+        # Cluster slots by (date, time)
         time_clusters = OrderedDict()
 
         for slot in slots:
@@ -67,7 +70,6 @@ class AvailabilityHandler(ToolHandler):
             if not slot_datetime:
                 continue
 
-            # Parse datetime
             try:
                 dt = datetime.fromisoformat(slot_datetime.replace('Z', '+00:00'))
                 date_str = dt.strftime('%Y-%m-%d')
@@ -82,57 +84,52 @@ class AvailabilityHandler(ToolHandler):
                     'time': time_str,
                     'datetime': slot_datetime,
                     'doctors': [],
-                    'doctor_count': 0
+                    'doctor_ids': [],
+                    'weekday': dt.strftime('%A')
                 }
 
-            doctor_name = slot.get('doctor_name', 'Available specialist')
+            doctor_name = slot.get('doctor_name', 'specialist')
+            doctor_id = slot.get('doctor_id', '')
             if doctor_name not in time_clusters[cluster_key]['doctors']:
                 time_clusters[cluster_key]['doctors'].append(doctor_name)
-                time_clusters[cluster_key]['doctor_count'] += 1
+                time_clusters[cluster_key]['doctor_ids'].append(doctor_id)
 
         if not time_clusters:
-            return "No available slots found."
+            return "NO_AVAILABILITY: No valid slots found."
 
-        # Get unique dates
-        unique_dates = list(set(c['date'] for c in time_clusters.values()))
-        unique_dates.sort()
+        # Get the FIRST available slot as recommendation
+        first_slot = list(time_clusters.values())[0]
 
-        # Limit to first 4 distinct time slots
-        clustered_list = list(time_clusters.values())[:4]
+        # Format for natural language
+        slot_date = datetime.strptime(first_slot['date'], '%Y-%m-%d').date()
+        today = date_type.today()
 
-        # Build summary message for LLM
-        total_slots = len(slots)
-        unique_times = len(time_clusters)
+        # Relative date description
+        if slot_date == today:
+            date_desc = "today"
+        elif (slot_date - today).days == 1:
+            date_desc = "tomorrow"
+        elif (slot_date - today).days < 7:
+            date_desc = first_slot['weekday']  # "Monday", "Tuesday", etc.
+        else:
+            date_desc = first_slot['date']
 
-        # Format each clustered time slot
-        options = []
-        for cluster in clustered_list:
-            time_display = cluster['time']
-            if cluster['doctor_count'] > 1:
-                options.append(f"{cluster['date']} at {time_display} ({cluster['doctor_count']} specialists available)")
-            else:
-                options.append(f"{cluster['date']} at {time_display} with {cluster['doctors'][0]}")
+        time_desc = first_slot['time']
+        num_doctors = len(first_slot['doctors'])
 
-        # Build the result text
-        result_text = f"Found {total_slots} slots across {unique_times} time options.\n"
-        result_text += "Main options:\n"
-        for opt in options:
-            result_text += f"- {opt}\n"
+        # Build concise response for LLM
+        # Format: RECOMMENDATION | BACKUP_INFO
+        if num_doctors > 1:
+            result_text = f"RECOMMENDED: {date_desc} at {time_desc} ({num_doctors} specialists available)"
+        else:
+            result_text = f"RECOMMENDED: {date_desc} at {time_desc} with {first_slot['doctors'][0]}"
 
-        # Add note about more availability if there are more options
-        if unique_times > 4:
-            result_text += f"\n(Plus {unique_times - 4} more time options available if needed)"
+        # Add backup options count (don't list them)
+        total_options = len(time_clusters)
+        if total_options > 1:
+            result_text += f" | {total_options - 1} other time options available if needed"
 
-        # Add recommendation if present
-        if result.get('recommendation'):
-            rec = result['recommendation']
-            if isinstance(rec, dict):
-                rec_time = rec.get('datetime', rec.get('start_time', ''))
-                if rec_time:
-                    try:
-                        rec_dt = datetime.fromisoformat(rec_time.replace('Z', '+00:00'))
-                        result_text += f"\nRecommended: {rec_dt.strftime('%Y-%m-%d')} at {rec_dt.strftime('%H:%M')}"
-                    except (ValueError, AttributeError):
-                        pass
+        # Add booking info for next step
+        result_text += f"\n[BOOKING_DATA: date={first_slot['date']}, time={first_slot['time']}, doctor_id={first_slot['doctor_ids'][0]}]"
 
         return result_text

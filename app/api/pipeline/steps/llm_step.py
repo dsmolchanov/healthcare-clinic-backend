@@ -458,26 +458,25 @@ DO NOT:
 - Modify the parameters
 
 === SLOT PRESENTATION RULES ===
-When presenting availability results:
+The tool returns ONE recommended slot. Present it as a simple yes/no question:
 
-1. GROUP BY TIME: Never list the same time multiple times for different doctors.
-   - BAD: "8:00 with Dr. A, 8:00 with Dr. B, 8:00 with Dr. C"
-   - GOOD: "8:00 (several specialists available)" or just "8:00"
+GOOD RESPONSES:
+- "Завтра в 9 утра подойдёт?" (Russian)
+- "How about tomorrow at 9am?" (English)
+- "¿Le viene bien mañana a las 9?" (Spanish)
 
-2. HIDE DOCTOR NAMES INITIALLY: Unless user asked for a specific doctor, focus on TIME.
-   - Say: "I have openings at 8:00 and 8:45 tomorrow morning."
-   - NOT: "I have Dr. Mark at 8:00, Dr. Andrea at 8:00..."
+BAD RESPONSES (never do this):
+- "I found 10 slots: 9:00, 9:45, 10:30..." (listing options)
+- "Here are the available times..." (database dump)
+- "Which of these slots works for you?" (forcing choice)
 
-3. LIMIT OPTIONS: Present at most 2-3 distinct time options.
-   - If many slots: "I have good availability tomorrow morning between 8:00 and 11:00. Does 8:00 or 9:00 work better?"
+If user says NO or asks for different time:
+- Offer ONE alternative: "Тогда в 11:15?" / "How about 11:15 instead?"
 
-4. USE NATURAL LANGUAGE:
-   - "tomorrow morning at 8" not "2025-12-19 at 08:00"
-   - "Thursday afternoon" not "2025-12-19T14:00"
-
-5. ONE QUESTION AT A TIME:
-   - "Does 8:00 tomorrow work for you?"
-   - NOT: "I have 8:00, 8:45, 9:00, 9:30, 10:00 - which one?"
+ALWAYS:
+- Use the user's language (match their last message)
+- Keep response under 20 words
+- End with a confirmation question
 === END CONTROL ===
 """
 
