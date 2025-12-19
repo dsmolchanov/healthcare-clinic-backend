@@ -818,22 +818,20 @@ class IntelligentScheduler:
             days_to_search = (end_date - start_date).days + 1
             days_to_search = min(days_to_search, 14)  # Limit to 2 weeks
 
-            # Get available slots using the unified appointment service
-            slots = []
-            for day_offset in range(days_to_search):
-                check_date = (start_date + timedelta(days=day_offset)).strftime('%Y-%m-%d')
+            # PARALLEL: Get slots for all days concurrently
+            async def get_slots_for_day(check_date: str):
+                """Fetch slots for a single day."""
                 try:
-                    # Use the appointment service directly
                     day_slots = await self.appointment_service.get_available_slots(
-                        doctor_id=doctor_id,  # Pass None if not specified, not 'any'
+                        doctor_id=doctor_id,
                         date=check_date,
                         duration_minutes=duration_minutes
                     )
 
-                    # Convert TimeSlot objects to dictionaries if needed
+                    # Convert TimeSlot objects to dictionaries
+                    result_slots = []
                     for slot in day_slots:
                         if hasattr(slot, 'start_time'):
-                            # It's a TimeSlot object
                             slot_dict = {
                                 'datetime': slot.start_time.isoformat(),
                                 'doctor_id': slot.doctor_id if hasattr(slot, 'doctor_id') else doctor_id,
@@ -841,15 +839,36 @@ class IntelligentScheduler:
                                 'available': True
                             }
                         elif isinstance(slot, dict):
-                            # Already a dictionary
                             slot_dict = slot
                         else:
                             continue
-
-                        slots.append(slot_dict)
+                        result_slots.append(slot_dict)
+                    return result_slots
                 except Exception as e:
                     logger.warning(f"Failed to get slots for {check_date}: {e}")
+                    return []
+
+            # Create list of dates to check
+            dates_to_check = [
+                (start_date + timedelta(days=day_offset)).strftime('%Y-%m-%d')
+                for day_offset in range(days_to_search)
+            ]
+
+            # Fire all day queries in parallel
+            import asyncio
+            day_results = await asyncio.gather(
+                *[get_slots_for_day(date) for date in dates_to_check],
+                return_exceptions=True
+            )
+
+            # Flatten results
+            slots = []
+            for result in day_results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Day slot query failed: {result}")
                     continue
+                if result:
+                    slots.extend(result)
 
             return slots
 
