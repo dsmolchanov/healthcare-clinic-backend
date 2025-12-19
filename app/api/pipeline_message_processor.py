@@ -20,6 +20,7 @@ from app.api.pipeline.steps import (
     EscalationCheckStep,
     RoutingStep,
     ConstraintEnforcementStep,
+    NarrowingStep,
     LLMGenerationStep,
     PostProcessingStep,
 )
@@ -176,6 +177,9 @@ class PipelineMessageProcessor:
                 constraints_manager=self.constraints_manager,
                 profile_manager=self.profile_manager,
                 memory_manager=self.memory_manager
+            ),
+            NarrowingStep(
+                supabase_client=self._supabase
             ),
             LLMGenerationStep(
                 llm_factory_getter=self._get_llm_factory,

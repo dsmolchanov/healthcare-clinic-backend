@@ -17,8 +17,22 @@ from typing import Tuple, Dict, Any, List, Optional
 
 from ..base import PipelineStep
 from ..context import PipelineContext
+from app.domain.preferences.narrowing import NarrowingAction, NarrowingInstruction
 
 logger = logging.getLogger(__name__)
+
+
+# Question type to template mapping (LLM localizes based on user language)
+QUESTION_TEMPLATES = {
+    "ask_for_service": "Ask what service the user needs (e.g., cleaning, checkup, whitening)",
+    "ask_for_time": "Ask what day and time works best for the user",
+    "ask_for_doctor": "Ask if user prefers {doctor_names} or first available",
+    "ask_time_with_doctor": "Ask when user would like to see {doctor_name}",
+    "ask_time_with_service": "Ask when user would like their {service_name} appointment",
+    "ask_today_or_tomorrow": "Ask if user prefers today or tomorrow (urgent case)",
+    "suggest_consultation": "Explain no specialists for {service_name}, suggest general consultation",
+    "ask_first_available": "Ask if user prefers {doctor_names} or first availability",
+}
 
 
 class LLMGenerationStep(PipelineStep):
@@ -246,6 +260,12 @@ BOOKING FLOW:
             if constraints_section:
                 system_prompt += f"\n\n{constraints_section}"
 
+        # Add narrowing control block at the beginning (most important)
+        if ctx.narrowing_instruction:
+            control_block = self._build_narrowing_control_block(ctx.narrowing_instruction)
+            if control_block:
+                system_prompt = control_block + "\n\n" + system_prompt
+
         return system_prompt
 
     def _build_doctors_text(self, doctors_list: List) -> str:
@@ -387,6 +407,59 @@ ENFORCEMENT RULES:
         lines.append("\nIMPORTANT: These constraints OVERRIDE all other context.\n")
 
         return "\n".join(lines)
+
+    def _build_narrowing_control_block(self, instruction: Optional[NarrowingInstruction]) -> str:
+        """Build control block for LLM based on narrowing instruction."""
+        if not instruction:
+            return ""
+
+        if instruction.action == NarrowingAction.ASK_QUESTION:
+            # Build question guidance from type + args
+            question_type_str = instruction.question_type.value if instruction.question_type else ""
+            template = QUESTION_TEMPLATES.get(question_type_str, "Ask a clarifying question")
+
+            # Format template with args, handling missing keys gracefully
+            try:
+                question_guidance = template.format(**instruction.question_args)
+            except KeyError:
+                question_guidance = template
+
+            return f"""
+=== BOOKING CONTROL ===
+Case: {instruction.case}
+Action: ASK_QUESTION
+Question Type: {instruction.question_type}
+Guidance: {question_guidance}
+Args: {instruction.question_args}
+
+DO:
+- Ask this question in natural language, matching user's language
+- Wait for user's answer before proceeding
+DO NOT:
+- Call check_availability
+- Ask multiple questions at once
+=== END CONTROL ===
+"""
+
+        elif instruction.action == NarrowingAction.CALL_TOOL:
+            params = instruction.tool_call.params if instruction.tool_call else {}
+            return f"""
+=== BOOKING CONTROL ===
+Case: {instruction.case}
+Action: CALL_TOOL
+Tool: check_availability
+Parameters: {params}
+
+DO:
+- Call check_availability with EXACTLY these parameters
+- Present results naturally to user
+DO NOT:
+- Ask for more information first
+- Modify the parameters
+=== END CONTROL ===
+"""
+
+        return ""
 
     def _build_messages(self, system_prompt: str, ctx: PipelineContext) -> List[Dict]:
         """Build messages list for LLM."""

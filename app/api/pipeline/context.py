@@ -8,10 +8,13 @@ Phase 2A of the Agentic Flow Architecture Refactor.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any, Set, Tuple
+from typing import Optional, Dict, List, Any, Set, Tuple, TYPE_CHECKING
 from datetime import datetime
 
 from app.services.conversation_constraints import ConversationConstraints
+
+if TYPE_CHECKING:
+    from app.domain.preferences.narrowing import NarrowingInstruction
 
 
 @dataclass
@@ -77,6 +80,9 @@ class PipelineContext:
     # ===== Constraints (set by ConstraintEnforcementStep) =====
     constraints: Optional[ConversationConstraints] = None
     constraints_changed: bool = False
+
+    # ===== Narrowing instruction (set by NarrowingStep) =====
+    narrowing_instruction: Optional['NarrowingInstruction'] = None
 
     # ===== Routing decision (set by RoutingStep) =====
     lane: Optional[str] = None  # FAQ, PRICE, SERVICE_INFO, SCHEDULING, COMPLEX
