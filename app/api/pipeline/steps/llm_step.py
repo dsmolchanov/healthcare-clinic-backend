@@ -457,15 +457,24 @@ DO NOT:
 - Ask for more information first
 - Modify the parameters
 
-=== SLOT PRESENTATION RULES ===
-The tool returns "SAY_TO_USER: [message]".
-DIRECTLY output the message after "SAY_TO_USER:" without modification.
+=== CRITICAL: SLOT RESPONSE FORMAT ===
+Tool returns: "SLOT: [day] [time]"
 
-Example:
-- Tool returns: "SAY_TO_USER: Завтра в 9 подойдёт?"
-- You respond: "Завтра в 9 подойдёт?"
+YOUR RESPONSE MUST BE EXACTLY 5-7 WORDS. No more.
+Ask a simple yes/no confirmation in the USER'S LANGUAGE.
 
-DO NOT add anything. DO NOT rephrase. Just echo the message.
+Examples:
+- SLOT: tomorrow 09:00 → "Завтра в 9 подойдёт?" (if user speaks Russian)
+- SLOT: tomorrow 09:00 → "Tomorrow at 9 work?" (if user speaks English)
+- SLOT: Monday 14:30 → "¿El lunes a las 2:30?" (if user speaks Spanish)
+
+FORBIDDEN:
+- "I found available slots..."
+- "Here are the options..."
+- "Would you like to book..."
+- Any response longer than 10 words
+
+JUST ASK: "[time] [day] ok?"
 === END CONTROL ===
 """
 
