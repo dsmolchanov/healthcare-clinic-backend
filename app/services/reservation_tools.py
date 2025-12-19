@@ -42,24 +42,34 @@ class ReservationTools:
     managing holds, and handling cancellations.
     """
 
-    def __init__(self, clinic_id: str, patient_id: Optional[str] = None):
+    def __init__(self, clinic_id: str, patient_id: Optional[str] = None, business_hours: Optional[Dict] = None):
         """
         Initialize reservation tools with clinic context.
 
         Args:
             clinic_id: ID of the clinic
             patient_id: Optional patient ID for personalized operations
+            business_hours: Pre-loaded business hours from clinic warmup (avoids DB fetch)
         """
         self.clinic_id = clinic_id
         self.patient_id = patient_id
+        self.business_hours = business_hours or {}
         self.supabase = create_supabase_client()
 
-        # Initialize services
+        # Initialize services with pre-loaded business hours
         # Phase C: Removed deprecated AppointmentBookingService
         # self.booking_service = AppointmentBookingService(supabase_client=self.supabase)
-        self.unified_service = UnifiedAppointmentService(supabase=self.supabase, clinic_id=clinic_id)
+        self.unified_service = UnifiedAppointmentService(
+            supabase=self.supabase,
+            clinic_id=clinic_id,
+            business_hours=business_hours
+        )
         self.calendar_service = ExternalCalendarService(supabase=self.supabase)
-        self.scheduler = IntelligentScheduler(supabase=self.supabase, clinic_id=clinic_id)
+        self.scheduler = IntelligentScheduler(
+            supabase=self.supabase,
+            clinic_id=clinic_id,
+            business_hours=business_hours
+        )
         self.conflict_detector = RealtimeConflictDetector()
         self.session_manager = RedisSessionManager()
 

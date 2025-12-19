@@ -96,7 +96,7 @@ class IntelligentScheduler:
     Uses machine learning, historical data, and heuristics for optimal scheduling
     """
 
-    def __init__(self, supabase: Client = None, clinic_id: str = None):
+    def __init__(self, supabase: Client = None, clinic_id: str = None, business_hours: Dict = None):
         if supabase:
             self.supabase = supabase
         else:
@@ -105,7 +105,13 @@ class IntelligentScheduler:
                 os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
             )
         self.clinic_id = clinic_id
-        self.appointment_service = UnifiedAppointmentService(supabase=self.supabase, clinic_id=clinic_id)
+        self.business_hours = business_hours or {}
+        # Pass pre-loaded business hours to avoid DB fetch
+        self.appointment_service = UnifiedAppointmentService(
+            supabase=self.supabase,
+            clinic_id=clinic_id,
+            business_hours=business_hours
+        )
         self.calendar_service = ExternalCalendarService(supabase=self.supabase)
 
         # Scheduling weights for optimization

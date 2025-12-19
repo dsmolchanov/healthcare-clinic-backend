@@ -535,10 +535,15 @@ JUST ASK: "[time] [day] ok?"
                 if llm_response.tool_calls and len(llm_response.tool_calls) > 0:
                     logger.info(f"LLM requesting {len(llm_response.tool_calls)} tool call(s) (Turn {current_turn})")
 
+                    # Get business_hours from already-hydrated clinic_profile (no extra DB call)
+                    clinic_profile = ctx.clinic_profile or {}
+                    business_hours = clinic_profile.get('business_hours') or clinic_profile.get('hours') or {}
+
                     tool_context = {
                         'clinic_id': ctx.effective_clinic_id,
                         'phone_number': ctx.from_phone,
                         'session_history': ctx.session_messages,
+                        'business_hours': business_hours,  # From warmup, no extra DB fetch
                         'supabase_client': None,  # Will be set by executor
                         'calendar_calls_made': 0,
                         'max_calendar_calls': 10

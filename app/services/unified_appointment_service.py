@@ -82,7 +82,7 @@ class UnifiedAppointmentService:
     Integrates with external calendar coordination for comprehensive scheduling
     """
 
-    def __init__(self, supabase: Client = None, clinic_id: str = None):
+    def __init__(self, supabase: Client = None, clinic_id: str = None, business_hours: Dict = None):
         if supabase:
             self.supabase = supabase
         else:
@@ -97,7 +97,8 @@ class UnifiedAppointmentService:
         self.calendar_service = ExternalCalendarService(supabase=self.supabase)
         self.default_appointment_duration = timedelta(minutes=30)
         self.clinic_id = clinic_id
-        self._business_hours_cache = None  # Cache business hours per session
+        # Use pre-loaded business hours from warmup (avoids DB fetch)
+        self._business_hours_cache = business_hours if business_hours else None
 
     async def get_available_slots(
         self,
