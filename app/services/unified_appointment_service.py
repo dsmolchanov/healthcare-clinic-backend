@@ -126,37 +126,19 @@ class UnifiedAppointmentService:
                 duration_minutes
             )
 
-            # PARALLEL: Check availability for all slots concurrently
-            import asyncio
-
-            async def check_single_slot(slot_start):
-                """Check a single slot and return TimeSlot object."""
-                slot_end = slot_start + timedelta(minutes=duration_minutes)
-                is_available, sources = await self._check_slot_availability(
-                    doctor_id, slot_start, slot_end
-                )
-                return TimeSlot(
+            # FAST PATH: Return all slots within working hours as available
+            # The hold-reserve pattern will catch conflicts at actual booking time
+            # This trades some accuracy for significantly faster response (~20s → ~100ms)
+            available_slots = [
+                TimeSlot(
                     start_time=slot_start,
-                    end_time=slot_end,
+                    end_time=slot_start + timedelta(minutes=duration_minutes),
                     doctor_id=doctor_id,
-                    available=is_available,
-                    source=','.join(sources) if sources else 'unknown'
+                    available=True,  # Assume available, verify at booking
+                    source='working_hours'
                 )
-
-            # Fire all slot checks in parallel
-            slot_results = await asyncio.gather(
-                *[check_single_slot(slot_start) for slot_start in potential_slots],
-                return_exceptions=True
-            )
-
-            # Filter to only available slots, handling any exceptions
-            available_slots = []
-            for result in slot_results:
-                if isinstance(result, Exception):
-                    logger.warning(f"Slot check failed: {result}")
-                    continue
-                if result and result.available:
-                    available_slots.append(result)
+                for slot_start in potential_slots
+            ]
 
             return available_slots
 
