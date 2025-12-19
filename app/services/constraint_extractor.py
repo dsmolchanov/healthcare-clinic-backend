@@ -53,6 +53,20 @@ class ConstraintExtractor:
         'he': ['במקום', 'עדיף', 'רוצה']
     }
 
+    # Time-related keywords for extraction
+    TOMORROW_KEYWORDS = ['завтра', 'tomorrow', 'mañana', 'מחר']
+    TODAY_KEYWORDS = ['сегодня', 'today', 'hoy', 'היום']
+
+    # Time extraction patterns (captures hour)
+    TIME_PATTERNS = [
+        r'(\d{1,2})\s*(?:утра|am|часов?|ч\.?)',  # 11 утра, 11am, 11 часов
+        r'в\s*(\d{1,2})(?:\s|$|,|\.|:)',  # в 11
+        r'на\s*(\d{1,2})(?:\s|$|,|\.)',  # на 11
+        r'at\s*(\d{1,2})',  # at 11
+        r'^(\d{1,2})$',  # Just "11" alone
+        r',\s*(\d{1,2})(?:\s|$)',  # "Завтра, 11"
+    ]
+
     def detect_meta_reset(self, message: str, language: str = 'ru') -> bool:
         """
         Detect if user wants to reset conversation context entirely.
@@ -183,6 +197,54 @@ class ConstraintExtractor:
                 return (exclude_entity, desired_entity)
 
         return None
+
+    def extract_date_time(self, message: str, reference_date: datetime, language: str = 'ru') -> Optional[Dict[str, Any]]:
+        """
+        Extract date and time from user message.
+
+        Args:
+            message: User message like "Завтра, 11" or "mañana a las 10"
+            reference_date: Current date for calculation
+            language: Language code
+
+        Returns:
+            Dict with:
+            - date: "2025-12-19" (ISO format)
+            - time: "11:00" or None
+            - display: "завтра в 11:00"
+        """
+        message_lower = message.lower().strip()
+        result = {'date': None, 'time': None, 'display': None}
+
+        # Extract date
+        if any(kw in message_lower for kw in self.TOMORROW_KEYWORDS):
+            target_date = reference_date + timedelta(days=1)
+            result['date'] = target_date.strftime('%Y-%m-%d')
+            result['display'] = 'завтра' if language == 'ru' else 'tomorrow'
+        elif any(kw in message_lower for kw in self.TODAY_KEYWORDS):
+            result['date'] = reference_date.strftime('%Y-%m-%d')
+            result['display'] = 'сегодня' if language == 'ru' else 'today'
+
+        # Extract time
+        for pattern in self.TIME_PATTERNS:
+            match = re.search(pattern, message_lower)
+            if match:
+                hour = int(match.group(1))
+                if 0 <= hour <= 23:
+                    # Assume AM for hours 6-11 if no AM/PM specified
+                    result['time'] = f"{hour:02d}:00"
+                    if result['display']:
+                        result['display'] += f" в {hour}:00" if language == 'ru' else f" at {hour}:00"
+                    else:
+                        result['display'] = f"{hour}:00"
+                    break
+
+        # Return None if nothing was extracted
+        if result['date'] is None and result['time'] is None:
+            return None
+
+        logger.info(f"📅 Extracted date/time from '{message}': {result}")
+        return result
 
     def normalize_time_window(self, time_expression: str, reference_date: datetime, language: str = 'ru') -> Optional[Tuple[str, str, str]]:
         """

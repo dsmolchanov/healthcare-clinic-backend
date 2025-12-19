@@ -1956,10 +1956,41 @@ IMPORTANT BEHAVIORS:
                 exclude_service=exclude_entity
             )
 
-        # Detect time window normalization
+        # Get current time in clinic timezone for date extraction
+        try:
+            import pytz
+            clinic_tz = pytz.timezone('America/Cancun')
+            now = datetime.now(clinic_tz)
+        except Exception:
+            now = datetime.now()
+
+        # Detect date/time expressions (today, tomorrow, specific hours)
+        date_time_result = self.constraint_extractor.extract_date_time(
+            message,
+            now,
+            detected_language
+        )
+
+        if date_time_result:
+            logger.info(f"📅 Extracted date/time: {date_time_result}")
+            constraints_changed = True
+
+            # Build time window from extracted date/time
+            extracted_date = date_time_result.get('date')
+            extracted_time = date_time_result.get('time')
+            display = date_time_result.get('display', '')
+
+            if extracted_date:
+                # Use same date for start and end (single day)
+                await self.constraints_manager.update_constraints(
+                    session_id,
+                    time_window=(extracted_date, extracted_date, display)
+                )
+
+        # Detect time window normalization (for "next week" type expressions)
         time_window = self.constraint_extractor.normalize_time_window(
             message,
-            datetime.now(),
+            now,
             detected_language
         )
 
