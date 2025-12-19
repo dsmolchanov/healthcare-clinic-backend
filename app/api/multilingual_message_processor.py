@@ -1956,6 +1956,16 @@ IMPORTANT BEHAVIORS:
                 exclude_service=exclude_entity
             )
 
+        # Extract service from message (e.g., "чистка" -> "Dental Cleaning")
+        extracted_service = self.constraint_extractor.extract_service(message)
+        if extracted_service:
+            logger.info(f"🦷 Extracted service: {extracted_service}")
+            constraints_changed = True
+            await self.constraints_manager.update_constraints(
+                session_id,
+                desired_service=extracted_service
+            )
+
         # Get current time in clinic timezone for date extraction
         try:
             import pytz

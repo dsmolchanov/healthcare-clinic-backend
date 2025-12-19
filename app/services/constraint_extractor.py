@@ -57,6 +57,20 @@ class ConstraintExtractor:
     TOMORROW_KEYWORDS = ['завтра', 'tomorrow', 'mañana', 'מחר']
     TODAY_KEYWORDS = ['сегодня', 'today', 'hoy', 'היום']
 
+    # Service keywords for extraction (canonical service name to keywords)
+    SERVICE_KEYWORDS = {
+        'Dental Cleaning': ['чистк', 'cleaning', 'limpieza', 'профессиональная чистка', 'гигиена'],
+        'Consultation': ['консультаци', 'consultation', 'consulta', 'осмотр', 'прием'],
+        'Dental Filling': ['пломб', 'filling', 'empaste', 'relleno'],
+        'Tooth Extraction': ['удалени', 'extraction', 'extracción', 'вырвать'],
+        'Dental Implant': ['имплант', 'implant'],
+        'Veneers': ['винир', 'veneer', 'carilla'],
+        'Teeth Whitening': ['отбеливани', 'whitening', 'blanqueamiento'],
+        'Root Canal Treatment': ['канал', 'root canal', 'endodoncia'],
+        'Crown': ['коронк', 'crown', 'corona'],
+        'Dental X-ray': ['рентген', 'снимок', 'x-ray', 'radiografía'],
+    }
+
     # Time extraction patterns (captures hour)
     TIME_PATTERNS = [
         r'(\d{1,2})\s*(?:утра|am|часов?|ч\.?)',  # 11 утра, 11am, 11 часов
@@ -195,6 +209,26 @@ class ConstraintExtractor:
 
                 # Both entities passed validation
                 return (exclude_entity, desired_entity)
+
+        return None
+
+    def extract_service(self, message: str) -> Optional[str]:
+        """
+        Extract service name from user message using keyword matching.
+
+        Args:
+            message: User message like "запишите на чистку" or "cleaning please"
+
+        Returns:
+            Canonical service name like "Dental Cleaning" or None
+        """
+        message_lower = message.lower()
+
+        for service_name, keywords in self.SERVICE_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in message_lower:
+                    logger.info(f"🦷 Extracted service '{service_name}' from keyword '{keyword}'")
+                    return service_name
 
         return None
 
