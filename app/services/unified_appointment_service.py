@@ -991,27 +991,21 @@ class UnifiedAppointmentService:
 
     async def _get_doctor_working_hours(self, doctor_id: str, date: datetime) -> Dict[str, datetime]:
         """Get doctor's working hours for a specific date"""
-        # Simplified implementation - could be enhanced with database lookup
+        # TODO: Load from database per clinic/doctor
         day_of_week = date.weekday()  # 0 = Monday, 6 = Sunday
 
-        if day_of_week == 6:  # Sunday
-            # Closed on Sunday
+        # Clinic closed on weekends (Saturday=5, Sunday=6)
+        if day_of_week >= 5:
             return {
                 'start': date.replace(hour=0, minute=0),
                 'end': date.replace(hour=0, minute=0)
             }
-        elif day_of_week == 5:  # Saturday
-            # Half day on Saturday
-            return {
-                'start': date.replace(hour=9, minute=0),
-                'end': date.replace(hour=13, minute=0)
-            }
-        else:
-            # Regular weekday hours
-            return {
-                'start': date.replace(hour=8, minute=0),
-                'end': date.replace(hour=18, minute=0)
-            }
+
+        # Weekdays: 9:00 - 17:00 (clinic hours 10-17, but doctors may start earlier)
+        return {
+            'start': date.replace(hour=9, minute=0),
+            'end': date.replace(hour=17, minute=0)
+        }
 
     def _generate_time_slots(self, start: datetime, end: datetime, duration_minutes: int) -> List[datetime]:
         """Generate potential appointment time slots"""
