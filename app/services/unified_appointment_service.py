@@ -82,7 +82,7 @@ class UnifiedAppointmentService:
     Integrates with external calendar coordination for comprehensive scheduling
     """
 
-    def __init__(self, supabase: Client = None):
+    def __init__(self, supabase: Client = None, clinic_id: str = None):
         if supabase:
             self.supabase = supabase
         else:
@@ -96,6 +96,8 @@ class UnifiedAppointmentService:
             self.healthcare_supabase = self.supabase
         self.calendar_service = ExternalCalendarService(supabase=self.supabase)
         self.default_appointment_duration = timedelta(minutes=30)
+        self.clinic_id = clinic_id
+        self._business_hours_cache = None  # Cache business hours per session
 
     async def get_available_slots(
         self,
@@ -990,22 +992,70 @@ class UnifiedAppointmentService:
         return None
 
     async def _get_doctor_working_hours(self, doctor_id: str, date: datetime) -> Dict[str, datetime]:
-        """Get doctor's working hours for a specific date"""
-        # TODO: Load from database per clinic/doctor
+        """Get doctor's working hours for a specific date from clinic business_hours"""
         day_of_week = date.weekday()  # 0 = Monday, 6 = Sunday
+        day_names = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+        day_name = day_names[day_of_week]
 
-        # Clinic closed on weekends (Saturday=5, Sunday=6)
+        # Fetch business hours from clinic (with caching)
+        business_hours = await self._get_clinic_business_hours()
+
+        if not business_hours:
+            # Fallback: weekdays 9-17, weekends closed
+            if day_of_week >= 5:
+                return {'start': date.replace(hour=0, minute=0), 'end': date.replace(hour=0, minute=0)}
+            return {'start': date.replace(hour=9, minute=0), 'end': date.replace(hour=17, minute=0)}
+
+        # Check day-specific hours first, then 'weekdays' fallback
+        day_hours = business_hours.get(day_name)
+        if not day_hours and day_of_week < 5:
+            day_hours = business_hours.get('weekdays')
+
+        # Parse hours string like "10:00-17:00" or "Closed"
+        if not day_hours or day_hours.lower() in ['closed', 'cerrado', 'закрыто', '']:
+            return {'start': date.replace(hour=0, minute=0), 'end': date.replace(hour=0, minute=0)}
+
+        try:
+            # Handle format "10:00-17:00" or "10:00 - 17:00"
+            parts = day_hours.replace(' ', '').split('-')
+            if len(parts) == 2:
+                start_h, start_m = map(int, parts[0].split(':'))
+                end_h, end_m = map(int, parts[1].split(':'))
+                return {
+                    'start': date.replace(hour=start_h, minute=start_m, second=0, microsecond=0),
+                    'end': date.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+                }
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Failed to parse business hours '{day_hours}': {e}")
+
+        # Fallback
         if day_of_week >= 5:
-            return {
-                'start': date.replace(hour=0, minute=0),
-                'end': date.replace(hour=0, minute=0)
-            }
+            return {'start': date.replace(hour=0, minute=0), 'end': date.replace(hour=0, minute=0)}
+        return {'start': date.replace(hour=9, minute=0), 'end': date.replace(hour=17, minute=0)}
 
-        # Weekdays: 9:00 - 17:00 (clinic hours 10-17, but doctors may start earlier)
-        return {
-            'start': date.replace(hour=9, minute=0),
-            'end': date.replace(hour=17, minute=0)
-        }
+    async def _get_clinic_business_hours(self) -> Optional[Dict]:
+        """Fetch clinic business hours from database (cached)"""
+        if self._business_hours_cache is not None:
+            return self._business_hours_cache
+
+        if not self.clinic_id:
+            return None
+
+        try:
+            result = self.healthcare_supabase.table('clinics').select('business_hours').eq('id', self.clinic_id).single().execute()
+            if result.data:
+                hours = result.data.get('business_hours')
+                if isinstance(hours, str):
+                    import json
+                    hours = json.loads(hours)
+                self._business_hours_cache = hours or {}
+                logger.info(f"Loaded business hours for clinic {self.clinic_id}: {self._business_hours_cache}")
+                return self._business_hours_cache
+        except Exception as e:
+            logger.warning(f"Failed to fetch business hours for clinic {self.clinic_id}: {e}")
+
+        self._business_hours_cache = {}
+        return self._business_hours_cache
 
     def _generate_time_slots(self, start: datetime, end: datetime, duration_minutes: int) -> List[datetime]:
         """Generate potential appointment time slots"""

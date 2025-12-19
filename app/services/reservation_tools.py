@@ -57,9 +57,9 @@ class ReservationTools:
         # Initialize services
         # Phase C: Removed deprecated AppointmentBookingService
         # self.booking_service = AppointmentBookingService(supabase_client=self.supabase)
-        self.unified_service = UnifiedAppointmentService(supabase=self.supabase)
+        self.unified_service = UnifiedAppointmentService(supabase=self.supabase, clinic_id=clinic_id)
         self.calendar_service = ExternalCalendarService(supabase=self.supabase)
-        self.scheduler = IntelligentScheduler(supabase=self.supabase)
+        self.scheduler = IntelligentScheduler(supabase=self.supabase, clinic_id=clinic_id)
         self.conflict_detector = RealtimeConflictDetector()
         self.session_manager = RedisSessionManager()
 
