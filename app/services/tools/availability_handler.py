@@ -84,6 +84,6 @@ class AvailabilityHandler(ToolHandler):
         except (ValueError, AttributeError):
             return "NO_SLOTS"
 
-        # Return simple format: "SLOT: tomorrow 9:00"
-        # LLM will translate and ask confirmation
-        return f"SLOT: {relative} {time_str}"
+        # Return format with BOTH relative day AND explicit date to prevent hallucination
+        # "SLOT: Monday 2025-12-22 09:00" - date included to prevent LLM guessing wrong date
+        return f"SLOT: {relative} {date_str} {time_str}"
