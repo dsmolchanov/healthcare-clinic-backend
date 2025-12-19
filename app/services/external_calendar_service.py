@@ -686,14 +686,22 @@ class ExternalCalendarService:
 
             # Check for overlapping appointments
             for appointment in result.data:
-                apt_start = datetime.combine(
-                    appointment['appointment_date'],
-                    appointment['start_time']
-                )
-                apt_end = datetime.combine(
-                    appointment['appointment_date'],
-                    appointment['end_time']
-                )
+                # Parse appointment_date from string if needed (Supabase returns strings)
+                apt_date = appointment['appointment_date']
+                if isinstance(apt_date, str):
+                    apt_date = date.fromisoformat(apt_date)
+
+                # Parse times from string if needed
+                apt_start_time = appointment['start_time']
+                if isinstance(apt_start_time, str):
+                    apt_start_time = time.fromisoformat(apt_start_time)
+
+                apt_end_time = appointment['end_time']
+                if isinstance(apt_end_time, str):
+                    apt_end_time = time.fromisoformat(apt_end_time)
+
+                apt_start = datetime.combine(apt_date, apt_start_time)
+                apt_end = datetime.combine(apt_date, apt_end_time)
 
                 # Check for overlap
                 if (start_time < apt_end and end_time > apt_start):
