@@ -670,16 +670,17 @@ DO NOT attempt to answer complex questions yourself.
             narrowing_instruction=narrowing_instruction  # Preference narrowing for deterministic flow
         )
 
-        # Phase 6: Prepend state echo ONLY if NEW constraints were added this turn
-        # (not just when existing constraints are present from previous turns)
+        # Phase 6: Prepend state echo ONLY for user corrections (exclusions/switches)
+        # Don't echo for simple service extraction - it's noisy
         if constraints_changed and constraints and (
             constraints.excluded_doctors
             or constraints.excluded_services
-            or constraints.desired_service
-            or constraints.time_window_start
+            # Removed: or constraints.desired_service
+            # Removed: or constraints.time_window_start
+            # Only echo for exclusions (user corrections), not routine extraction
         ):
             # Phase 7: Format response with state echo
-            logger.info(f"📢 State echo triggered: constraints changed this turn")
+            logger.info(f"📢 State echo triggered: user correction detected")
             formatted_response = self.state_echo_formatter.format_response(
                 ai_response,
                 constraints,

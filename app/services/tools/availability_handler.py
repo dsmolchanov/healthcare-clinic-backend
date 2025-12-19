@@ -41,7 +41,12 @@ class AvailabilityHandler(ToolHandler):
             if slots:
                 result_text = f"Found {len(slots)} available slots:\n"
                 for slot in slots[:5]:  # Show top 5
-                    result_text += f"- {slot['date']} at {slot['start_time']} with {slot['doctor_name']}\n"
+                    # Slots use 'datetime' not 'date' - parse it
+                    slot_datetime = slot.get('datetime', '')
+                    slot_date = slot_datetime.split('T')[0] if 'T' in slot_datetime else slot_datetime[:10]
+                    slot_time = slot.get('start_time', slot_datetime.split('T')[1][:5] if 'T' in slot_datetime else '')
+                    doctor_name = slot.get('doctor_name', 'Doctor')
+                    result_text += f"- {slot_date} at {slot_time} with {doctor_name}\n"
                 if result.get('recommendation'):
                     result_text += f"\nRecommendation: {result['recommendation']}"
             else:
