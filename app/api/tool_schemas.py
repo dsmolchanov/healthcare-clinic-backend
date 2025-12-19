@@ -195,7 +195,9 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
             "x_meta": {
                 "category": "appointments",
                 "priority": 20,
-                "allowed_states": ["awaiting_confirmation", "booking"],
+                # AI path uses "idle" state, so we must allow it here
+                # FSM path uses explicit state transitions
+                "allowed_states": ["idle", "collecting_slots", "presenting_slots", "awaiting_confirmation", "booking"],
                 "depends_on": ["check_availability"],
                 "requires_prior_result": {
                     "check_availability": ["service_id", "datetime_str", "doctor_id"]
