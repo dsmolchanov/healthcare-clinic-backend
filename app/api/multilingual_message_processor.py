@@ -939,9 +939,17 @@ DO NOT attempt to answer complex questions yourself.
         saturday_hours = hours.get('saturday') or "Not provided"
         sunday_hours = hours.get('sunday') or "Not provided"
 
-        # Get current date/time context for the LLM
-        # from datetime import datetime # REMOVED: Uses module-level datetime which can be mocked
-        now = datetime.now()
+        # Get current date/time context for the LLM in clinic's timezone
+        # Use clinic timezone if available, otherwise fall back to UTC
+        try:
+            import pytz
+            clinic_tz_name = clinic_profile.get('timezone', 'America/Cancun')
+            clinic_tz = pytz.timezone(clinic_tz_name)
+            now = datetime.now(clinic_tz)
+            logger.info(f"Using clinic timezone: {clinic_tz_name}, local time: {now.strftime('%Y-%m-%d %H:%M')}")
+        except Exception as e:
+            logger.warning(f"Failed to use clinic timezone: {e}, falling back to UTC")
+            now = datetime.now()
         current_date = now.strftime('%Y-%m-%d')
         current_day = now.strftime('%A')  # e.g., "Sunday"
         current_time = now.strftime('%H:%M')
