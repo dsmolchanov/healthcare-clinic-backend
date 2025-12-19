@@ -126,26 +126,39 @@ class UnifiedAppointmentService:
                 duration_minutes
             )
 
-            # Check availability for each slot across all calendar sources
-            available_slots = []
-            for slot_start in potential_slots:
-                slot_end = slot_start + timedelta(minutes=duration_minutes)
+            # PARALLEL: Check availability for all slots concurrently
+            import asyncio
 
-                # Use ask-hold-reserve to check true availability
+            async def check_single_slot(slot_start):
+                """Check a single slot and return TimeSlot object."""
+                slot_end = slot_start + timedelta(minutes=duration_minutes)
                 is_available, sources = await self._check_slot_availability(
                     doctor_id, slot_start, slot_end
                 )
-
-                available_slots.append(TimeSlot(
+                return TimeSlot(
                     start_time=slot_start,
                     end_time=slot_end,
                     doctor_id=doctor_id,
                     available=is_available,
                     source=','.join(sources) if sources else 'unknown'
-                ))
+                )
 
-            # Filter to only available slots
-            return [slot for slot in available_slots if slot.available]
+            # Fire all slot checks in parallel
+            slot_results = await asyncio.gather(
+                *[check_single_slot(slot_start) for slot_start in potential_slots],
+                return_exceptions=True
+            )
+
+            # Filter to only available slots, handling any exceptions
+            available_slots = []
+            for result in slot_results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Slot check failed: {result}")
+                    continue
+                if result and result.available:
+                    available_slots.append(result)
+
+            return available_slots
 
         except Exception as e:
             logger.error(f"Failed to get available slots: {e}")
@@ -886,35 +899,49 @@ class UnifiedAppointmentService:
     ) -> Tuple[bool, List[str]]:
         """Check if a time slot is available across all calendar sources"""
         try:
-            # Quick check using the calendar service availability logic
-            # This reuses the ask-hold-reserve pattern's ASK phase
-            availability_sources = []
+            import asyncio
 
-            # Check internal availability
-            internal_check = await self.calendar_service._check_internal_availability(
+            # PARALLEL: Check all calendar sources concurrently
+            internal_task = self.calendar_service._check_internal_availability(
                 doctor_id, start_time, end_time
             )
+            google_task = self.calendar_service._check_google_calendar_availability(
+                doctor_id, start_time, end_time
+            )
+            outlook_task = self.calendar_service._check_outlook_calendar_availability(
+                doctor_id, start_time, end_time
+            )
+
+            # Fire all checks in parallel
+            internal_check, google_check, outlook_check = await asyncio.gather(
+                internal_task, google_task, outlook_task,
+                return_exceptions=True
+            )
+
+            # Handle exceptions
+            if isinstance(internal_check, Exception):
+                logger.warning(f"Internal calendar check failed: {internal_check}")
+                internal_check = {'available': False}
+            if isinstance(google_check, Exception):
+                logger.warning(f"Google calendar check failed: {google_check}")
+                google_check = {'available': True}  # Fail open if not configured
+            if isinstance(outlook_check, Exception):
+                logger.warning(f"Outlook calendar check failed: {outlook_check}")
+                outlook_check = {'available': True}  # Fail open if not configured
+
+            availability_sources = []
             if internal_check.get('available'):
                 availability_sources.append('internal')
-
-            # Check external calendars (if configured)
-            google_check = await self.calendar_service._check_google_calendar_availability(
-                doctor_id, start_time, end_time
-            )
             if google_check.get('available'):
                 availability_sources.append('google')
-
-            outlook_check = await self.calendar_service._check_outlook_calendar_availability(
-                doctor_id, start_time, end_time
-            )
             if outlook_check.get('available'):
                 availability_sources.append('outlook')
 
             # Slot is available if ALL configured sources are available
             is_available = (
                 internal_check.get('available', False) and
-                google_check.get('available', True) and  # True if not configured
-                outlook_check.get('available', True)     # True if not configured
+                google_check.get('available', True) and
+                outlook_check.get('available', True)
             )
 
             return is_available, availability_sources
