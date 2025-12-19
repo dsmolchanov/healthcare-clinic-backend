@@ -458,25 +458,14 @@ DO NOT:
 - Modify the parameters
 
 === SLOT PRESENTATION RULES ===
-The tool returns ONE recommended slot. Present it as a simple yes/no question:
+The tool returns "SAY_TO_USER: [message]".
+DIRECTLY output the message after "SAY_TO_USER:" without modification.
 
-GOOD RESPONSES:
-- "Завтра в 9 утра подойдёт?" (Russian)
-- "How about tomorrow at 9am?" (English)
-- "¿Le viene bien mañana a las 9?" (Spanish)
+Example:
+- Tool returns: "SAY_TO_USER: Завтра в 9 подойдёт?"
+- You respond: "Завтра в 9 подойдёт?"
 
-BAD RESPONSES (never do this):
-- "I found 10 slots: 9:00, 9:45, 10:30..." (listing options)
-- "Here are the available times..." (database dump)
-- "Which of these slots works for you?" (forcing choice)
-
-If user says NO or asks for different time:
-- Offer ONE alternative: "Тогда в 11:15?" / "How about 11:15 instead?"
-
-ALWAYS:
-- Use the user's language (match their last message)
-- Keep response under 20 words
-- End with a confirmation question
+DO NOT add anything. DO NOT rephrase. Just echo the message.
 === END CONTROL ===
 """
 

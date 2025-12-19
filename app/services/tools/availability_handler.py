@@ -53,14 +53,13 @@ class AvailabilityHandler(ToolHandler):
         """
         Format slots for natural conversation - focus on ONE recommendation.
 
-        A real receptionist says: "Tomorrow at 9 works - should I book it?"
-        NOT: "Here are 10 options, pick one."
+        Returns a DIRECT response the LLM should echo, not data to process.
         """
         from datetime import datetime, date as date_type
         from collections import OrderedDict
 
         if not slots:
-            return "NO_AVAILABILITY: No slots found for this timeframe."
+            return "SAY_TO_USER: К сожалению, на это время нет свободных слотов. Хотите посмотреть другой день?"
 
         # Cluster slots by (date, time)
         time_clusters = OrderedDict()
@@ -95,41 +94,44 @@ class AvailabilityHandler(ToolHandler):
                 time_clusters[cluster_key]['doctor_ids'].append(doctor_id)
 
         if not time_clusters:
-            return "NO_AVAILABILITY: No valid slots found."
+            return "SAY_TO_USER: К сожалению, свободных слотов не найдено."
 
         # Get the FIRST available slot as recommendation
         first_slot = list(time_clusters.values())[0]
 
-        # Format for natural language
+        # Format time naturally (09:00 -> 9, 10:30 -> 10:30)
+        time_str = first_slot['time']
+        if time_str.endswith(':00'):
+            time_display = time_str.split(':')[0].lstrip('0') or '0'
+        else:
+            time_display = time_str.lstrip('0')
+
+        # Format date naturally
         slot_date = datetime.strptime(first_slot['date'], '%Y-%m-%d').date()
         today = date_type.today()
 
-        # Relative date description
         if slot_date == today:
-            date_desc = "today"
+            date_display = "сегодня"
         elif (slot_date - today).days == 1:
-            date_desc = "tomorrow"
-        elif (slot_date - today).days < 7:
-            date_desc = first_slot['weekday']  # "Monday", "Tuesday", etc.
+            date_display = "завтра"
         else:
-            date_desc = first_slot['date']
+            # Russian weekday names
+            weekdays_ru = {
+                'Monday': 'в понедельник',
+                'Tuesday': 'во вторник',
+                'Wednesday': 'в среду',
+                'Thursday': 'в четверг',
+                'Friday': 'в пятницу',
+                'Saturday': 'в субботу',
+                'Sunday': 'в воскресенье'
+            }
+            date_display = weekdays_ru.get(first_slot['weekday'], first_slot['date'])
 
-        time_desc = first_slot['time']
-        num_doctors = len(first_slot['doctors'])
+        # Build the EXACT response to say
+        # Format: "Завтра в 9 подойдёт?" or "В пятницу в 10:30 подойдёт?"
+        response = f"SAY_TO_USER: {date_display.capitalize()} в {time_display} подойдёт?"
 
-        # Build concise response for LLM
-        # Format: RECOMMENDATION | BACKUP_INFO
-        if num_doctors > 1:
-            result_text = f"RECOMMENDED: {date_desc} at {time_desc} ({num_doctors} specialists available)"
-        else:
-            result_text = f"RECOMMENDED: {date_desc} at {time_desc} with {first_slot['doctors'][0]}"
+        # Add hidden booking data for next step
+        response += f"\n[BOOKING: {first_slot['date']} {first_slot['time']} doctor={first_slot['doctor_ids'][0]}]"
 
-        # Add backup options count (don't list them)
-        total_options = len(time_clusters)
-        if total_options > 1:
-            result_text += f" | {total_options - 1} other time options available if needed"
-
-        # Add booking info for next step
-        result_text += f"\n[BOOKING_DATA: date={first_slot['date']}, time={first_slot['time']}, doctor_id={first_slot['doctor_ids'][0]}]"
-
-        return result_text
+        return response
