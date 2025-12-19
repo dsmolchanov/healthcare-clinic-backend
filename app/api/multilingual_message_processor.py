@@ -26,6 +26,9 @@ from app.services.conversation_constraints import ConstraintsManager, Conversati
 from app.services.constraint_extractor import ConstraintExtractor
 from app.services.tool_state_gate import ToolStateGate
 from app.services.state_echo_formatter import StateEchoFormatter
+# Preference narrowing for deterministic booking flow
+from app.services.preference_narrowing import PreferenceNarrowingService
+from app.domain.preferences.narrowing import NarrowingAction, NarrowingInstruction, QuestionType
 
 logger = logging.getLogger(__name__)
 
@@ -630,6 +633,24 @@ DO NOT attempt to answer complex questions yourself.
                 f"changed_this_turn={constraints_changed}"
             )
 
+        # Compute narrowing instruction for deterministic booking flow
+        narrowing_instruction = None
+        try:
+            narrowing_service = PreferenceNarrowingService(get_supabase_client())
+            narrowing_instruction = await narrowing_service.decide(
+                constraints=constraints,
+                clinic_id=effective_clinic_id or resolved_request_clinic_id or request.clinic_id,
+                user_message=request.body,
+                clinic_strategy="service_first"
+            )
+            logger.info(
+                f"🎯 Narrowing: case={narrowing_instruction.case}, "
+                f"action={narrowing_instruction.action}, "
+                f"doctors={narrowing_instruction.eligible_doctor_count}"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Narrowing failed (non-fatal): {e}")
+
         # Generate AI response with full context (for SCHEDULING, COMPLEX lanes, or fast-path fallback)
         ai_response, detected_language = await self._generate_response(
             user_message=request.body,
@@ -645,7 +666,8 @@ DO NOT attempt to answer complex questions yourself.
             clinic_profile=clinic_profile,
             constraints=constraints,  # Phase 3: Pass constraints for prompt injection
             previous_session_summary=previous_session_summary,  # Phase 6: Pass previous session summary
-            phone_number=request.from_phone
+            phone_number=request.from_phone,
+            narrowing_instruction=narrowing_instruction  # Preference narrowing for deterministic flow
         )
 
         # Phase 6: Prepend state echo ONLY if NEW constraints were added this turn
@@ -858,7 +880,8 @@ DO NOT attempt to answer complex questions yourself.
         clinic_profile: Optional[Dict[str, Any]] = None,
         constraints: Optional[ConversationConstraints] = None,  # Phase 3: For prompt injection
         previous_session_summary: Optional[str] = None,  # Phase 6: For soft resets
-        phone_number: Optional[str] = None  # For tool context
+        phone_number: Optional[str] = None,  # For tool context
+        narrowing_instruction: Optional[NarrowingInstruction] = None  # Preference narrowing
     ) -> tuple[str, str]:
         """Generate AI response using OpenAI with automatic language detection, RAG context, and deterministic memory"""
 
@@ -1207,6 +1230,12 @@ IMPORTANT BEHAVIORS:
             constraints_section = self._build_constraints_section(constraints)
             if constraints_section:
                 system_prompt += f"\n\n{constraints_section}"
+
+        # Add narrowing control block at the beginning (most important - LLM sees first)
+        if narrowing_instruction:
+            control_block = self._build_narrowing_control_block(narrowing_instruction)
+            if control_block:
+                system_prompt = control_block + "\n\n" + system_prompt
 
         messages = [
             {"role": "system", "content": system_prompt}
@@ -1937,6 +1966,71 @@ IMPORTANT BEHAVIORS:
         # Return updated constraints and change flag
         constraints = await self.constraints_manager.get_constraints(session_id)
         return constraints, constraints_changed
+
+    # Question type to template mapping (LLM localizes based on user language)
+    QUESTION_TEMPLATES = {
+        "ask_for_service": "Ask what service the user needs (e.g., cleaning, checkup, whitening)",
+        "ask_for_time": "Ask what day and time works best for the user",
+        "ask_for_doctor": "Ask if user prefers {doctor_names} or first available",
+        "ask_time_with_doctor": "Ask when user would like to see {doctor_name}",
+        "ask_time_with_service": "Ask when user would like their {service_name} appointment",
+        "ask_today_or_tomorrow": "Ask if user prefers today or tomorrow (urgent case)",
+        "suggest_consultation": "Explain no specialists for {service_name}, suggest general consultation",
+        "ask_first_available": "Ask if user prefers {doctor_names} or first availability",
+    }
+
+    def _build_narrowing_control_block(self, instruction: Optional[NarrowingInstruction]) -> str:
+        """Build control block for LLM based on narrowing instruction."""
+        if not instruction:
+            return ""
+
+        if instruction.action == NarrowingAction.ASK_QUESTION:
+            # Build question guidance from type + args
+            question_type_str = instruction.question_type.value if instruction.question_type else ""
+            template = self.QUESTION_TEMPLATES.get(question_type_str, "Ask a clarifying question")
+
+            # Format template with args, handling missing keys gracefully
+            try:
+                question_guidance = template.format(**instruction.question_args)
+            except KeyError:
+                question_guidance = template
+
+            return f"""
+=== BOOKING CONTROL ===
+Case: {instruction.case}
+Action: ASK_QUESTION
+Question Type: {instruction.question_type}
+Guidance: {question_guidance}
+Args: {instruction.question_args}
+
+DO:
+- Ask this question in natural language, matching user's language
+- Wait for user's answer before proceeding
+DO NOT:
+- Call check_availability yet
+- Ask multiple questions at once
+=== END CONTROL ===
+"""
+
+        elif instruction.action == NarrowingAction.CALL_TOOL:
+            params = instruction.tool_call.params if instruction.tool_call else {}
+            return f"""
+=== BOOKING CONTROL ===
+Case: {instruction.case}
+Action: CALL_TOOL
+Tool: check_availability
+Parameters: {params}
+
+DO:
+- Call check_availability with EXACTLY these parameters
+- Present results naturally to user
+DO NOT:
+- Ask for more information first
+- Modify the parameters
+=== END CONTROL ===
+"""
+
+        return ""
 
     def _build_constraints_section(self, constraints: ConversationConstraints) -> str:
         """
