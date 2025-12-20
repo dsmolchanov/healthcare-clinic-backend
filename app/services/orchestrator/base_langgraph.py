@@ -388,8 +388,19 @@ class BaseLangGraphOrchestrator:
                 # Build messages for factory
                 messages = [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": state['message']}
                 ]
+
+                # Include conversation history from pipeline context
+                conversation_history = state.get('context', {}).get('conversation_history', [])
+                if conversation_history:
+                    for msg in conversation_history[-10:]:  # Last 10 messages to avoid token overflow
+                        role = msg.get('role', 'user')
+                        content = msg.get('content', msg.get('text', ''))
+                        if role in ('user', 'assistant') and content:
+                            messages.append({"role": role, "content": content})
+
+                # Add current message
+                messages.append({"role": "user", "content": state['message']})
 
                 # Generate using factory
                 response = await self.llm_factory.generate(
