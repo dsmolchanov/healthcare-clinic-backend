@@ -53,7 +53,8 @@ async def list_integrations(
 
         all_integrations = []
 
-        # Get non-calendar integrations from public schema (WhatsApp, SMS, etc.)
+        # Get non-healthcare integrations from public schema (Slack, generic SMS, email)
+        # NOTE: WhatsApp and Calendar are managed in healthcare schema to maintain HIPAA compliance
         try:
             public_supabase = create_client(
                 os.getenv("SUPABASE_URL"),
@@ -65,8 +66,11 @@ async def list_integrations(
             if type:
                 query = query.eq("integration_type", type)
 
-            # Exclude google_calendar - it's tracked in healthcare.calendar_integrations only
+            # Exclude healthcare-managed integrations - they're tracked in healthcare schema only
+            # This prevents duplicate cards on the frontend
             query = query.neq("integration_type", "google_calendar")
+            query = query.neq("integration_type", "whatsapp")
+            query = query.neq("integration_type", "evolution_api")
 
             result = query.execute()
             all_integrations.extend(result.data)
