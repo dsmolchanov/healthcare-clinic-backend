@@ -7,9 +7,9 @@ Extends base orchestrator with PHI protection and appointment handling
 import sys
 import os
 
-from ..base_langgraph import BaseLangGraphOrchestrator, BaseConversationState, ComplianceMode
+from ..base_langgraph import BaseLangGraphOrchestrator, BaseConversationState, ComplianceMode, last_value
 from langgraph.graph import StateGraph, END
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Annotated
 import logging
 from datetime import datetime
 
@@ -24,22 +24,27 @@ logger = logging.getLogger(__name__)
 
 
 class HealthcareConversationState(BaseConversationState):
-    """Healthcare-specific conversation state"""
+    """
+    Healthcare-specific conversation state.
+
+    Extends BaseConversationState with healthcare/PHI fields.
+    All fields use Annotated with last_value reducer for LangGraph checkpointing.
+    """
     # PHI-related fields
-    contains_phi: bool
-    phi_tokens: Optional[Dict[str, str]]
-    de_identified_message: Optional[str]
+    contains_phi: Annotated[bool, last_value]
+    phi_tokens: Annotated[Optional[Dict[str, str]], last_value]
+    de_identified_message: Annotated[Optional[str], last_value]
 
     # Appointment fields
-    appointment_type: Optional[str]
-    preferred_date: Optional[str]
-    preferred_time: Optional[str]
-    doctor_id: Optional[str]
+    appointment_type: Annotated[Optional[str], last_value]
+    preferred_date: Annotated[Optional[str], last_value]
+    preferred_time: Annotated[Optional[str], last_value]
+    doctor_id: Annotated[Optional[str], last_value]
 
     # Patient context
-    patient_id: Optional[str]
-    patient_name: Optional[str]
-    insurance_verified: bool
+    patient_id: Annotated[Optional[str], last_value]
+    patient_name: Annotated[Optional[str], last_value]
+    insurance_verified: Annotated[bool, last_value]
 
 
 class HealthcareLangGraph(BaseLangGraphOrchestrator):

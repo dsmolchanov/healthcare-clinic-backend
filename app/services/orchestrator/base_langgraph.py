@@ -5,11 +5,26 @@ Provides foundation for all specialized orchestrators
 """
 
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Optional, Dict, Any, List
+from typing import TypedDict, Optional, Dict, Any, List, Annotated
 import logging
 import asyncio
 from datetime import datetime
 from enum import Enum
+
+
+def last_value(existing: Any, new: Any) -> Any:
+    """Reducer that keeps the last (newest) value - used for scalar fields in LangGraph state."""
+    return new
+
+
+def merge_list(existing: List, new: List) -> List:
+    """Reducer that appends new items to existing list - used for audit trails etc."""
+    if existing is None:
+        return new or []
+    if new is None:
+        return existing
+    return existing + new
+
 
 logger = logging.getLogger(__name__)
 
@@ -23,28 +38,33 @@ class ComplianceMode(Enum):
 
 
 class BaseConversationState(TypedDict):
-    """Base state for all conversation workflows"""
-    # Core conversation data
-    session_id: str
-    message: str
-    context: dict
-    intent: Optional[str]
-    response: Optional[str]
-    metadata: dict
+    """
+    Base state for all conversation workflows.
 
-    # Memory and knowledge
-    memories: Optional[List[dict]]
-    knowledge: Optional[List[dict]]
+    Uses Annotated types with reducers to handle LangGraph checkpointing properly.
+    Scalar fields use last_value reducer (keep newest), list fields use merge_list.
+    """
+    # Core conversation data - scalar fields use last_value reducer
+    session_id: Annotated[str, last_value]
+    message: Annotated[str, last_value]
+    context: Annotated[dict, last_value]
+    intent: Annotated[Optional[str], last_value]
+    response: Annotated[Optional[str], last_value]
+    metadata: Annotated[dict, last_value]
 
-    # Workflow control
-    error: Optional[str]
-    should_end: bool
-    next_node: Optional[str]
+    # Memory and knowledge - can be replaced each turn
+    memories: Annotated[Optional[List[dict]], last_value]
+    knowledge: Annotated[Optional[List[dict]], last_value]
 
-    # Compliance tracking
-    compliance_mode: Optional[str]
-    compliance_checks: List[dict]
-    audit_trail: List[dict]
+    # Workflow control - scalar fields
+    error: Annotated[Optional[str], last_value]
+    should_end: Annotated[bool, last_value]
+    next_node: Annotated[Optional[str], last_value]
+
+    # Compliance tracking - mode is scalar, lists accumulate
+    compliance_mode: Annotated[Optional[str], last_value]
+    compliance_checks: Annotated[List[dict], merge_list]
+    audit_trail: Annotated[List[dict], merge_list]
 
 
 class BaseLangGraphOrchestrator:
