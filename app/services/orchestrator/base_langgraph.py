@@ -361,12 +361,48 @@ class BaseLangGraphOrchestrator:
         # Use LLM factory if available for better understanding
         if self.llm_factory:
             try:
-                # Prepare context
+                # Prepare context from pipeline-provided data
                 context_parts = []
+                pipeline_ctx = state.get('context', {})
+
+                # Clinic profile for business context
+                clinic_profile = pipeline_ctx.get('clinic_profile', {})
+                if clinic_profile:
+                    clinic_name = clinic_profile.get('name', 'Clinic')
+                    context_parts.append(f"Clinic: {clinic_name}")
+                    if clinic_profile.get('business_hours'):
+                        context_parts.append(f"Hours: {clinic_profile['business_hours']}")
+
+                # Available doctors (summarized)
+                clinic_doctors = pipeline_ctx.get('clinic_doctors', [])
+                if clinic_doctors:
+                    doctor_names = [d.get('name', d.get('full_name', 'Doctor')) for d in clinic_doctors[:5]]
+                    context_parts.append(f"Available doctors: {', '.join(doctor_names)}")
+
+                # Available services (summarized with prices)
+                clinic_services = pipeline_ctx.get('clinic_services', [])
+                if clinic_services:
+                    svc_summary = [f"{s.get('name', 'Service')} (${s.get('price', 'N/A')})" for s in clinic_services[:10]]
+                    context_parts.append(f"Services: {', '.join(svc_summary)}")
+
+                # FAQs for common questions
+                clinic_faqs = pipeline_ctx.get('clinic_faqs', [])
+                if clinic_faqs:
+                    faq_summary = "; ".join([f"Q: {f.get('question', '')[:50]}..." for f in clinic_faqs[:3]])
+                    context_parts.append(f"Common FAQs: {faq_summary}")
+
+                # Patient context
+                patient_profile = pipeline_ctx.get('patient_profile', {})
+                if patient_profile:
+                    patient_name = patient_profile.get('name', patient_profile.get('first_name', ''))
+                    if patient_name:
+                        context_parts.append(f"Patient: {patient_name}")
+
+                # Legacy memory/knowledge context
                 if state.get('memories'):
-                    context_parts.append(f"Previous context: {state['memories'][:500]}")
+                    context_parts.append(f"Previous context: {str(state['memories'])[:300]}")
                 if state.get('knowledge'):
-                    context_parts.append(f"Relevant knowledge: {state['knowledge'][:500]}")
+                    context_parts.append(f"Relevant knowledge: {str(state['knowledge'])[:300]}")
 
                 context = "\n".join(context_parts) if context_parts else ""
 

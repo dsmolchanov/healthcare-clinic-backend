@@ -14,7 +14,7 @@ Usage:
 
 import logging
 import time
-from typing import Tuple, Any, Optional
+from typing import Dict, Tuple, Any, Optional
 
 from cachetools import TTLCache
 
@@ -175,6 +175,9 @@ class LangGraphExecutionStep(PipelineStep):
         context = {
             "clinic_profile": ctx.clinic_profile or {},
             "patient_profile": ctx.patient_profile or {},
+            "clinic_doctors": ctx.clinic_doctors or [],    # Available doctors
+            "clinic_services": ctx.clinic_services or [],  # Available services with prices
+            "clinic_faqs": ctx.clinic_faqs or [],          # Clinic FAQs for context
             "constraints": constraints_dict,
             "language": ctx.detected_language,
             "lane": ctx.lane,
