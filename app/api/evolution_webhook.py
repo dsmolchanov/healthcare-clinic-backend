@@ -881,6 +881,34 @@ def extract_org_id_from_instance(instance_name: str) -> str:
 # Use LanguageService.detect_sync() instead (single source of truth).
 
 
+@router.post("/{instance_name}")
+async def evolution_webhook_legacy(
+    request: Request,
+    instance_name: str = Path(..., description="WhatsApp instance name"),
+    body: Dict[str, Any] = Body(..., description="Webhook payload from Evolution API")
+):
+    """
+    Legacy instance-based webhook endpoint for backward compatibility.
+
+    This endpoint exists because Evolution API webhook URLs cannot be updated via API.
+    It forwards to the same pipeline processor as the token-based endpoint.
+
+    To migrate: Update Evolution API instance webhook URL to use token-based format:
+    /webhooks/evolution/whatsapp/{webhook_token}
+    """
+    import datetime
+    timestamp = datetime.datetime.now().isoformat()
+
+    logger.info(f"[Legacy Webhook] Received from instance: {instance_name}")
+
+    # Return immediately, process in background
+    if body:
+        body_bytes = json.dumps(body).encode('utf-8')
+        asyncio.create_task(process_webhook_async(instance_name, body_bytes))
+
+    return {"status": "ok", "instance": instance_name}
+
+
 @router.get("/test")
 async def test_evolution_webhook():
     """Test endpoint to verify Evolution webhook is working"""
