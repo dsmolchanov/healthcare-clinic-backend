@@ -413,13 +413,43 @@ class BaseLangGraphOrchestrator:
                 if system_prompt_override:
                     system_prompt = system_prompt_override
                 else:
-                    system_prompt = (
-                        "You are a helpful assistant. Use the provided context to give accurate, "
-                        "relevant responses. Be concise and professional."
-                    )
+                    # Try to use PromptComposer with DB templates for sophisticated prompts
+                    try:
+                        from app.prompts.composer import PromptComposer
+                        from app.api.pipeline.context import PipelineContext
 
-                if context:
-                    system_prompt += f"\n\nContext:\n{context}"
+                        # Build a minimal PipelineContext from state for the composer
+                        # This allows reuse of DB-backed prompt templates
+                        clinic_id = state.get('metadata', {}).get('clinic_id')
+                        if clinic_id and pipeline_ctx:
+                            composer = PromptComposer(use_db_templates=True)
+                            # Create a mock context with needed fields
+                            mock_ctx = type('MockCtx', (), {
+                                'clinic_profile': clinic_profile,
+                                'clinic_name': clinic_profile.get('name', 'Clinic'),
+                                'effective_clinic_id': clinic_id,
+                                'from_phone': state.get('metadata', {}).get('phone_number', ''),
+                                'profile': patient_profile,
+                                'conversation_state': None,
+                                'session_messages': pipeline_ctx.get('conversation_history', []),
+                                'previous_session_summary': None,
+                                'additional_context': None,
+                                'constraints': None,
+                                'narrowing_instruction': None,
+                            })()
+                            system_prompt = await composer.compose_async(mock_ctx, include_booking_policy=True)
+                            logger.debug(f"[LangGraph] Using DB-backed prompt composer for clinic {clinic_id}")
+                        else:
+                            raise ValueError("No clinic_id for prompt composer")
+                    except Exception as e:
+                        logger.debug(f"[LangGraph] Falling back to inline prompt: {e}")
+                        # Fallback to inline prompt with context
+                        system_prompt = (
+                            "You are a helpful healthcare assistant. Use the provided context to give accurate, "
+                            "relevant responses. Be concise and professional.\n\n"
+                            f"Context:\n{context}" if context else
+                            "You are a helpful healthcare assistant. Be concise and professional."
+                        )
 
                 # Build messages for factory
                 messages = [
