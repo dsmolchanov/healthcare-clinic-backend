@@ -90,10 +90,10 @@ class PromptTemplateService:
     async def _fetch_from_db(self, clinic_id: str) -> Dict[str, str]:
         """Fetch templates from Supabase."""
         try:
-            from app.supabase_client import get_supabase_client
-            client = get_supabase_client()
+            from app.database import get_healthcare_client
+            client = get_healthcare_client()
 
-            response = client.schema('healthcare').table('prompt_templates').select(
+            response = client.table('prompt_templates').select(
                 'component_key, content'
             ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
 
@@ -157,8 +157,8 @@ class PromptTemplateService:
             )
 
         try:
-            from app.supabase_client import get_supabase_client
-            client = get_supabase_client()
+            from app.database import get_healthcare_client
+            client = get_healthcare_client()
 
             # Build data for upsert
             data = {
@@ -174,7 +174,7 @@ class PromptTemplateService:
                 data['description'] = description
 
             # Upsert (insert or update on conflict)
-            response = client.schema('healthcare').table('prompt_templates').upsert(
+            response = client.table('prompt_templates').upsert(
                 data,
                 on_conflict='clinic_id,component_key'
             ).execute()
@@ -203,11 +203,11 @@ class PromptTemplateService:
             True if successful, False otherwise
         """
         try:
-            from app.supabase_client import get_supabase_client
-            client = get_supabase_client()
+            from app.database import get_healthcare_client
+            client = get_healthcare_client()
 
             # Soft delete by setting is_active = false
-            response = client.schema('healthcare').table('prompt_templates').update(
+            response = client.table('prompt_templates').update(
                 {'is_active': False}
             ).eq('clinic_id', clinic_id).eq('component_key', component_key).execute()
 
@@ -237,10 +237,10 @@ class PromptTemplateService:
             List of template dicts with full metadata
         """
         try:
-            from app.supabase_client import get_supabase_client
-            client = get_supabase_client()
+            from app.database import get_healthcare_client
+            client = get_healthcare_client()
 
-            query = client.schema('healthcare').table('prompt_templates').select(
+            query = client.table('prompt_templates').select(
                 'id, component_key, content, description, is_active, version, created_at, updated_at'
             ).eq('clinic_id', clinic_id).order('component_key')
 
@@ -271,10 +271,10 @@ class PromptTemplateService:
             Template dict or None if not found
         """
         try:
-            from app.supabase_client import get_supabase_client
-            client = get_supabase_client()
+            from app.database import get_healthcare_client
+            client = get_healthcare_client()
 
-            response = client.schema('healthcare').table('prompt_templates').select(
+            response = client.table('prompt_templates').select(
                 'id, component_key, content, description, is_active, version, created_at, updated_at'
             ).eq('clinic_id', clinic_id).eq('component_key', component_key).eq(
                 'is_active', True
