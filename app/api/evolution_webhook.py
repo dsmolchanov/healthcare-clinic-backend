@@ -11,7 +11,8 @@ import os
 import json
 import logging
 import asyncio
-from app.api.multilingual_message_processor import MessageRequest, MultilingualMessageProcessor
+from app.api.multilingual_message_processor import MessageRequest
+from app.api.pipeline_message_processor import get_message_processor
 from app.security.webhook_verification import verify_webhook_signature
 from app.services.message_router import MessageType  # Keep MessageType enum for logging
 from app.services.language_service import LanguageService
@@ -24,8 +25,15 @@ router = APIRouter(prefix="/webhooks/evolution", tags=["webhooks"])
 # Evolution API URL
 EVOLUTION_API_URL = os.getenv("EVOLUTION_SERVER_URL", "https://evolution-api-prod.fly.dev")
 
-# Initialize message processor with RAG
-message_processor = MultilingualMessageProcessor()
+# Message processor will be initialized lazily based on feature flag
+_message_processor = None
+
+async def get_message_processor_instance():
+    """Get or create message processor based on ENABLE_PIPELINE flag"""
+    global _message_processor
+    if _message_processor is None:
+        _message_processor = await get_message_processor()
+    return _message_processor
 
 # FSM Feature Flag
 FSM_ENABLED = os.getenv('ENABLE_FSM', 'false').lower() == 'true'
@@ -201,8 +209,8 @@ async def process_webhook_by_token(webhook_token: str, body_bytes: bytes):
             )
             ai_response = fsm_result.get("response", "")
         else:
-            # Multilingual processor fallback
-            processor = MultilingualMessageProcessor()
+            # Use feature-flagged processor (pipeline or legacy)
+            processor = await get_message_processor_instance()
 
             request_obj = MessageRequest(
                 session_id=f"whatsapp_{from_number}_{clinic_id[:8]}",
@@ -653,9 +661,10 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
                     }
                 )
 
-                # Process with timeout
+                # Process with feature-flagged processor (pipeline or legacy)
+                processor = await get_message_processor_instance()
                 message_response = await asyncio.wait_for(
-                    message_processor.process_message(request_obj),
+                    processor.process_message(request_obj),
                     timeout=30.0  # 30 second max for AI processing
                 )
 
@@ -784,12 +793,13 @@ async def get_ai_response_with_rag(user_message: str, from_number: str, clinic_i
         print(f"[RAG] Message SID: {message_sid}")
         print(f"[RAG] Request object created successfully")
 
-        # Process with RAG
-        print(f"\n[RAG] Step 2: Processing with MultilingualMessageProcessor...")
-        print(f"[RAG] Calling message_processor.process_message()...")
+        # Process with feature-flagged processor
+        print(f"\n[RAG] Step 2: Processing with feature-flagged processor...")
+        print(f"[RAG] Calling processor.process_message()...")
 
         process_start = datetime.datetime.now()
-        response = await message_processor.process_message(message_request)
+        processor = await get_message_processor_instance()
+        response = await processor.process_message(message_request)
         process_end = datetime.datetime.now()
         process_duration = (process_end - process_start).total_seconds()
 
