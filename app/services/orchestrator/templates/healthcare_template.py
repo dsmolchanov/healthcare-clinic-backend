@@ -616,30 +616,68 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         message: str,
         session_id: str,
         metadata: Optional[Dict[str, Any]] = None,
-        patient_id: Optional[str] = None
+        patient_id: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Process healthcare conversation
+        Process healthcare conversation.
+
+        Enhanced for Phase 3B integration with:
+        - Pipeline context injection
+        - UnifiedStateManager flow state tracking
+        - State transition reporting for pipeline
 
         Args:
             message: User message
             session_id: Session ID
             metadata: Optional metadata
             patient_id: Optional patient identifier
+            context: Optional pipeline context with:
+                - clinic_profile: Clinic info from pipeline
+                - patient_profile: Patient info from pipeline
+                - constraints: ConversationConstraints dict
+                - language: Detected language
+                - flow_state: Current flow state (Phase 3A)
+                - turn_status: Current turn status (Phase 3A)
+                - conversation_history: Prior messages
 
         Returns:
-            Processed state with response
+            Dict with:
+                - response: Generated response text
+                - intent: Classified intent
+                - audit_trail: List of processed nodes
+                - state_transition: Optional new flow state
+                - context: Updated context dict
         """
+        # Extract context values
+        ctx = context or {}
+        patient_id = patient_id or ctx.get('patient_profile', {}).get('id')
+        patient_name = ctx.get('patient_profile', {}).get('name')
+        flow_state = ctx.get('flow_state', 'idle')
+        turn_status = ctx.get('turn_status', 'user_turn')
+
+        # Merge context into metadata for orchestrator access
+        enriched_metadata = metadata or {}
+        enriched_metadata.update({
+            'clinic_profile': ctx.get('clinic_profile', {}),
+            'patient_profile': ctx.get('patient_profile', {}),
+            'constraints': ctx.get('constraints', {}),
+            'language': ctx.get('language', 'es'),
+            'flow_state': flow_state,
+            'turn_status': turn_status,
+            'conversation_history': ctx.get('conversation_history', []),
+        })
+
         # Create healthcare-specific initial state
         initial_state = HealthcareConversationState(
             session_id=session_id,
             message=message,
-            context={},
+            context=ctx,
             intent=None,
             response=None,
-            metadata=metadata or {},
+            metadata=enriched_metadata,
             memories=None,
-            knowledge=None,
+            knowledge=ctx.get('knowledge', []),
             error=None,
             should_end=False,
             next_node=None,
@@ -654,12 +692,75 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
             preferred_time=None,
             doctor_id=None,
             patient_id=patient_id,
-            patient_name=None,
+            patient_name=patient_name,
             insurance_verified=False
         )
 
-        # Process through parent class
-        return await super().process(message, session_id, metadata)
+        try:
+            # Run the graph
+            if self.enable_checkpointing:
+                result = await self.compiled_graph.ainvoke(
+                    initial_state,
+                    {"configurable": {"thread_id": session_id}}
+                )
+            else:
+                result = await self.compiled_graph.ainvoke(initial_state)
+
+            # Determine state transition based on result
+            state_transition = self._determine_state_transition(result)
+
+            # Return enriched result for pipeline integration
+            return {
+                'response': result.get('response'),
+                'intent': result.get('intent'),
+                'audit_trail': result.get('audit_trail', []),
+                'state_transition': state_transition,
+                'context': result.get('context', {}),
+                'should_escalate': result.get('should_end') and 'emergency' in str(result.get('response', '')).lower(),
+                'pending_action': result.get('metadata', {}).get('pending_action'),
+            }
+
+        except Exception as e:
+            logger.error(f"Error processing healthcare message: {e}")
+            return {
+                'session_id': session_id,
+                'response': "I encountered an error processing your message. Please try again.",
+                'error': str(e),
+                'state_transition': None,
+            }
+
+    def _determine_state_transition(self, result: Dict[str, Any]) -> Optional[str]:
+        """
+        Determine flow state transition based on graph result.
+
+        Maps orchestrator outcomes to Phase 3A FlowState values.
+        """
+        # Check for explicit state in result
+        if result.get('should_end'):
+            # Check if escalation or completion
+            response = str(result.get('response', '')).lower()
+            if 'emergency' in response or '911' in response:
+                return 'escalated'
+            return 'completed'
+
+        # Check intent for booking flow
+        intent = result.get('intent')
+        if intent == 'appointment':
+            # Check if appointment was booked
+            context = result.get('context', {})
+            if context.get('appointment_booked'):
+                return 'completed'
+            elif context.get('available_slots'):
+                return 'presenting_slots'
+            else:
+                return 'collecting_slots'
+
+        # Info-seeking flows
+        if intent in ('faq_query', 'price_query', 'insurance'):
+            return 'info_seeking'
+
+        # No transition needed
+        return None
 
 
 # Example usage

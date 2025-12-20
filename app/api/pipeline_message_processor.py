@@ -21,6 +21,7 @@ from app.api.pipeline.steps import (
     RoutingStep,
     ConstraintEnforcementStep,
     NarrowingStep,
+    LangGraphExecutionStep,
     LLMGenerationStep,
     PostProcessingStep,
 )
@@ -45,8 +46,15 @@ class PipelineMessageProcessor:
     3. EscalationCheckStep: Check if should escalate to human
     4. RoutingStep: Classify message and handle fast-path
     5. ConstraintEnforcementStep: Extract and enforce constraints
-    6. LLMGenerationStep: Generate AI response with tools
-    7. PostProcessingStep: Format, log, update session
+    6. NarrowingStep: Preference narrowing computation
+    7. LangGraphExecutionStep: Route complex flows through orchestrator (Phase 3B)
+    8. LLMGenerationStep: Generate AI response with tools (fallback if LangGraph skipped)
+    9. PostProcessingStep: Format, log, update session
+
+    LangGraph routing (Phase 3B):
+    - Controlled by ENABLE_LANGGRAPH env var + clinic whitelist
+    - Routes SCHEDULING/COMPLEX lanes through HealthcareLangGraph orchestrator
+    - Falls through to LLMGenerationStep if disabled or skipped
 
     Usage:
         processor = PipelineMessageProcessor()
@@ -123,6 +131,7 @@ class PipelineMessageProcessor:
         self._supabase = get_supabase_client()
         self._public_supabase = get_public_supabase_client()
         self._get_llm_factory = get_llm_factory
+        self._redis_client = redis_client
 
         logger.info("✅ PipelineMessageProcessor initialized")
 
@@ -180,6 +189,10 @@ class PipelineMessageProcessor:
             ),
             NarrowingStep(
                 supabase_client=self._supabase
+            ),
+            LangGraphExecutionStep(
+                supabase_client=self._supabase,
+                redis_client=self._redis_client
             ),
             LLMGenerationStep(
                 llm_factory_getter=self._get_llm_factory,

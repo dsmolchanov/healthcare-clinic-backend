@@ -17,6 +17,21 @@ MESSAGE_HISTORY_MAX_WINDOW = int(os.getenv("MESSAGE_HISTORY_MAX_WINDOW", "24"))
 MESSAGE_HISTORY_MAX_MESSAGES = int(os.getenv("MESSAGE_HISTORY_MAX_MESSAGES", "100"))
 MESSAGE_HISTORY_MAX_TOKENS = int(os.getenv("MESSAGE_HISTORY_MAX_TOKENS", "4000"))
 
+# LangGraph Integration (Phase 3B)
+# Feature flag for gradual rollout
+ENABLE_LANGGRAPH = os.getenv("ENABLE_LANGGRAPH", "false").lower() == "true"
+
+# Clinic whitelist for gradual rollout (comma-separated clinic IDs)
+# Empty string means LangGraph is disabled for all clinics regardless of ENABLE_LANGGRAPH
+LANGGRAPH_CLINIC_WHITELIST_STR = os.getenv("LANGGRAPH_CLINIC_WHITELIST", "")
+LANGGRAPH_CLINIC_WHITELIST = [
+    c.strip() for c in LANGGRAPH_CLINIC_WHITELIST_STR.split(",")
+    if c.strip()
+]
+
+# Lanes that trigger LangGraph routing (SCHEDULING/COMPLEX flows benefit most)
+LANGGRAPH_ENABLED_LANES = os.getenv("LANGGRAPH_ENABLED_LANES", "SCHEDULING,COMPLEX").split(",")
+
 
 def get_redis_client() -> Redis:
     """
