@@ -11,7 +11,8 @@ import os
 import aiohttp
 import json
 import asyncio
-from app.api.multilingual_message_processor import MessageRequest, MultilingualMessageProcessor
+from app.api.multilingual_message_processor import MessageRequest
+from app.api.pipeline_message_processor import get_message_processor
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -33,8 +34,15 @@ async def get_llm_factory():
 # Evolution API URL
 EVOLUTION_API_URL = os.getenv("EVOLUTION_SERVER_URL", "https://evolution-api-prod.fly.dev")
 
-# Initialize message processor with RAG
-message_processor = MultilingualMessageProcessor()
+# Message processor will be initialized lazily based on feature flag
+_message_processor = None
+
+async def get_message_processor_instance():
+    """Get or create message processor based on ENABLE_PIPELINE flag"""
+    global _message_processor
+    if _message_processor is None:
+        _message_processor = await get_message_processor()
+    return _message_processor
 
 @router.post("/whatsapp")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -175,8 +183,9 @@ async def get_ai_response_with_rag(user_message: str, from_number: str, clinic_i
             metadata={}
         )
 
-        # Process with RAG
-        response = await message_processor.process_message(message_request)
+        # Process with feature-flagged processor (pipeline or legacy)
+        processor = await get_message_processor_instance()
+        response = await processor.process_message(message_request)
         return response.message
 
     except Exception as e:

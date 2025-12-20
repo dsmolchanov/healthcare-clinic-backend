@@ -12,7 +12,7 @@ import httpx
 
 from app.database import get_supabase_client
 from app.memory.conversation_memory import ConversationMemory
-from app.services.multilingual_message_processor import MultilingualMessageProcessor
+from app.api.pipeline_message_processor import get_message_processor
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +23,14 @@ class WhatsAppMessageProcessor:
     def __init__(self):
         self.supabase = get_supabase_client()
         self.memory = ConversationMemory()
-        self.message_processor = MultilingualMessageProcessor()
+        self._message_processor = None  # Lazy init based on feature flag
         self.http_client = httpx.AsyncClient(timeout=60.0)
+
+    async def _get_processor(self):
+        """Get or create message processor based on ENABLE_PIPELINE flag"""
+        if self._message_processor is None:
+            self._message_processor = await get_message_processor()
+        return self._message_processor
 
     async def process_message(self, message_data: Dict[str, Any]) -> Dict[str, Any]:
         """
