@@ -88,9 +88,15 @@ class LangGraphExecutionStep(PipelineStep):
             return ctx, True
 
         # 3. Check if lane triggers LangGraph
-        lane = ctx.lane or "COMPLEX"
-        if lane not in LANGGRAPH_ENABLED_LANES:
-            logger.debug(f"LangGraph skipped: lane {lane} not in enabled lanes")
+        # ctx.lane may be Lane enum or string; normalize to uppercase string for comparison
+        lane = ctx.lane
+        if hasattr(lane, 'value'):
+            lane_str = lane.value.upper()  # Lane enum -> "COMPLEX"
+        else:
+            lane_str = (lane or "COMPLEX").upper()
+
+        if lane_str not in [l.upper() for l in LANGGRAPH_ENABLED_LANES]:
+            logger.debug(f"LangGraph skipped: lane {lane_str} not in enabled lanes {LANGGRAPH_ENABLED_LANES}")
             return ctx, True
 
         logger.info(f"[LangGraph] Routing {lane} conversation for clinic {clinic_id}")
