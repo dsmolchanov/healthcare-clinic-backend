@@ -217,13 +217,23 @@ class BaseLangGraphOrchestrator:
             workflow.add_edge("knowledge_retrieve", "process")
 
         workflow.add_edge("process", "generate_response")
-        workflow.add_edge("generate_response", "memory_store" if self.enable_memory else "exit")
 
+        # Determine the next node after generate_response
+        # Priority: memory_store -> compliance_audit -> exit
         if self.enable_memory:
-            workflow.add_edge("memory_store", "compliance_audit" if self.compliance_mode else "exit")
-
-        if self.compliance_mode and self.compliance_mode != ComplianceMode.NONE:
+            workflow.add_edge("generate_response", "memory_store")
+            if self.compliance_mode and self.compliance_mode != ComplianceMode.NONE:
+                workflow.add_edge("memory_store", "compliance_audit")
+                workflow.add_edge("compliance_audit", "exit")
+            else:
+                workflow.add_edge("memory_store", "exit")
+        elif self.compliance_mode and self.compliance_mode != ComplianceMode.NONE:
+            # No memory, but compliance is enabled - route directly to audit
+            workflow.add_edge("generate_response", "compliance_audit")
             workflow.add_edge("compliance_audit", "exit")
+        else:
+            # No memory, no compliance - go straight to exit
+            workflow.add_edge("generate_response", "exit")
 
         workflow.add_edge("exit", END)
 
