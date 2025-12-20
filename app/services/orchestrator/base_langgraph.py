@@ -26,6 +26,30 @@ def merge_list(existing: List, new: List) -> List:
     return existing + new
 
 
+def bounded_merge_list(max_length: int = 50):
+    """
+    Factory for bounded list merge reducer.
+    Keeps only the most recent `max_length` items.
+
+    Args:
+        max_length: Maximum number of items to retain (default 50)
+
+    Returns:
+        Reducer function that merges and truncates lists
+    """
+    def reducer(existing: List, new: List) -> List:
+        if existing is None:
+            existing = []
+        if new is None:
+            new = []
+        combined = existing + new
+        # Keep only the most recent items
+        if len(combined) > max_length:
+            return combined[-max_length:]
+        return combined
+    return reducer
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,10 +85,10 @@ class BaseConversationState(TypedDict):
     should_end: Annotated[bool, last_value]
     next_node: Annotated[Optional[str], last_value]
 
-    # Compliance tracking - mode is scalar, lists accumulate
+    # Compliance tracking - mode is scalar, lists bounded to prevent memory growth
     compliance_mode: Annotated[Optional[str], last_value]
-    compliance_checks: Annotated[List[dict], merge_list]
-    audit_trail: Annotated[List[dict], merge_list]
+    compliance_checks: Annotated[List[dict], bounded_merge_list(50)]
+    audit_trail: Annotated[List[dict], bounded_merge_list(50)]
 
 
 class BaseLangGraphOrchestrator:

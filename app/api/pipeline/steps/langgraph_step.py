@@ -14,7 +14,9 @@ Usage:
 
 import logging
 import time
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Any, Optional
+
+from cachetools import TTLCache
 
 from ..base import PipelineStep
 from ..context import PipelineContext
@@ -58,7 +60,10 @@ class LangGraphExecutionStep(PipelineStep):
         """
         self.supabase = supabase_client
         self.redis = redis_client
-        self._orchestrator_cache: Dict[str, Any] = {}
+        # Cache up to 5 orchestrators with 15-minute TTL
+        # Conservative for 512MB: worst-case 5 × 50MB = 250MB cache
+        # 15-min TTL accommodates healthcare's async WhatsApp pacing
+        self._orchestrator_cache: TTLCache = TTLCache(maxsize=5, ttl=900)
 
     @property
     def name(self) -> str:
@@ -291,7 +296,7 @@ class LangGraphExecutionStep(PipelineStep):
             )
 
             self._orchestrator_cache[clinic_id] = orchestrator
-            logger.info(f"[LangGraph] Created orchestrator for clinic {clinic_id}")
+            logger.info(f"[LangGraph] Created orchestrator for clinic {clinic_id}, cache size: {len(self._orchestrator_cache)}/{self._orchestrator_cache.maxsize}")
 
             return orchestrator
 

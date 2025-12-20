@@ -453,6 +453,10 @@ from app.api import billing_routes
 app.include_router(billing_routes.router)
 app.include_router(billing_routes.webhooks_router)
 
+# Prompt Template Management (Phase 2B-2)
+from app.api import prompt_routes
+app.include_router(prompt_routes.router)
+
 # ============================================================================
 # Health Check
 # ============================================================================
@@ -573,6 +577,30 @@ async def debug_mem0():
         return status
     except Exception as e:
         return {"error": str(e), "type": str(type(e)), "traceback": traceback.format_exc()}
+
+@app.get("/debug/memory")
+async def memory_stats():
+    """
+    Return current memory usage stats for LangGraph optimization monitoring.
+    Restricted to staging/dev environments for security.
+    """
+    import psutil
+    import os
+
+    # Security: Don't expose memory internals in production healthcare API
+    fly_app_name = os.environ.get('FLY_APP_NAME', 'local')
+    if fly_app_name == 'healthcare-clinic-backend':
+        raise HTTPException(status_code=404, detail="Not found")
+
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    return {
+        "rss_mb": mem_info.rss / 1024 / 1024,
+        "vms_mb": mem_info.vms / 1024 / 1024,
+        "percent": process.memory_percent(),
+        "rss_vs_vms_delta_mb": (mem_info.vms - mem_info.rss) / 1024 / 1024,
+        "environment": fly_app_name,
+    }
 
 @app.get("/test/queue")
 async def test_queue():
@@ -1364,7 +1392,7 @@ async def widget_chat_get(body: str = "", session_id: str = "", clinic_id: str =
         return {
             "message": "Please send a message!",
             "status": "success",
-            "backend": "clinic-webhooks.fly.dev"
+            "backend": "healthcare-clinic-backend.fly.dev"
         }
 
     if not clinic_id:
@@ -1427,7 +1455,7 @@ Be helpful, professional, and specific about our services.
             text=body,
             metadata={
                 "channel": "widget",
-                "backend": "clinic-webhooks",
+                "backend": "healthcare-clinic-backend",
                 "clinic_id": clinic_id,
                 "clinic_name": clinic_name,
                 "clinic_context": clinic_context,
@@ -1446,7 +1474,7 @@ Be helpful, professional, and specific about our services.
         return {
             "message": response.response,
             "status": "success",
-            "backend": "clinic-webhooks.fly.dev",
+            "backend": "healthcare-clinic-backend.fly.dev",
             "latency_ms": response.latency_ms,
             "intent": response.intent,
             "routing_path": response.routing_path
@@ -1457,7 +1485,7 @@ Be helpful, professional, and specific about our services.
         return {
             "message": f"I received your message: '{body}'. AI processing temporarily unavailable. How can I help you?",
             "status": "success",
-            "backend": "clinic-webhooks.fly.dev",
+            "backend": "healthcare-clinic-backend.fly.dev",
             "error": str(e)
         }
 

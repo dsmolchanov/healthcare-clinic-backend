@@ -81,32 +81,50 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         self.supabase_client = supabase_client
         self.clinic_id = clinic_id
 
-        # Initialize appointment tools if available
-        self.appointment_tools = None
-        if APPOINTMENT_TOOLS_AVAILABLE:
-            self.appointment_tools = AppointmentTools(
-                supabase_client=supabase_client,
-                calendar_service=appointment_service,
-                clinic_id=clinic_id
-            )
-
-        # Initialize price query tool
-        from app.tools.price_query_tool import PriceQueryTool
-        self.price_query_tool = PriceQueryTool(clinic_id=clinic_id) if clinic_id else None
-
-        # Initialize FAQ query tool
-        from app.tools.faq_query_tool import FAQQueryTool
-        self.faq_tool = FAQQueryTool(clinic_id=clinic_id) if clinic_id else None
+        # Private caches for lazy-loaded tools (initialized on first access)
+        self._appointment_tools = None
+        self._price_query_tool = None
+        self._faq_tool = None
 
         # NOW call parent init (which will call _build_graph and safely access our attributes)
         super().__init__(
             compliance_mode=ComplianceMode.HIPAA,
-            enable_memory=True,
-            enable_rag=True,
-            enable_checkpointing=True,
+            enable_memory=False,      # Pipeline provides via conversation_memory.py
+            enable_rag=False,         # Pipeline provides via PipelineContext.knowledge_context
+            enable_checkpointing=False,  # Pipeline provides state via Redis StateManager
             supabase_client=supabase_client,
             agent_config=agent_config
         )
+
+    @property
+    def appointment_tools(self):
+        """Lazy-load appointment tools on first access."""
+        if self._appointment_tools is None and APPOINTMENT_TOOLS_AVAILABLE:
+            self._appointment_tools = AppointmentTools(
+                supabase_client=self.supabase_client,
+                calendar_service=self.appointment_service,
+                clinic_id=self.clinic_id
+            )
+            logger.debug(f"[HealthcareLangGraph] Lazy-loaded AppointmentTools for clinic {self.clinic_id}")
+        return self._appointment_tools
+
+    @property
+    def price_query_tool(self):
+        """Lazy-load price query tool on first access."""
+        if self._price_query_tool is None and self.clinic_id:
+            from app.tools.price_query_tool import PriceQueryTool
+            self._price_query_tool = PriceQueryTool(clinic_id=self.clinic_id)
+            logger.debug(f"[HealthcareLangGraph] Lazy-loaded PriceQueryTool for clinic {self.clinic_id}")
+        return self._price_query_tool
+
+    @property
+    def faq_tool(self):
+        """Lazy-load FAQ tool on first access."""
+        if self._faq_tool is None and self.clinic_id:
+            from app.tools.faq_query_tool import FAQQueryTool
+            self._faq_tool = FAQQueryTool(clinic_id=self.clinic_id)
+            logger.debug(f"[HealthcareLangGraph] Lazy-loaded FAQQueryTool for clinic {self.clinic_id}")
+        return self._faq_tool
 
     def _build_graph(self) -> StateGraph:
         """
