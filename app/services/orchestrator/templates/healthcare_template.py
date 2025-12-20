@@ -191,6 +191,7 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         workflow.add_edge("insurance_verify", "process")
 
         # Add PHI redaction before exit
+        # Note: generate_response_node now preserves response from process_node (no duplicate LLM call)
         workflow.add_edge("generate_response", "phi_redact")
         workflow.add_edge("phi_redact", "memory_store" if self.enable_memory else "exit")
 
