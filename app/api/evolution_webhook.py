@@ -25,45 +25,15 @@ router = APIRouter(prefix="/webhooks/evolution", tags=["webhooks"])
 # Evolution API URL
 EVOLUTION_API_URL = os.getenv("EVOLUTION_SERVER_URL", "https://evolution-api-prod.fly.dev")
 
-# Message processor will be initialized lazily based on feature flag
+# Message processor will be initialized lazily
 _message_processor = None
 
 async def get_message_processor_instance():
-    """Get or create message processor based on ENABLE_PIPELINE flag"""
+    """Get or create the pipeline message processor instance."""
     global _message_processor
     if _message_processor is None:
         _message_processor = await get_message_processor()
     return _message_processor
-
-# FSM Feature Flag
-FSM_ENABLED = os.getenv('ENABLE_FSM', 'false').lower() == 'true'
-
-logger.info(f"Evolution webhook - FSM feature flag: {'ENABLED' if FSM_ENABLED else 'DISABLED'}")
-
-# FSM imports (only if enabled)
-if FSM_ENABLED:
-    from ..fsm.manager import FSMManager
-    from ..fsm.intent_router import IntentRouter
-    from ..fsm.slot_manager import SlotManager
-    from ..fsm.state_handlers import StateHandler
-    from ..fsm.answer_service import AnswerService
-    from ..fsm.redis_client import redis_client
-    from ..fsm.models import FSMState, ConversationState
-    from supabase import create_client
-    from supabase.client import ClientOptions
-
-    # Get Supabase client for FSM components
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-    options = ClientOptions(schema='healthcare', auto_refresh_token=True, persist_session=False)
-    fsm_supabase = create_client(supabase_url, supabase_key, options=options)
-
-    # Initialize FSM components
-    fsm_manager = FSMManager()
-    intent_router = IntentRouter()
-    slot_manager = SlotManager()
-    answer_service = AnswerService(fsm_supabase)
-    state_handler = StateHandler(fsm_manager, intent_router, slot_manager, answer_service)
 
 @router.post("/whatsapp/{webhook_token}")
 async def whatsapp_webhook_v2(
@@ -195,34 +165,20 @@ async def process_webhook_by_token(webhook_token: str, body_bytes: bytes):
         print(f"[Token Async] From: {from_number}")
         print(f"[Token Async] Message: {message_text[:100]}...")
 
-        # Route to FSM or multilingual processor (same as existing flow)
-        if FSM_ENABLED:
-            from app.api.webhooks import process_with_fsm
-            fsm_result = await process_with_fsm(
-                message_sid=message_id,
-                conversation_id=from_number,
-                message=message_text,
-                context={
-                    "clinic_id": clinic_id,
-                    "instance_name": instance_name
-                }
-            )
-            ai_response = fsm_result.get("response", "")
-        else:
-            # Use feature-flagged processor (pipeline or legacy)
-            processor = await get_message_processor_instance()
+        # Process with pipeline processor
+        processor = await get_message_processor_instance()
 
-            request_obj = MessageRequest(
-                session_id=f"whatsapp_{from_number}_{clinic_id[:8]}",
-                message=message_text,
-                clinic_id=clinic_id,
-                from_phone=from_number,
-                channel="whatsapp",
-                language=None
-            )
+        request_obj = MessageRequest(
+            session_id=f"whatsapp_{from_number}_{clinic_id[:8]}",
+            message=message_text,
+            clinic_id=clinic_id,
+            from_phone=from_number,
+            channel="whatsapp",
+            language=None
+        )
 
-            response_obj = await asyncio.wait_for(processor.process_message(request_obj), timeout=30.0)
-            ai_response = response_obj.response
+        response_obj = await asyncio.wait_for(processor.process_message(request_obj), timeout=30.0)
+        ai_response = response_obj.response
 
         print(f"[Token Async] ✅ AI response: {ai_response[:100]}...")
 
@@ -242,70 +198,6 @@ async def process_webhook_by_token(webhook_token: str, body_bytes: bytes):
 
     except Exception as e:
         logger.error(f"[Token Async] ❌ Error processing webhook: {e}", exc_info=True)
-
-
-@router.post("/{instance_name}")
-async def evolution_webhook(
-    request: Request,
-    instance_name: str = Path(..., description="WhatsApp instance name"),
-    body: Dict[str, Any] = Body(..., description="Webhook payload from Evolution API")
-):
-    """
-    Handle incoming messages from Evolution API for specific instance.
-    Evolution API sends to: /webhooks/evolution/{instance_name}
-
-    CRITICAL: Must return IMMEDIATELY to avoid Evolution timeout
-    Using FastAPI Body parameter to let framework handle body reading
-    """
-    import datetime
-    timestamp = datetime.datetime.now().isoformat()
-
-    print(f"\n{'='*80}")
-    print(f"[{timestamp}] WEBHOOK RECEIVED")
-    print(f"[Evolution Webhook] Instance: {instance_name}")
-    print(f"[Evolution Webhook] Body type: {type(body)}")
-    print(f"[Evolution Webhook] Body keys: {list(body.keys()) if body else 'None'}")
-
-    # Verify webhook signature if configured (OPTIONAL - Evolution doesn't send signatures by default)
-    evolution_webhook_secret = os.getenv("EVOLUTION_WEBHOOK_SECRET", "")
-    signature = request.headers.get("X-Webhook-Signature")
-
-    if evolution_webhook_secret and signature:
-        # Signature verification is OPTIONAL - verify if both secret and signature present
-        print(f"[Evolution Webhook] Signature header present: {signature[:20]}...")
-        # Convert dict back to bytes for signature verification.
-        # Match JSON.stringify output (no spaces, UTF-8) so HMAC lines up with Evolution API.
-        body_bytes = json.dumps(body, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-        if verify_webhook_signature('evolution', body=body_bytes, signature=signature):
-            print(f"[Evolution Webhook] ✅ Signature verified")
-        else:
-            print(f"[Evolution Webhook] ⚠️  Invalid signature - continuing anyway (optional verification)")
-    else:
-        print(f"[Evolution Webhook] ⚠️  No signature verification (secret={bool(evolution_webhook_secret)}, signature={bool(signature)})")
-
-    print(f"{'='*80}\n")
-
-    # FastAPI has already parsed the body for us
-    if body:
-        # Log first 500 chars of content for debugging
-        body_str = json.dumps(body, indent=2)[:500]
-        print(f"[Evolution Webhook] ✅ Successfully received body")
-        print(f"[Evolution Webhook] Body preview:\n{body_str}")
-
-        # Convert dict back to bytes for background processing
-        body_bytes = json.dumps(body).encode('utf-8')
-
-        # Create a task to process the webhook asynchronously
-        task = asyncio.create_task(process_webhook_async(instance_name, body_bytes))
-        print(f"[Evolution Webhook] 🚀 Background task created: {task}")
-        print(f"[Evolution Webhook] Task ID: {id(task)}")
-    else:
-        print(f"[Evolution Webhook] ⚠️ No body data to process")
-
-    # ALWAYS return immediately - this is the critical part
-    print(f"[Evolution Webhook] 🏁 Returning response immediately to Evolution API")
-    print(f"[Evolution Webhook] Response: {{'status': 'ok', 'instance': '{instance_name}'}}")
-    return {"status": "ok", "instance": instance_name}
 
 
 async def process_webhook_async(instance_name: str, body_bytes: bytes):
@@ -597,99 +489,63 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
         # Create session ID from phone number
         session_id = f"whatsapp_{from_number}_{actual_instance}"
 
-        # Route message through FSM or multilingual processor
+        # Process message through pipeline
         print(f"\n[Background] Step 5: Processing message...")
         print(f"[Background] Message type: {message_type.value}")
         print(f"[Background] Session ID: {session_id}")
 
         ai_start = datetime.datetime.now()
 
-        # Use local variable to track if we should use FSM for this message
-        use_fsm = FSM_ENABLED
+        print(f"[Background] 🔄 Processing with pipeline processor...")
+        try:
+            # Use the pipeline message processor
+            request_obj = MessageRequest(
+                from_phone=from_number,
+                to_phone=actual_instance,  # Use instance as "to" identifier
+                body=text,
+                message_sid=key.get("id"),
+                clinic_id=clinic_id,
+                clinic_name=clinic_name or "Clinic",
+                channel="whatsapp",
+                profile_name=push_name,
+                metadata={
+                    "instance_name": actual_instance,
+                    "user_name": push_name,
+                    "whatsapp_message_id": key.get("id"),
+                    "session_id": session_id,
+                    "organization_id": actual_organization_id  # For metrics logging
+                }
+            )
 
-        # Check if FSM is enabled
-        if use_fsm:
-            print(f"[Background] 🔄 Routing to FSM processing")
-            try:
-                # Process through FSM
-                from app.api.webhooks import process_with_fsm
+            # Process with pipeline processor
+            processor = await get_message_processor_instance()
+            message_response = await asyncio.wait_for(
+                processor.process_message(request_obj),
+                timeout=30.0  # 30 second max for AI processing
+            )
 
-                fsm_result = await process_with_fsm(
-                    message_sid=key.get("id"),
-                    conversation_id=from_number,
-                    message=text,
-                    context={
-                        "clinic_id": clinic_id,
-                        "instance_name": actual_instance,
-                        "user_name": push_name,
-                        "session_id": session_id
-                    }
-                )
+            # Extract response from MessageResponse object
+            ai_response = message_response.message
+            routing_path = message_response.metadata.get("routing_path", "pipeline_processor")
+            latency_ms = message_response.metadata.get("processing_time_ms", 0)
 
-                ai_response = fsm_result.get("response", "")
-                routing_path = "fsm"
-                latency_ms = fsm_result.get("processing_time_ms", 0)
+            print(f"[Background] ✅ Message processed successfully via {routing_path}")
 
-                print(f"[Background] ✅ Message processed successfully via FSM")
-
-            except Exception as fsm_error:
-                print(f"[Background] ❌ FSM processing failed: {fsm_error}")
-                print(f"[Background] 🔄 Falling back to multilingual processor")
-                # Fallback to multilingual processor on FSM error
-                use_fsm = False  # Disable for this message only
-
-        if not use_fsm:
-            print(f"[Background] 🔄 Processing with multilingual processor (with memory support)...")
-            try:
-                # Use the NEW message processor with RouterService and FastPathService
-                # This includes memory retrieval and fast-path routing
-                request_obj = MessageRequest(
-                    from_phone=from_number,
-                    to_phone=actual_instance,  # Use instance as "to" identifier
-                    body=text,
-                    message_sid=key.get("id"),
-                    clinic_id=clinic_id,
-                    clinic_name=clinic_name or "Clinic",
-                    channel="whatsapp",
-                    profile_name=push_name,
-                    metadata={
-                        "instance_name": actual_instance,
-                        "user_name": push_name,
-                        "whatsapp_message_id": key.get("id"),
-                        "session_id": session_id,
-                        "organization_id": actual_organization_id  # For metrics logging
-                    }
-                )
-
-                # Process with feature-flagged processor (pipeline or legacy)
-                processor = await get_message_processor_instance()
-                message_response = await asyncio.wait_for(
-                    processor.process_message(request_obj),
-                    timeout=30.0  # 30 second max for AI processing
-                )
-
-                # Extract response from MessageResponse object
-                ai_response = message_response.message
-                routing_path = message_response.metadata.get("routing_path", "multilingual_processor")
-                latency_ms = message_response.metadata.get("processing_time_ms", 0)
-
-                print(f"[Background] ✅ Message processed successfully via {routing_path}")
-
-            except asyncio.TimeoutError:
-                print(f"[Background] ⏰ Processing timed out after 30s - using fallback response")
-                # Use fallback response on timeout
-                ai_response = "Thank you for your message. We're processing your request and will respond shortly."
-                routing_path = "timeout_fallback"
-                latency_ms = 30000
-                # Continue to send this fallback message
-            except Exception as routing_error:
-                print(f"[Background] ❌ Processing error: {routing_error}")
-                import traceback
-                print(f"[Background] Processing traceback:\n{traceback.format_exc()}")
-                # Use error fallback
-                ai_response = "We received your message. Please try again or contact us directly."
-                routing_path = "error_fallback"
-                latency_ms = 0
+        except asyncio.TimeoutError:
+            print(f"[Background] ⏰ Processing timed out after 30s - using fallback response")
+            # Use fallback response on timeout
+            ai_response = "Thank you for your message. We're processing your request and will respond shortly."
+            routing_path = "timeout_fallback"
+            latency_ms = 30000
+            # Continue to send this fallback message
+        except Exception as routing_error:
+            print(f"[Background] ❌ Processing error: {routing_error}")
+            import traceback
+            print(f"[Background] Processing traceback:\n{traceback.format_exc()}")
+            # Use error fallback
+            ai_response = "We received your message. Please try again or contact us directly."
+            routing_path = "error_fallback"
+            latency_ms = 0
 
         ai_end = datetime.datetime.now()
         ai_duration = (ai_end - ai_start).total_seconds()

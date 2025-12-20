@@ -499,48 +499,17 @@ class BaseLangGraphOrchestrator:
         return state
 
     async def generate_response_node(self, state: BaseConversationState) -> BaseConversationState:
-        """Generate or enhance final response to user"""
-        logger.debug(f"Response generation - session: {state['session_id']}")
-
-        # Check if process_node already generated a response
-        existing_response = state.get('response')
-        if existing_response:
-            logger.info(f"[generate_response_node] Using existing response from process_node ({len(existing_response)} chars)")
-            state['audit_trail'].append({
-                "node": "generate_response",
-                "timestamp": datetime.utcnow().isoformat(),
-                "response_length": len(existing_response),
-                "source": "process_node"
-            })
-            return state
-
-        # Only generate if no response exists - this is a FALLBACK
-        logger.warning(f"[generate_response_node] No response from process_node, generating fallback")
-        if self.llm_factory:
-            try:
-                messages = [
-                    {"role": "system", "content": "You are a helpful assistant. Provide a clear, concise response."},
-                    {"role": "user", "content": f"Generate a helpful response to: {state['message']}"}
-                ]
-
-                response = await self.llm_factory.generate(
-                    messages=messages,
-                    model=self.primary_model,
-                    temperature=0.7,
-                    max_tokens=300
-                )
-                state['response'] = response.content
-            except Exception as e:
-                logger.warning(f"LLM response generation failed: {e}")
-                state['response'] = "I understand your message. How can I help you?"
-        else:
-            state['response'] = "I understand your message. How can I help you?"
+        """
+        Pure passthrough node - response is already generated in process_node.
+        This node exists for graph structure consistency (audit trail, future hooks).
+        """
+        logger.debug(f"generate_response_node passthrough - session: {state['session_id']}")
 
         state['audit_trail'].append({
             "node": "generate_response",
             "timestamp": datetime.utcnow().isoformat(),
             "response_length": len(state.get('response', '') or ''),
-            "source": "fallback"
+            "source": "passthrough"
         })
 
         return state

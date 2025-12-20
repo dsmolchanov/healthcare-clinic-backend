@@ -1,10 +1,8 @@
 """
 Pipeline-based Message Processor.
 
-This is the refactored version of MultilingualMessageProcessor using
-the pipeline architecture from Phase 2A.
-
-Feature flagged via ENABLE_PIPELINE environment variable.
+This is the canonical message processor using the pipeline architecture.
+It replaces the legacy MultilingualMessageProcessor.
 """
 
 import os
@@ -224,32 +222,25 @@ class PipelineMessageProcessor:
         )
 
 
-# Feature flag for pipeline vs legacy processor
-ENABLE_PIPELINE = os.getenv("ENABLE_PIPELINE", "false").lower() == "true"
-
-
 async def get_message_processor():
     """
-    Get the appropriate message processor based on feature flag.
+    Get the message processor.
 
     Returns:
-        PipelineMessageProcessor if ENABLE_PIPELINE=true
-        MultilingualMessageProcessor otherwise
+        PipelineMessageProcessor - the canonical message processor.
+
+    Note: ENABLE_PIPELINE feature flag removed in Phase 1 cleanup.
+    Pipeline is now the only supported path.
     """
-    if ENABLE_PIPELINE:
-        logger.info("Using pipeline-based message processor")
-        return PipelineMessageProcessor()
-    else:
-        from app.api.multilingual_message_processor import MultilingualMessageProcessor
-        logger.info("Using legacy message processor")
-        return MultilingualMessageProcessor()
+    logger.info("Using pipeline-based message processor")
+    return PipelineMessageProcessor()
 
 
 async def handle_process_message(request: MessageRequest) -> MessageResponse:
     """
     Main endpoint handler for processing messages.
 
-    Uses feature flag to choose between pipeline and legacy processor.
+    Always uses the pipeline processor.
     """
     processor = await get_message_processor()
     return await processor.process_message(request)
