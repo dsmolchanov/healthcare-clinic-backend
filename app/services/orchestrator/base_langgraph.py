@@ -502,32 +502,45 @@ class BaseLangGraphOrchestrator:
         """Generate or enhance final response to user"""
         logger.debug(f"Response generation - session: {state['session_id']}")
 
-        # Enhance response with LLM if needed and available
-        if not state.get('response'):
-            if self.llm_factory:
-                try:
-                    messages = [
-                        {"role": "system", "content": "You are a helpful assistant. Provide a clear, concise response."},
-                        {"role": "user", "content": f"Generate a helpful response to: {state['message']}"}
-                    ]
+        # Check if process_node already generated a response
+        existing_response = state.get('response')
+        if existing_response:
+            logger.info(f"[generate_response_node] Using existing response from process_node ({len(existing_response)} chars)")
+            state['audit_trail'].append({
+                "node": "generate_response",
+                "timestamp": datetime.utcnow().isoformat(),
+                "response_length": len(existing_response),
+                "source": "process_node"
+            })
+            return state
 
-                    response = await self.llm_factory.generate(
-                        messages=messages,
-                        model=self.primary_model,
-                        temperature=0.7,
-                        max_tokens=300
-                    )
-                    state['response'] = response.content
-                except Exception as e:
-                    logger.warning(f"LLM response generation failed: {e}")
-                    state['response'] = "I understand your message. How can I help you?"
-            else:
+        # Only generate if no response exists - this is a FALLBACK
+        logger.warning(f"[generate_response_node] No response from process_node, generating fallback")
+        if self.llm_factory:
+            try:
+                messages = [
+                    {"role": "system", "content": "You are a helpful assistant. Provide a clear, concise response."},
+                    {"role": "user", "content": f"Generate a helpful response to: {state['message']}"}
+                ]
+
+                response = await self.llm_factory.generate(
+                    messages=messages,
+                    model=self.primary_model,
+                    temperature=0.7,
+                    max_tokens=300
+                )
+                state['response'] = response.content
+            except Exception as e:
+                logger.warning(f"LLM response generation failed: {e}")
                 state['response'] = "I understand your message. How can I help you?"
+        else:
+            state['response'] = "I understand your message. How can I help you?"
 
         state['audit_trail'].append({
             "node": "generate_response",
             "timestamp": datetime.utcnow().isoformat(),
-            "response_length": len(state['response'])
+            "response_length": len(state.get('response', '') or ''),
+            "source": "fallback"
         })
 
         return state
