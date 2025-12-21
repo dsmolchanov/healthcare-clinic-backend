@@ -893,6 +893,9 @@ async def evolution_webhook_legacy(
     This endpoint exists because Evolution API webhook URLs cannot be updated via API.
     It forwards to the same pipeline processor as the token-based endpoint.
 
+    SECURITY: Verifies instance_name exists in database before processing.
+    This prevents spoofed requests from being processed.
+
     To migrate: Update Evolution API instance webhook URL to use token-based format:
     /webhooks/evolution/whatsapp/{webhook_token}
     """
@@ -900,6 +903,27 @@ async def evolution_webhook_legacy(
     timestamp = datetime.datetime.now().isoformat()
 
     logger.info(f"[Legacy Webhook] Received from instance: {instance_name}")
+
+    # SECURITY: Verify instance exists in database before processing
+    # This prevents processing of spoofed webhooks with fake instance names
+    from app.services.whatsapp_clinic_cache import get_whatsapp_clinic_cache
+
+    cache = get_whatsapp_clinic_cache()
+    clinic_info = await cache.get_or_fetch_clinic_info(instance_name)
+
+    if not clinic_info:
+        logger.warning(
+            f"[Legacy Webhook] REJECTED - Unknown instance: {instance_name} "
+            f"(IP: {request.client.host if request.client else 'unknown'})"
+        )
+        # Return 200 to not reveal information, but don't process
+        # Attacker can't distinguish between valid and invalid instances
+        return {"status": "ok", "instance": instance_name}
+
+    logger.info(
+        f"[Legacy Webhook] VERIFIED - instance: {instance_name}, "
+        f"clinic_id: {clinic_info.get('clinic_id')}"
+    )
 
     # Return immediately, process in background
     if body:
