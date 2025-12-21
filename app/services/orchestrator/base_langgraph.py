@@ -207,8 +207,8 @@ class BaseLangGraphOrchestrator:
         else:
             workflow.add_edge("entry", "intent_classify")
 
-        # Standard flow
-        workflow.add_edge("intent_classify", "memory_retrieve" if self.enable_memory else "process")
+        # Intent routing - subclasses can override _add_intent_routing() for custom routing
+        self._add_intent_routing(workflow)
 
         if self.enable_memory:
             workflow.add_edge("memory_retrieve", "knowledge_retrieve" if self.enable_rag else "process")
@@ -241,6 +241,15 @@ class BaseLangGraphOrchestrator:
         workflow.set_entry_point("entry")
 
         return workflow
+
+    def _add_intent_routing(self, workflow: StateGraph) -> None:
+        """
+        Add routing edges from intent_classify node.
+
+        Subclasses can override this to add conditional routing based on intent.
+        Default implementation goes directly to memory_retrieve or process.
+        """
+        workflow.add_edge("intent_classify", "memory_retrieve" if self.enable_memory else "process")
 
     # Core node implementations
 

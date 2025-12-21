@@ -7,6 +7,7 @@ This webhook handles messages from Evolution API using the expected URL pattern:
 
 from fastapi import APIRouter, Request, Path, Body, HTTPException
 from typing import Any, Dict, Optional
+from enum import Enum
 import os
 import json
 import logging
@@ -14,9 +15,16 @@ import asyncio
 from app.api.multilingual_message_processor import MessageRequest
 from app.api.pipeline_message_processor import get_message_processor
 from app.security.webhook_verification import verify_webhook_signature
-from app.services.message_router import MessageType  # Keep MessageType enum for logging
 from app.services.language_service import LanguageService
 import aiohttp
+
+
+class MessageType(Enum):
+    """Types of messages for logging"""
+    TEXT = "text"
+    VOICE = "voice"
+    VOICE_NOTE = "voice_note"
+    IMAGE = "image"
 
 logger = logging.getLogger(__name__)
 

@@ -161,18 +161,7 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
 
         workflow.add_edge("phi_check", "compliance_check")
 
-        # Add appointment handling based on intent
-        workflow.add_conditional_edges(
-            "intent_classify",
-            self.intent_router,
-            {
-                "appointment": "appointment_handler",
-                "price_query": "price_query",
-                "faq_query": "faq_lookup",
-                "insurance": "insurance_verify",
-                "general": "memory_retrieve" if self.enable_memory else "process"
-            }
-        )
+        # Intent routing is handled by _add_intent_routing() override
 
         workflow.add_edge("appointment_handler", "process")
         workflow.add_edge("price_query", "process")
@@ -196,6 +185,29 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         workflow.add_edge("phi_redact", "memory_store" if self.enable_memory else "exit")
 
         return workflow
+
+    def _add_intent_routing(self, workflow) -> None:
+        """
+        Override base class to add healthcare-specific intent routing.
+
+        Routes to specialized handlers for:
+        - appointment: Appointment booking flow
+        - price_query: Service pricing lookup
+        - faq_query: FAQ knowledge base lookup
+        - insurance: Insurance verification
+        - general: Standard conversation processing
+        """
+        workflow.add_conditional_edges(
+            "intent_classify",
+            self.intent_router,
+            {
+                "appointment": "appointment_handler",
+                "price_query": "price_query",
+                "faq_query": "faq_lookup",
+                "insurance": "insurance_verify",
+                "general": "memory_retrieve" if self.enable_memory else "process"
+            }
+        )
 
     async def phi_check_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
         """Check message for PHI and de-identify if needed"""
@@ -427,8 +439,40 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         """Handle price queries using the price query tool"""
         logger.debug(f"Price query - session: {state['session_id']}")
 
+        # Get language for localized responses
+        language = state.get('metadata', {}).get('language', 'en')
+
+        # Localized messages
+        messages = {
+            'ru': {
+                'no_tool': "Извините, но у меня сейчас нет доступа к информации о ценах.",
+                'header': "Вот цены на наши услуги:\n",
+                'contact': "Свяжитесь с нами",
+                'more': "\n... и ещё {} услуг доступно.",
+                'not_found': "Не удалось найти цены на '{}'. Уточните, пожалуйста, какая услуга вас интересует?",
+                'error': "Извините, возникла проблема с получением информации о ценах."
+            },
+            'es': {
+                'no_tool': "Lo siento, no tengo acceso a la información de precios en este momento.",
+                'header': "Aquí están los precios de nuestros servicios:\n",
+                'contact': "Contáctenos",
+                'more': "\n... y {} servicios más disponibles.",
+                'not_found': "No pude encontrar precios para '{}'. ¿Podría ser más específico sobre qué servicio le interesa?",
+                'error': "Lo siento, tengo problemas para acceder a la información de precios."
+            },
+            'en': {
+                'no_tool': "I apologize, but I don't have access to pricing information right now.",
+                'header': "Here are the prices for our services:\n",
+                'contact': "Contact us",
+                'more': "\n... and {} more services available.",
+                'not_found': "I couldn't find specific pricing for '{}'. Could you please be more specific about which service you're interested in?",
+                'error': "I apologize, I'm having trouble accessing pricing information right now."
+            }
+        }
+        msg = messages.get(language, messages['en'])
+
         if not self.price_query_tool:
-            state['response'] = "I apologize, but I don't have access to pricing information right now."
+            state['response'] = msg['no_tool']
             return state
 
         try:
@@ -438,7 +482,7 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
             # Remove common price-related words to get service name
             search_terms = message_lower
             for word in ['how', 'much', 'is', 'the', 'what', 'price', 'cost', 'fee', 'of', 'for',
-                        'сколько', 'стоит', 'цена', 'стоимость', '?', ',']:
+                        'сколько', 'стоит', 'цена', 'стоимость', 'cuánto', 'cuesta', 'precio', '?', ',']:
                 search_terms = search_terms.replace(word, ' ')
             search_terms = ' '.join(search_terms.split()).strip()
 
@@ -450,27 +494,24 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
 
             if services:
                 # Format response with prices
-                response_parts = [f"Here are the prices for our services:\n"]
+                response_parts = [msg['header']]
                 for i, service in enumerate(services[:3], 1):  # Show top 3
-                    price_str = f"{service['price']:.2f} {service['currency']}" if service['price'] else "Contact us"
-                    response_parts.append(f"{i}. **{service['name']}** - {price_str}")
+                    price_str = f"{service['price']:.2f} {service['currency']}" if service['price'] else msg['contact']
+                    response_parts.append(f"{i}. {service['name']} - {price_str}")
                     if service.get('description'):
                         response_parts.append(f"   {service['description']}")
 
                 if len(services) > 3:
-                    response_parts.append(f"\n... and {len(services) - 3} more services available.")
+                    response_parts.append(msg['more'].format(len(services) - 3))
 
                 state['response'] = '\n'.join(response_parts)
                 state['context']['services_found'] = services
             else:
-                state['response'] = (
-                    f"I couldn't find specific pricing for '{search_terms}'. "
-                    "Could you please be more specific about which service you're interested in?"
-                )
+                state['response'] = msg['not_found'].format(search_terms)
 
         except Exception as e:
             logger.error(f"Price query error: {e}")
-            state['response'] = "I apologize, I'm having trouble accessing pricing information right now."
+            state['response'] = msg['error']
 
         state['audit_trail'].append({
             "node": "price_query",
