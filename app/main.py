@@ -98,6 +98,16 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
     # Startup
     logger.info("Starting Healthcare Backend...")
+
+    # Initialize Arize Cloud observability (Gemini + LangGraph tracing)
+    # Uses multi-exporter mode to work alongside Langfuse without conflicts
+    try:
+        from app.observability.arize_tracer import init_arize
+        arize_provider = init_arize()
+        if arize_provider:
+            app.state.arize_tracer = arize_provider
+    except Exception as e:
+        logger.warning(f"Failed to initialize Arize observability: {e}")
     logger.info(f"Connected to Supabase: {os.getenv('SUPABASE_URL')}")
 
     # Initialize HIPAA compliance systems
@@ -335,9 +345,7 @@ app.include_router(webhooks.router)
 from app.api import calendar_demo
 app.include_router(calendar_demo.router)
 
-# Include knowledge management routes
-from app.api import knowledge_routes
-app.include_router(knowledge_routes.router)
+# Knowledge routes removed - Pinecone RAG deprecated, using tools-based knowledge only
 
 # Include integrations routes for Evolution API and other integrations
 from app.api import integrations_routes
@@ -1067,7 +1075,6 @@ async def debug_env():
     env_status = {}
 
     keys_to_check = [
-        'PINECONE_API_KEY',
         'OPENAI_API_KEY',
         'SUPABASE_URL',
         'SUPABASE_ANON_KEY',
