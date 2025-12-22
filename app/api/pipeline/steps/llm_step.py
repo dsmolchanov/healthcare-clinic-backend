@@ -343,43 +343,8 @@ class LLMGenerationStep(PipelineStep):
             return llm_response.content or ""
 
         except (ValueError, RuntimeError) as factory_error:
-            logger.warning(f"LLM Factory not available: {factory_error}, using direct OpenAI")
-            return await self._execute_direct_openai(ctx, messages, llm_start)
-
-    async def _execute_direct_openai(
-        self,
-        ctx: PipelineContext,
-        messages: List[Dict],
-        llm_start: float
-    ) -> str:
-        """Fallback to direct OpenAI when factory not available."""
-        from openai import AsyncOpenAI
-
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY not configured")
-
-        client = AsyncOpenAI(api_key=api_key)
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                max_tokens=300
-            ),
-            timeout=10.0
-        )
-
-        llm_latency_ms = int((time.time() - llm_start) * 1000)
-        ctx.llm_metrics = {
-            'llm_provider': 'openai',
-            'llm_model': 'gpt-4o-mini',
-            'llm_tokens_input': response.usage.prompt_tokens if response.usage else 0,
-            'llm_tokens_output': response.usage.completion_tokens if response.usage else 0,
-            'llm_latency_ms': llm_latency_ms,
-            'llm_cost_usd': 0
-        }
-
-        return response.choices[0].message.content
+            logger.error(f"LLM Factory not available: {factory_error}")
+            raise RuntimeError(f"LLM generation failed: {factory_error}")
 
     def _calculate_cost(self, llm_response) -> float:
         """Calculate LLM cost from response."""

@@ -11,7 +11,6 @@ Uses semantic similarity to check if:
 
 import logging
 from typing import Dict, Any, Optional, Tuple
-from openai import AsyncOpenAI
 import os
 import json
 
@@ -21,19 +20,16 @@ logger = logging.getLogger(__name__)
 class ContextRelevanceChecker:
     """Checks if context is relevant to current user message"""
 
-    def __init__(self):
-        self._client = None
-        self.model = os.environ.get('CONTEXT_CHECKER_MODEL', 'gpt-4o-mini')
+    def __init__(self, llm_factory=None):
+        self._llm_factory = llm_factory
+        self.model = os.environ.get('CONTEXT_CHECKER_MODEL', 'gemini-3-flash')
 
-    @property
-    def client(self) -> AsyncOpenAI:
-        """Lazy-load OpenAI client"""
-        if self._client is None:
-            api_key = os.environ.get('OPENAI_API_KEY')
-            if not api_key:
-                raise RuntimeError("OPENAI_API_KEY not set")
-            self._client = AsyncOpenAI(api_key=api_key)
-        return self._client
+    async def _get_factory(self):
+        """Get or create LLM factory instance"""
+        if self._llm_factory is None:
+            from app.services.llm import get_llm_factory
+            self._llm_factory = await get_llm_factory()
+        return self._llm_factory
 
     async def is_context_relevant(
         self,
@@ -104,8 +100,8 @@ Guidelines:
                 ])
                 prompt += f"\n\nRecent conversation:\n{history_text}"
 
-            completion = await self.client.chat.completions.create(
-                model=self.model,
+            factory = await self._get_factory()
+            response = await factory.generate(
                 messages=[
                     {
                         "role": "system",
@@ -116,11 +112,12 @@ Guidelines:
                         "content": prompt
                     }
                 ],
+                model=self.model,
                 temperature=0.1,
                 response_format={"type": "json_object"}
             )
 
-            result = json.loads(completion.choices[0].message.content)
+            result = json.loads(response.content)
 
             is_relevant = result.get('is_relevant', False)
             confidence = float(result.get('confidence', 0.0))
@@ -173,8 +170,8 @@ Return ONLY a JSON object:
 }}
 """
 
-            completion = await self.client.chat.completions.create(
-                model=self.model,
+            factory = await self._get_factory()
+            response = await factory.generate(
                 messages=[
                     {
                         "role": "system",
@@ -185,11 +182,12 @@ Return ONLY a JSON object:
                         "content": prompt
                     }
                 ],
+                model=self.model,
                 temperature=0.1,
                 response_format={"type": "json_object"}
             )
 
-            result = json.loads(completion.choices[0].message.content)
+            result = json.loads(response.content)
             logger.info(f"Extracted intent: {result.get('intent')} (new_request: {result.get('is_new_request')})")
 
             return result

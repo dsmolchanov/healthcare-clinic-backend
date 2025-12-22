@@ -3,7 +3,6 @@
 import logging
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta, timezone
-from openai import AsyncOpenAI
 import json
 import os
 
@@ -12,19 +11,16 @@ logger = logging.getLogger(__name__)
 class FollowupScheduler:
     """Schedules automatic follow-ups based on conversation context"""
 
-    def __init__(self):
-        self._client = None
-        self.model = os.environ.get('FOLLOWUP_SCHEDULER_MODEL', 'gpt-4o')
+    def __init__(self, llm_factory=None):
+        self._llm_factory = llm_factory
+        self.model = os.environ.get('FOLLOWUP_SCHEDULER_MODEL', 'gemini-3-flash')
 
-    @property
-    def client(self) -> AsyncOpenAI:
-        """Lazy-load OpenAI client"""
-        if self._client is None:
-            api_key = os.environ.get('OPENAI_API_KEY')
-            if not api_key:
-                raise RuntimeError("OPENAI_API_KEY environment variable not set")
-            self._client = AsyncOpenAI(api_key=api_key)
-        return self._client
+    async def _get_factory(self):
+        """Get or create LLM factory instance"""
+        if self._llm_factory is None:
+            from app.services.llm import get_llm_factory
+            self._llm_factory = await get_llm_factory()
+        return self._llm_factory
 
     async def analyze_and_schedule_followup(
         self,
@@ -87,8 +83,8 @@ Urgency guidelines:
         try:
             logger.info(f"Analyzing conversation for follow-up scheduling...")
 
-            completion = await self.client.chat.completions.create(
-                model=self.model,
+            factory = await self._get_factory()
+            response = await factory.generate(
                 messages=[
                     {
                         "role": "system",
@@ -99,11 +95,12 @@ Urgency guidelines:
                         "content": prompt
                     }
                 ],
+                model=self.model,
                 temperature=0.3,
                 response_format={"type": "json_object"}
             )
 
-            analysis = json.loads(completion.choices[0].message.content)
+            analysis = json.loads(response.content)
 
             # Calculate followup datetime with improved urgency mapping
             followup_at = None
