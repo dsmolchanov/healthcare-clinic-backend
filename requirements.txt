@@ -62,3 +62,8 @@ PyYAML==6.0.1
 stripe>=7.0.0
 # LangGraph memory optimization (TTL cache for orchestrators)
 cachetools>=5.3.0
+# Arize Cloud Observability (multi-exporter mode - works alongside Langfuse)
+# Using native OTLP exporter instead of arize-otel to avoid TracerProvider conflicts
+opentelemetry-exporter-otlp-proto-http>=1.28.0
+openinference-instrumentation-google-genai>=0.1.0
+openinference-instrumentation-langchain>=0.1.35

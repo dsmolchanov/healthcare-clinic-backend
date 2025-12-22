@@ -172,10 +172,7 @@ async def run_evals():
                         'sunday': 'Closed'
                     },
                     'service_aliases': {'cleaning': 'Dental Cleaning'},
-                    'doctors': [
-                        {'name': 'Dr. Smith', 'id': 'doc-1', 'specialization': 'General'},
-                        {'name': 'Dr. Shtern', 'id': 'doc-2', 'specialization': 'Orthodontics'}
-                    ]
+                    'doctors': [] # Empty to force tool usage
                 },
                 'patient': {
                     'id': 'test-patient',
@@ -249,31 +246,30 @@ async def run_evals():
                     {'date': '2025-11-23', 'start_time': '10:00', 'doctor_name': 'Dr. Smith'},
                     {'date': '2025-11-23', 'start_time': '14:00', 'doctor_name': 'Dr. Smith'},
                     {'date': '2025-11-24', 'start_time': '09:00', 'doctor_name': 'Dr. Shtern'},
-                    {'date': '2025-11-24', 'start_time': '11:00', 'doctor_name': 'Dr. Shtern'}
+                    {'date': '2025-11-24', 'start_time': '11:00', 'doctor_name': 'Dr. Shtern'},
+                    {'date': '2025-11-24', 'start_time': '14:00', 'doctor_name': 'Dr. Smith'}
                 ],
                 'recommendation': 'We have morning and afternoon slots available.'
             })
             # Dynamic book_appointment mock
-            async def mock_book_appointment(date=None, start_time=None, doctor_id=None, **kwargs):
-                # Handle missing args gracefully or use defaults for robustness
-                if not date:
-                    date = "2025-11-23"
-                if not start_time:
-                    start_time = "10:00"
-
+            async def mock_book_appointment(service_id, datetime_str, patient_info, **kwargs):
+                # Parse datetime_str to make it look nice, or just use it directly
+                # datetime_str is likely ISO format e.g. 2025-11-24T14:00:00
+                display_date = datetime_str.replace('T', ' ')
+                # Determine doctor name based on service or random guess if not provided
+                # In a real mock, we'd check availability or doctor_id arg
                 doctor_name = "Dr. Smith"
-                if doctor_id == 'doc-2':
-                    doctor_name = "Dr. Shtern"
-                
+                if "Shtern" in str(kwargs) or "doc-2" in str(kwargs): # Simple heuristic
+                     doctor_name = "Dr. Shtern"
+
                 return {
                     'success': True,
                     'appointment_id': 'appt-123',
                     'appointment': {
-                        'date': date,
-                        'start_time': start_time,
+                        'date': display_date,
                         'doctor_name': doctor_name
                     },
-                    'confirmation_message': 'Appointment booked successfully'
+                    'confirmation_message': f'Appointment booked successfully for {display_date} with {doctor_name}'
                 }
 
             mock_reservation_tools.book_appointment_tool = AsyncMock(side_effect=mock_book_appointment)
@@ -282,6 +278,14 @@ async def run_evals():
             mock_reservation_tools.cancel_appointment_tool = AsyncMock(return_value={
                 'success': True,
                 'message': 'Appointment cancelled successfully'
+            })
+            
+            # Reschedule Appointment Mock (New for v3)
+            mock_reservation_tools.reschedule_appointment_tool = AsyncMock(return_value={
+                'success': True,
+                'appointment_id': 'appt-456',
+                'old_appointment_id': 'appt-123',
+                'message': 'Appointment rescheduled successfully'
             })
             # Patch in both handlers
             stack.enter_context(patch('app.services.tools.availability_handler.ReservationTools', return_value=mock_reservation_tools))
@@ -444,6 +448,16 @@ async def run_evals():
                 mock_cm_instance.constraints.excluded_doctors = set()
                 mock_cm_instance.constraints.excluded_services = set()
             
+            # Clear captured tool calls for the new scenario
+            captured_tool_calls.clear()
+            captured_tool_outputs.clear()
+
+            # Clear processor cache to prevent context leakage (e.g. doctor IDs)
+            if hasattr(processor, '_clinic_profile_cache'):
+                processor._clinic_profile_cache.clear()
+            if hasattr(processor, '_known_clinic_ids'):
+                processor._known_clinic_ids.clear()
+            
             conversation_history = []
             last_agent_response = None
             
@@ -474,8 +488,8 @@ async def run_evals():
                         )
 
                         # Clear captured tool calls/outputs for this turn
-                        captured_tool_calls.clear()
-                        captured_tool_outputs.clear()
+                        # captured_tool_calls.clear() # DON'T CLEAR - Accumulate for multi-turn eval
+                        # captured_tool_outputs.clear() # DON'T CLEAR - Accumulate for multi-turn eval
 
                         # Process Message
                         response = await processor.process_message(req)

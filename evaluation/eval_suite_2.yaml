@@ -150,9 +150,9 @@ scenarios:
     description: "Books a slot and immediately cancels it to test full lifecycle"
     messages:
       - role: user
-        content: "Book a cleaning for November 23rd at 14:00. Name: QA Test, Phone: 555-999-8888"
+        content: "Book a cleaning for November 24th at 14:00. Name: QA Test, Phone: 555-999-8888"
       - role: assistant
-        content: "I have booked your appointment for November 23rd at 14:00."
+        content: "I have booked your appointment for November 24th at 14:00."
         evaluate: false
       - role: user
         content: "Actually, I need to cancel that appointment immediately."

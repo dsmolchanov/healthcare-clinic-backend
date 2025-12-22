@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head>
+    <title>Agentic Conversation Flow State</title>
+  </head>
+  <body>
+    <outline text="Incoming WhatsApp Message">
+      <outline text="1. Context Hydration (State Build)">
+        <outline text="Fetch Session (Redis/Supabase)" />
+        <outline text="Fetch Patient Profile (Identity &amp; Language)" />
+        <outline text="Fetch Clinic Config (Services, Doctors, Hours)" />
+        <outline text="Fetch Conversation History (Last 12 messages)" />
+      </outline>
+      <outline text="2. Intent Classification (Router Service)">
+        <outline text="Decision: Is Fast Path?">
+          <outline text="Yes: FAQ / Price / Service Info">
+            <outline text="Action: Retrieve cached answer (No LLM)" />
+            <outline text="Action: Return Response" />
+          </outline>
+          <outline text="No: Complex / Booking / General">
+            <outline text="Action: Proceed to LLM Flow" />
+          </outline>
+        </outline>
+      </outline>
+      <outline text="3. Constraint Management">
+        <outline text="Extract Hard Constraints">
+          <outline text="Negative: 'I do not want Dr. X'" />
+          <outline text="Positive: 'I only want Service Y'" />
+          <outline text="Temporal: 'Only mornings'" />
+        </outline>
+        <outline text="Update Session State (Persist Constraints)" />
+      </outline>
+      <outline text="4. LLM Execution Loop (The 'Brain')">
+        <outline text="Input: System Prompt + Context + Tools" />
+        <outline text="Tool Selection Strategy (Max 5 Turns)">
+          <outline text="Scenario: Information Retrieval">
+            <outline text="Tool: query_service_prices">
+              <outline text="Trigger: User asks for costs/rates" />
+              <outline text="Param: query (e.g., 'veneers')" />
+            </outline>
+            <outline text="Tool: get_clinic_info">
+              <outline text="Trigger: User asks about location, hours, or staff list" />
+              <outline text="Param: info_type (doctors, hours, location)" />
+            </outline>
+          </outline>
+          <outline text="Scenario: Booking Flow (High Priority)">
+            <outline text="Step 1: Discovery">
+              <outline text="Tool: check_availability">
+                <outline text="Trigger: 'I want to book', 'Do you have slots?'" />
+                <outline text="Logic: If Doctor specific -> Use doctor_id" />
+                <outline text="Logic: If Doctor specific but no service -> Default to 'Consultation'" />
+              </outline>
+            </outline>
+            <outline text="Step 2: Presentation">
+              <outline text="Action: Present slots to user" />
+            </outline>
+            <outline text="Step 3: Action (Commit)">
+              <outline text="Tool: book_appointment">
+                <outline text="Trigger: User confirms ('Yes', 'Book it', provides name)" />
+                <outline text="Requirement: Must have service_id from Step 1" />
+                <outline text="Requirement: Must have patient_info (Name/Phone)" />
+              </outline>
+            </outline>
+          </outline>
+          <outline text="Scenario: Appointment Management">
+            <outline text="Tool: cancel_appointment">
+              <outline text="Trigger: 'Cancel my visit'" />
+              <outline text="Param: appointment_id, reason" />
+            </outline>
+            <outline text="Tool: reschedule_appointment">
+              <outline text="Trigger: 'Change my time'" />
+              <outline text="Param: appointment_id, new_datetime" />
+            </outline>
+          </outline>
+        </outline>
+      </outline>
+      <outline text="5. Post-Processing &amp; Analysis">
+        <outline text="Sanitize Response (Remove &lt;think&gt; tags)" />
+        <outline text="Response Analyzer">
+          <outline text="Determine Turn Status (Resolved vs Pending)" />
+          <outline text="Did agent promise follow-up? -> Schedule Background Task" />
+        </outline>
+        <outline text="Async Logging (Supabase RPC)" />
+      </outline>
+      <outline text="Final Output to User" />
+    </outline>
+  </body>
+</opml>

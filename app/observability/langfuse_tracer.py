@@ -13,26 +13,28 @@ logger = logging.getLogger(__name__)
 
 # Initialize Langfuse client
 try:
-    from langfuse import Langfuse
-    from langfuse.decorators import observe, langfuse_context
+    from langfuse import Langfuse, observe
+    # Note: langfuse_context was removed in newer SDK versions
+    langfuse_context = None  # For backwards compatibility
 
     langfuse_client = Langfuse(
         public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
         secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-        host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+        host=os.getenv("LANGFUSE_HOST", "https://us.cloud.langfuse.com")
     )
 
     LANGFUSE_ENABLED = bool(os.getenv("LANGFUSE_PUBLIC_KEY"))
 
     if LANGFUSE_ENABLED:
-        logger.info("✅ Langfuse LLM observability enabled")
+        logger.info("✅ Langfuse LLM observability enabled (v3 SDK)")
     else:
         logger.info("Langfuse disabled (no LANGFUSE_PUBLIC_KEY set)")
 
-except ImportError:
-    logger.warning("Langfuse not installed. LLM observability disabled.")
+except ImportError as e:
+    logger.warning(f"Langfuse not installed: {e}. LLM observability disabled.")
     LANGFUSE_ENABLED = False
     langfuse_client = None
+    observe = None
 
 
 class LLMObservability:

@@ -12,7 +12,7 @@ from fastapi import APIRouter, Request, HTTPException, Header, Depends
 from pydantic import BaseModel
 import stripe
 
-from app.db.supabase_client import get_supabase_client
+from app.database import get_core_client, get_healthcare_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/billing", tags=["billing"])
@@ -31,6 +31,7 @@ class CheckoutSessionRequest(BaseModel):
     return_url: str
     cancel_url: str
     organization_id: Optional[str] = None  # If not provided, get from auth
+    specialist_count: int = 1  # Number of specialists for per-seat pricing
 
 
 class CheckoutSessionResponse(BaseModel):
@@ -59,14 +60,12 @@ class SubscriptionStatus(BaseModel):
 # Helper Functions
 # ==============================================================================
 
-async def get_or_create_stripe_customer(
-    supabase,
-    organization_id: str
-) -> str:
+async def get_or_create_stripe_customer(organization_id: str) -> str:
     """Get existing Stripe customer ID or create a new customer."""
+    core_client = get_core_client()
 
     # Get organization from core schema
-    org_result = supabase.schema('core').table("organizations").select(
+    org_result = core_client.table("organizations").select(
         "id, name, billing_email, stripe_customer_id"
     ).eq("id", organization_id).single().execute()
 
@@ -90,7 +89,7 @@ async def get_or_create_stripe_customer(
     )
 
     # Save customer ID to organization
-    supabase.schema('core').table("organizations").update({
+    core_client.table("organizations").update({
         "stripe_customer_id": customer.id
     }).eq("id", organization_id).execute()
 
@@ -98,10 +97,11 @@ async def get_or_create_stripe_customer(
     return customer.id
 
 
-async def get_tier_price_id(supabase, tier_name: str) -> tuple[str, str]:
+async def get_tier_price_id(tier_name: str) -> tuple[str, str]:
     """Get Stripe price ID for a tier. Returns (price_id, product_id)."""
+    healthcare_client = get_healthcare_client()
 
-    tier_result = supabase.schema('healthcare').table("subscription_tiers").select(
+    tier_result = healthcare_client.table("subscription_tiers").select(
         "stripe_product_id, stripe_price_id"
     ).eq("tier_name", tier_name).single().execute()
 
@@ -120,7 +120,6 @@ async def get_tier_price_id(supabase, tier_name: str) -> tuple[str, str]:
 
 
 async def log_billing_event(
-    supabase,
     organization_id: str,
     event_type: str,
     stripe_event_id: Optional[str] = None,
@@ -135,7 +134,8 @@ async def log_billing_event(
 ):
     """Log a billing event for audit trail."""
     try:
-        supabase.schema('healthcare').table("billing_events").insert({
+        healthcare_client = get_healthcare_client()
+        healthcare_client.table("billing_events").insert({
             "organization_id": organization_id,
             "clinic_id": clinic_id,
             "event_type": event_type,
@@ -167,8 +167,6 @@ async def create_checkout_session(request: CheckoutSessionRequest):
     if not stripe.api_key:
         raise HTTPException(status_code=500, detail="Stripe is not configured")
 
-    supabase = get_supabase_client()
-
     # For now, require organization_id in request
     # TODO: Get from authenticated user's JWT
     if not request.organization_id:
@@ -176,10 +174,10 @@ async def create_checkout_session(request: CheckoutSessionRequest):
 
     try:
         # Get or create Stripe customer
-        customer_id = await get_or_create_stripe_customer(supabase, request.organization_id)
+        customer_id = await get_or_create_stripe_customer(request.organization_id)
 
         # Get price ID for requested tier
-        price_id, product_id = await get_tier_price_id(supabase, request.tier_name)
+        price_id, product_id = await get_tier_price_id(request.tier_name)
 
         # Check if customer already has an active subscription
         # If so, they should use the customer portal for upgrades
@@ -190,25 +188,30 @@ async def create_checkout_session(request: CheckoutSessionRequest):
                 detail="You already have an active subscription. Use 'Manage Billing' to upgrade."
             )
 
+        # Use specialist count for quantity (per-seat pricing model)
+        quantity = max(1, request.specialist_count)
+
         # Create Checkout Session
         session = stripe.checkout.Session.create(
             mode="subscription",
             customer=customer_id,
             line_items=[{
                 "price": price_id,
-                "quantity": 1
+                "quantity": quantity  # Number of specialists
             }],
             success_url=request.return_url + "?session_id={CHECKOUT_SESSION_ID}&status=success",
             cancel_url=request.cancel_url + "?status=cancelled",
             subscription_data={
                 "metadata": {
                     "organization_id": request.organization_id,
-                    "tier_name": request.tier_name
+                    "tier_name": request.tier_name,
+                    "specialist_count": str(quantity)
                 }
             },
             metadata={
                 "organization_id": request.organization_id,
-                "tier_name": request.tier_name
+                "tier_name": request.tier_name,
+                "specialist_count": str(quantity)
             },
             # Enable automatic tax if configured in Stripe
             # automatic_tax={"enabled": True},
@@ -244,14 +247,13 @@ async def create_portal_session(request: PortalSessionRequest):
     if not stripe.api_key:
         raise HTTPException(status_code=500, detail="Stripe is not configured")
 
-    supabase = get_supabase_client()
-
     if not request.organization_id:
         raise HTTPException(status_code=400, detail="organization_id is required")
 
     try:
         # Get organization's Stripe customer ID
-        org_result = supabase.schema('core').table("organizations").select(
+        core_client = get_core_client()
+        org_result = core_client.table("organizations").select(
             "stripe_customer_id"
         ).eq("id", request.organization_id).single().execute()
 
@@ -284,11 +286,10 @@ async def create_portal_session(request: PortalSessionRequest):
 @router.get("/subscription-status", response_model=SubscriptionStatus)
 async def get_subscription_status(organization_id: str):
     """Get current subscription status for an organization."""
-
-    supabase = get_supabase_client()
+    healthcare_client = get_healthcare_client()
 
     # Get the first clinic for this organization
-    clinic_result = supabase.schema('healthcare').table("clinics").select(
+    clinic_result = healthcare_client.table("clinics").select(
         "id"
     ).eq("organization_id", organization_id).limit(1).execute()
 
@@ -302,7 +303,7 @@ async def get_subscription_status(organization_id: str):
     clinic_id = clinic_result.data[0]["id"]
 
     # Get subscription for this clinic
-    sub_result = supabase.schema('healthcare').table("clinic_subscriptions").select(
+    sub_result = healthcare_client.table("clinic_subscriptions").select(
         "tier, status, current_period_end, trial_ends_at, stripe_subscription_id"
     ).eq("clinic_id", clinic_id).single().execute()
 
@@ -355,7 +356,6 @@ async def stripe_webhook(
         logger.error(f"Invalid webhook signature: {e}")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    supabase = get_supabase_client()
     event_type = event["type"]
 
     logger.info(f"Received Stripe webhook: {event_type}")
@@ -363,19 +363,19 @@ async def stripe_webhook(
     try:
         # Handle different event types
         if event_type == "checkout.session.completed":
-            await handle_checkout_completed(supabase, event)
+            await handle_checkout_completed(event)
 
         elif event_type == "customer.subscription.updated":
-            await handle_subscription_updated(supabase, event)
+            await handle_subscription_updated(event)
 
         elif event_type == "customer.subscription.deleted":
-            await handle_subscription_deleted(supabase, event)
+            await handle_subscription_deleted(event)
 
         elif event_type == "invoice.payment_succeeded":
-            await handle_invoice_paid(supabase, event)
+            await handle_invoice_paid(event)
 
         elif event_type == "invoice.payment_failed":
-            await handle_invoice_failed(supabase, event)
+            await handle_invoice_failed(event)
 
         else:
             logger.info(f"Unhandled event type: {event_type}")
@@ -389,7 +389,7 @@ async def stripe_webhook(
         return {"status": "error", "message": str(e)}
 
 
-async def handle_checkout_completed(supabase, event):
+async def handle_checkout_completed(event):
     """Handle successful checkout - activate subscription."""
     session = event["data"]["object"]
 
@@ -408,8 +408,11 @@ async def handle_checkout_completed(supabase, event):
     # Get subscription details from Stripe
     subscription = stripe.Subscription.retrieve(subscription_id)
 
+    healthcare_client = get_healthcare_client()
+    core_client = get_core_client()
+
     # Get all clinics for this organization
-    clinics_result = supabase.schema('healthcare').table("clinics").select(
+    clinics_result = healthcare_client.table("clinics").select(
         "id"
     ).eq("organization_id", organization_id).execute()
 
@@ -418,7 +421,7 @@ async def handle_checkout_completed(supabase, event):
         clinic_id = clinic["id"]
 
         # Upsert clinic subscription
-        supabase.schema('healthcare').table("clinic_subscriptions").upsert({
+        healthcare_client.table("clinic_subscriptions").upsert({
             "clinic_id": clinic_id,
             "tier": tier_name,
             "status": "active",
@@ -435,13 +438,12 @@ async def handle_checkout_completed(supabase, event):
         logger.info(f"Activated subscription for clinic {clinic_id}")
 
     # Update organization's subscription_tier
-    supabase.schema('core').table("organizations").update({
+    core_client.table("organizations").update({
         "subscription_tier": tier_name
     }).eq("id", organization_id).execute()
 
     # Log billing event
     await log_billing_event(
-        supabase,
         organization_id=organization_id,
         event_type="checkout.session.completed",
         stripe_event_id=event["id"],
@@ -455,14 +457,17 @@ async def handle_checkout_completed(supabase, event):
     )
 
 
-async def handle_subscription_updated(supabase, event):
+async def handle_subscription_updated(event):
     """Handle subscription updates (upgrades/downgrades)."""
     subscription = event["data"]["object"]
     subscription_id = subscription.get("id")
     customer_id = subscription.get("customer")
 
+    core_client = get_core_client()
+    healthcare_client = get_healthcare_client()
+
     # Get organization by Stripe customer ID
-    org_result = supabase.schema('core').table("organizations").select(
+    org_result = core_client.table("organizations").select(
         "id"
     ).eq("stripe_customer_id", customer_id).single().execute()
 
@@ -482,7 +487,7 @@ async def handle_subscription_updated(supabase, event):
     price_id = items[0].get("price", {}).get("id")
 
     # Look up tier by price ID
-    tier_result = supabase.schema('healthcare').table("subscription_tiers").select(
+    tier_result = healthcare_client.table("subscription_tiers").select(
         "tier_name"
     ).eq("stripe_price_id", price_id).single().execute()
 
@@ -503,12 +508,12 @@ async def handle_subscription_updated(supabase, event):
     status = status_map.get(subscription.get("status"), "inactive")
 
     # Update all clinic subscriptions for this organization
-    clinics_result = supabase.schema('healthcare').table("clinics").select(
+    clinics_result = healthcare_client.table("clinics").select(
         "id"
     ).eq("organization_id", organization_id).execute()
 
     for clinic in clinics_result.data or []:
-        supabase.schema('healthcare').table("clinic_subscriptions").update({
+        healthcare_client.table("clinic_subscriptions").update({
             "tier": tier_name,
             "status": status,
             "current_period_start": datetime.fromtimestamp(
@@ -521,7 +526,7 @@ async def handle_subscription_updated(supabase, event):
         }).eq("stripe_subscription_id", subscription_id).execute()
 
     # Update organization tier
-    supabase.schema('core').table("organizations").update({
+    core_client.table("organizations").update({
         "subscription_tier": tier_name
     }).eq("id", organization_id).execute()
 
@@ -529,7 +534,6 @@ async def handle_subscription_updated(supabase, event):
 
     # Log billing event
     await log_billing_event(
-        supabase,
         organization_id=organization_id,
         event_type="customer.subscription.updated",
         stripe_event_id=event["id"],
@@ -540,14 +544,17 @@ async def handle_subscription_updated(supabase, event):
     )
 
 
-async def handle_subscription_deleted(supabase, event):
+async def handle_subscription_deleted(event):
     """Handle subscription cancellation."""
     subscription = event["data"]["object"]
     subscription_id = subscription.get("id")
     customer_id = subscription.get("customer")
 
+    core_client = get_core_client()
+    healthcare_client = get_healthcare_client()
+
     # Get organization by Stripe customer ID
-    org_result = supabase.schema('core').table("organizations").select(
+    org_result = core_client.table("organizations").select(
         "id"
     ).eq("stripe_customer_id", customer_id).single().execute()
 
@@ -558,20 +565,19 @@ async def handle_subscription_deleted(supabase, event):
     organization_id = org_result.data["id"]
 
     # Mark all clinic subscriptions as cancelled
-    supabase.schema('healthcare').table("clinic_subscriptions").update({
+    healthcare_client.table("clinic_subscriptions").update({
         "status": "cancelled",
         "updated_at": datetime.now(timezone.utc).isoformat()
     }).eq("stripe_subscription_id", subscription_id).execute()
 
     # Downgrade organization to starter (free tier)
-    supabase.schema('core').table("organizations").update({
+    core_client.table("organizations").update({
         "subscription_tier": "starter"
     }).eq("id", organization_id).execute()
 
     logger.info(f"Cancelled subscription {subscription_id} for org {organization_id}")
 
     await log_billing_event(
-        supabase,
         organization_id=organization_id,
         event_type="customer.subscription.deleted",
         stripe_event_id=event["id"],
@@ -581,7 +587,7 @@ async def handle_subscription_deleted(supabase, event):
     )
 
 
-async def handle_invoice_paid(supabase, event):
+async def handle_invoice_paid(event):
     """Handle successful invoice payment - extend subscription period."""
     invoice = event["data"]["object"]
     subscription_id = invoice.get("subscription")
@@ -591,8 +597,11 @@ async def handle_invoice_paid(supabase, event):
         # One-time payment, not subscription
         return
 
+    core_client = get_core_client()
+    healthcare_client = get_healthcare_client()
+
     # Get organization
-    org_result = supabase.schema('core').table("organizations").select(
+    org_result = core_client.table("organizations").select(
         "id"
     ).eq("stripe_customer_id", customer_id).single().execute()
 
@@ -605,7 +614,7 @@ async def handle_invoice_paid(supabase, event):
     subscription = stripe.Subscription.retrieve(subscription_id)
 
     # Update clinic subscriptions with new period
-    supabase.schema('healthcare').table("clinic_subscriptions").update({
+    healthcare_client.table("clinic_subscriptions").update({
         "status": "active",
         "current_period_end": datetime.fromtimestamp(
             subscription.current_period_end, tz=timezone.utc
@@ -616,7 +625,6 @@ async def handle_invoice_paid(supabase, event):
     logger.info(f"Invoice paid for subscription {subscription_id}")
 
     await log_billing_event(
-        supabase,
         organization_id=organization_id,
         event_type="invoice.payment_succeeded",
         stripe_event_id=event["id"],
@@ -629,7 +637,7 @@ async def handle_invoice_paid(supabase, event):
     )
 
 
-async def handle_invoice_failed(supabase, event):
+async def handle_invoice_failed(event):
     """Handle failed invoice payment - mark subscription as past_due."""
     invoice = event["data"]["object"]
     subscription_id = invoice.get("subscription")
@@ -638,8 +646,11 @@ async def handle_invoice_failed(supabase, event):
     if not subscription_id:
         return
 
+    core_client = get_core_client()
+    healthcare_client = get_healthcare_client()
+
     # Get organization
-    org_result = supabase.schema('core').table("organizations").select(
+    org_result = core_client.table("organizations").select(
         "id"
     ).eq("stripe_customer_id", customer_id).single().execute()
 
@@ -649,7 +660,7 @@ async def handle_invoice_failed(supabase, event):
     organization_id = org_result.data["id"]
 
     # Mark subscription as past_due
-    supabase.schema('healthcare').table("clinic_subscriptions").update({
+    healthcare_client.table("clinic_subscriptions").update({
         "status": "past_due",
         "updated_at": datetime.now(timezone.utc).isoformat()
     }).eq("stripe_subscription_id", subscription_id).execute()
@@ -657,7 +668,6 @@ async def handle_invoice_failed(supabase, event):
     logger.warning(f"Invoice payment failed for subscription {subscription_id}")
 
     await log_billing_event(
-        supabase,
         organization_id=organization_id,
         event_type="invoice.payment_failed",
         stripe_event_id=event["id"],

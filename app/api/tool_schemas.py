@@ -36,7 +36,7 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "query_service_prices",
-                "description": "Search for service prices. Supports English, Spanish, Russian, Portuguese queries.",
+                "description": "REQUIRED for ANY price question. Search clinic services and prices. Call this BEFORE answering about costs. Supports English, Spanish, Russian, Portuguese.",
                 "parameters": {
                     "type": "object",
                     "properties": {

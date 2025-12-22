@@ -83,11 +83,14 @@ class OpenAIAdapter(LLMAdapter):
 
         # GPT-5-nano only supports temperature=1 (default)
         # Remove temperature param to use default
+        # Get tool_choice - default to 'auto' but allow override
+        tool_choice = params.pop('tool_choice', 'auto')
+
         api_params = {
             "model": self.model,
             "messages": messages,
             "tools": tools,
-            "tool_choice": params.pop('tool_choice', 'auto'),
+            "tool_choice": tool_choice,
             "parallel_tool_calls": params.pop('parallel_tool_calls', True),
             "max_completion_tokens": max_tokens or self.capability.max_output_tokens,
             **params

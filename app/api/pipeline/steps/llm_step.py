@@ -4,6 +4,7 @@ LLMGenerationStep - Generate AI response using LLM with tools.
 Extracted from _generate_response() method (lines 845-1487).
 
 Phase 2A of the Agentic Flow Architecture Refactor.
+Phase 2B: Updated to use PromptComposer for modular prompts.
 """
 
 import os
@@ -18,11 +19,19 @@ from typing import Tuple, Dict, Any, List, Optional
 from ..base import PipelineStep
 from ..context import PipelineContext
 from app.domain.preferences.narrowing import NarrowingAction, NarrowingInstruction
+from app.prompts import (
+    PromptComposer,
+    build_doctors_text,
+    build_profile_section,
+    build_conversation_summary,
+    build_constraints_section,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # Question type to template mapping (LLM localizes based on user language)
+# Kept here for backward compatibility - also exported from app.prompts.components
 QUESTION_TEMPLATES = {
     "ask_for_service": "Ask what service the user needs (e.g., cleaning, checkup, whitening)",
     "ask_for_time": "Ask what day and time works best for the user",
@@ -51,7 +60,8 @@ class LLMGenerationStep(PipelineStep):
         llm_factory_getter=None,
         tool_executor=None,
         constraints_manager=None,
-        language_service=None
+        language_service=None,
+        prompt_composer=None
     ):
         """
         Initialize with LLM dependencies.
@@ -61,11 +71,13 @@ class LLMGenerationStep(PipelineStep):
             tool_executor: ToolExecutor for executing tool calls
             constraints_manager: ConstraintsManager for persisting tool call context
             language_service: LanguageService for response language detection
+            prompt_composer: PromptComposer for building system prompts (optional)
         """
         self._get_llm_factory = llm_factory_getter
         self._tool_executor = tool_executor
         self._constraints_manager = constraints_manager
         self._language_service = language_service
+        self._prompt_composer = prompt_composer or PromptComposer()
 
     @property
     def name(self) -> str:
@@ -139,346 +151,48 @@ class LLMGenerationStep(PipelineStep):
         return ctx, True
 
     def _build_system_prompt(self, ctx: PipelineContext) -> str:
-        """Build the system prompt with clinic context, constraints, profile."""
-        clinic_profile = ctx.clinic_profile or {}
+        """
+        Build the system prompt with clinic context, constraints, profile.
 
-        # Location
-        location_parts = []
-        if clinic_profile.get('city'):
-            location_parts.append(clinic_profile['city'])
-        if clinic_profile.get('state'):
-            location_parts.append(clinic_profile['state'])
-        if clinic_profile.get('country'):
-            location_parts.append(clinic_profile['country'])
-        profile_location = (
-            clinic_profile.get('location')
-            or ', '.join([p for p in location_parts if p])
-            or clinic_profile.get('timezone')
-            or 'Unknown'
-        )
-
-        # Services
-        services_list = clinic_profile.get('services') or []
-        services_text = ', '.join(services_list[:6]) if services_list else "Information available upon request"
-
-        # Doctors
-        doctors_list = clinic_profile.get('doctors') or []
-        doctors_text = self._build_doctors_text(doctors_list)
-
-        # Business hours
-        hours = clinic_profile.get('business_hours') or clinic_profile.get('hours') or {}
-        weekday_hours = hours.get('weekdays') or hours.get('monday') or "Not provided"
-        saturday_hours = hours.get('saturday') or "Not provided"
-        sunday_hours = hours.get('sunday') or "Not provided"
-
-        # Current date/time
-        now = datetime.now()
-        current_date = now.strftime('%Y-%m-%d')
-        current_day = now.strftime('%A')
-        current_time = now.strftime('%H:%M')
-        tomorrow = now + timedelta(days=1)
-        tomorrow_date = tomorrow.strftime('%Y-%m-%d')
-        tomorrow_day = tomorrow.strftime('%A')
-
-        # Today's hours
-        day_lower = current_day.lower()
-        if day_lower == 'sunday':
-            todays_hours = sunday_hours
-        elif day_lower == 'saturday':
-            todays_hours = saturday_hours
-        else:
-            todays_hours = weekday_hours
-
-        # Profile section
-        profile_section = self._build_profile_section(ctx)
-
-        # Conversation summary
-        conversation_summary = self._build_conversation_summary(ctx.session_messages)
-
-        # Previous session summary
-        previous_summary_section = ""
-        if ctx.previous_session_summary:
-            previous_summary_section = f"\n\nPREVIOUS SESSION CONTEXT:\n{ctx.previous_session_summary}\n(Use this context if relevant, but prioritize current user request)"
-
-        # Build main prompt
-        system_prompt = f"""You are a helpful AI assistant for {ctx.clinic_name}.
-Your goal is to assist patients with booking appointments, checking availability, and answering questions about the clinic.
-
-CLINIC INFORMATION:
-Name: {ctx.clinic_name} (ID: {ctx.effective_clinic_id})
-Location: {profile_location}
-Services: {services_text}
-{doctors_text}
-Business Hours:
-- Today ({current_day}): {todays_hours}
-- Weekdays: {weekday_hours}
-- Saturday: {saturday_hours}
-- Sunday: {sunday_hours}
-
-CURRENT DATE/TIME:
-- Today: {current_day}, {current_date}
-- Tomorrow: {tomorrow_day}, {tomorrow_date}
-- Current Time: {current_time}
-- Today's Hours: {todays_hours}
-
-DATE CALCULATION RULES:
-- "Tomorrow" = {tomorrow_date} ({tomorrow_day})
-- "Next Tuesday" = The first Tuesday AFTER today ({current_date}).
-- "This Tuesday" = The Tuesday of the current week.
-
-HALLUCINATION GUARD:
-- You must ONLY use dates returned by the tool.
-- If the tool returns NO slots, say "No slots available" and offer alternatives.
-- NEVER invent availability.
-
-Instructions:
-1. Maintain conversation language consistency
-2. Be friendly, professional, and helpful
-3. Use patient's name if known
-4. Maintain conversation context across turns
-5. Use tools when needed for prices, availability, bookings
-6. Keep responses concise (2-3 sentences)
-7. Phone number available: {ctx.from_phone} - use for bookings
-8. YOU ARE THE CLINIC - never suggest "call the clinic"
-
-BOOKING FLOW:
-1. User asks to book → call check_availability
-2. Present slots → wait for confirmation
-3. User confirms → call book_appointment immediately
-
-{profile_section}
-
-{conversation_summary}
-
-{previous_summary_section}
-
-{ctx.additional_context}"""
-
-        # Add constraints section
-        if ctx.constraints:
-            constraints_section = self._build_constraints_section(ctx.constraints)
-            if constraints_section:
-                system_prompt += f"\n\n{constraints_section}"
-
-        # Add narrowing control block at the beginning (most important)
-        if ctx.narrowing_instruction:
-            control_block = self._build_narrowing_control_block(ctx.narrowing_instruction)
-            if control_block:
-                system_prompt = control_block + "\n\n" + system_prompt
-
-        return system_prompt
+        Phase 2B: Delegates to PromptComposer for modular prompt composition.
+        """
+        return self._prompt_composer.compose(ctx)
 
     def _build_doctors_text(self, doctors_list: List) -> str:
-        """Build doctors section for prompt."""
-        if not doctors_list:
-            return "\nCLINIC STAFF: Information available upon request via get_clinic_info tool.\n"
+        """
+        Build doctors section for prompt.
 
-        doctors_text = "\nCLINIC STAFF (DOCTORS):\n"
-        for doc in doctors_list:
-            if isinstance(doc, dict):
-                name = doc.get('name', 'Unknown')
-                doc_id = doc.get('id', 'unknown')
-                spec = doc.get('specialization', 'General Dentist')
-                doctors_text += f"- {name} (ID: {doc_id}) - {spec}\n"
-            else:
-                doctors_text += f"- {doc}\n"
+        Phase 2B: Delegates to build_doctors_text from prompts.components.
+        """
+        return build_doctors_text(doctors_list)
 
-        return doctors_text
+    # NOTE: The following methods are kept for backward compatibility but are now
+    # deprecated. The PromptComposer handles all prompt building internally.
+    # These delegate to the functions in app.prompts.components.
 
     def _build_profile_section(self, ctx: PipelineContext) -> str:
-        """Build patient profile section for prompt."""
-        profile = ctx.profile
-        conversation_state = ctx.conversation_state
+        """
+        Build patient profile section for prompt.
 
-        if not profile or not conversation_state:
-            return ""
-
-        return f"""
-PATIENT PROFILE (CRITICAL - ALWAYS ENFORCE):
-Name: {profile.first_name} {profile.last_name}
-Bio: {profile.bio_summary}
-
-Medical History:
-  - Allergies: {', '.join(profile.allergies) if profile.allergies else 'None'}
-  - Implants: {'Yes' if profile.medical_history.get('implants') else 'No'}
-  - Chronic Conditions: {', '.join(profile.medical_history.get('chronic_conditions', []))}
-
-Hard Preferences:
-  - Language: {profile.preferred_language or 'auto-detect'}
-  - BANNED DOCTORS (NEVER SUGGEST): {', '.join(profile.hard_doctor_bans) if profile.hard_doctor_bans else 'None'}
-
-CURRENT CONVERSATION STATE:
-Episode Type: {conversation_state.episode_type}
-
-Booking Constraints:
-  - Desired Service: {conversation_state.desired_service or 'Not specified'}
-  - Desired Doctor: {conversation_state.current_constraints.get('desired_doctor', 'Not specified')}
-  - Excluded Doctors: {', '.join(conversation_state.excluded_doctors) if conversation_state.excluded_doctors else 'None'}
-  - Excluded Services: {', '.join(conversation_state.excluded_services) if conversation_state.excluded_services else 'None'}
-  - Time Window: {conversation_state.current_constraints.get('time_window', {}).get('display', 'Flexible')}
-
-ENFORCEMENT RULES:
-1. NEVER suggest doctors in BANNED DOCTORS list
-2. NEVER suggest doctors in Excluded Doctors
-3. NEVER suggest services in Excluded Services
-4. ALWAYS check allergies before procedures
-5. Respect language preference
-"""
+        DEPRECATED: Use PromptComposer.compose() instead.
+        """
+        return build_profile_section(ctx.profile, ctx.conversation_state)
 
     def _build_conversation_summary(self, session_messages: List) -> str:
-        """Build conversation summary from history."""
-        if not session_messages:
-            return ""
+        """
+        Build conversation summary from history.
 
-        user_name = None
-        mentioned_doctors = []
-        mentioned_services = []
-
-        for msg in session_messages:
-            if msg['role'] == 'user':
-                content = msg['content']
-                content_lower = content.lower()
-
-                # Extract name
-                if any(x in content_lower for x in ['me llamo', 'my name is', 'soy']):
-                    parts = content.split()
-                    for i, part in enumerate(parts):
-                        if part.lower() in ['llamo', 'soy', 'is'] and i + 1 < len(parts):
-                            potential = parts[i + 1].strip('.,!?')
-                            if potential and len(potential) > 2:
-                                user_name = potential
-                                break
-
-                # Track doctors
-                if any(x in content_lower for x in ['doctor', 'доктор', 'врач', 'dr.']):
-                    words = content.split()
-                    for i, word in enumerate(words):
-                        if word and word[0].isupper() and len(word) > 2:
-                            context_words = ' '.join(words[max(0, i-2):min(len(words), i+3)]).lower()
-                            if any(kw in context_words for kw in ['doctor', 'доктор', 'врач', 'dr']):
-                                mentioned_doctors.append(word)
-
-                # Track services
-                if any(x in content_lower for x in ['limpieza', 'cleaning', 'чистка']):
-                    mentioned_services.append('dental cleaning')
-                if any(x in content_lower for x in ['cita', 'appointment', 'запись']):
-                    mentioned_services.append('appointment scheduling')
-
-        if not any([user_name, mentioned_doctors, mentioned_services]):
-            return ""
-
-        summary = "\n\nIMPORTANT CONTEXT FROM THIS CONVERSATION:\n"
-        if user_name:
-            summary += f"- The user's name is {user_name}. USE THEIR NAME when appropriate.\n"
-        if mentioned_doctors:
-            unique_doctors = list(set(mentioned_doctors))
-            summary += f"- User has been asking about doctors: {', '.join(unique_doctors)}\n"
-        if mentioned_services:
-            summary += f"- User has expressed interest in: {', '.join(set(mentioned_services))}\n"
-
-        return summary
+        DEPRECATED: Use PromptComposer.compose() instead.
+        """
+        return build_conversation_summary(session_messages)
 
     def _build_constraints_section(self, constraints) -> str:
-        """Build constraints section for system prompt."""
-        if not constraints:
-            return ""
+        """
+        Build constraints section for system prompt.
 
-        if not (constraints.desired_service or constraints.desired_doctor or
-                constraints.excluded_doctors or constraints.excluded_services or
-                constraints.time_window_start):
-            return ""
-
-        lines = ["\n🔒 CONVERSATION CONSTRAINTS (MUST ENFORCE):\n"]
-
-        if constraints.desired_service:
-            lines.append(f"  - Current Service: {constraints.desired_service}")
-        if constraints.desired_doctor:
-            lines.append(f"  - Preferred Doctor: {constraints.desired_doctor}")
-        if constraints.excluded_doctors:
-            lines.append(f"  - NEVER suggest these doctors: {', '.join(constraints.excluded_doctors)}")
-        if constraints.excluded_services:
-            lines.append(f"  - NEVER suggest these services: {', '.join(constraints.excluded_services)}")
-        if constraints.time_window_start:
-            lines.append(
-                f"  - Time Window: {constraints.time_window_display} "
-                f"({constraints.time_window_start} to {constraints.time_window_end})"
-            )
-
-        lines.append("\nIMPORTANT: These constraints OVERRIDE all other context.\n")
-
-        return "\n".join(lines)
-
-    def _build_narrowing_control_block(self, instruction: Optional[NarrowingInstruction]) -> str:
-        """Build control block for LLM based on narrowing instruction."""
-        if not instruction:
-            return ""
-
-        if instruction.action == NarrowingAction.ASK_QUESTION:
-            # Build question guidance from type + args
-            question_type_str = instruction.question_type.value if instruction.question_type else ""
-            template = QUESTION_TEMPLATES.get(question_type_str, "Ask a clarifying question")
-
-            # Format template with args, handling missing keys gracefully
-            try:
-                question_guidance = template.format(**instruction.question_args)
-            except KeyError:
-                question_guidance = template
-
-            return f"""
-=== BOOKING CONTROL ===
-Case: {instruction.case}
-Action: ASK_QUESTION
-Question Type: {instruction.question_type}
-Guidance: {question_guidance}
-Args: {instruction.question_args}
-
-DO:
-- Ask this question in natural language, matching user's language
-- Wait for user's answer before proceeding
-DO NOT:
-- Call check_availability
-- Ask multiple questions at once
-=== END CONTROL ===
-"""
-
-        elif instruction.action == NarrowingAction.CALL_TOOL:
-            params = instruction.tool_call.params if instruction.tool_call else {}
-            return f"""
-=== BOOKING CONTROL ===
-Case: {instruction.case}
-Action: CALL_TOOL
-Tool: check_availability
-Parameters: {params}
-
-DO:
-- Call check_availability with EXACTLY these parameters
-- Present results naturally to user following SLOT PRESENTATION RULES below
-DO NOT:
-- Ask for more information first
-- Modify the parameters
-
-=== CRITICAL: SLOT RESPONSE FORMAT ===
-Tool returns: "SLOT: [day] [time]"
-
-YOUR RESPONSE MUST BE EXACTLY 5-7 WORDS. No more.
-Ask a simple yes/no confirmation in the USER'S LANGUAGE.
-
-Examples:
-- SLOT: tomorrow 09:00 → "Завтра в 9 подойдёт?" (if user speaks Russian)
-- SLOT: tomorrow 09:00 → "Tomorrow at 9 work?" (if user speaks English)
-- SLOT: Monday 14:30 → "¿El lunes a las 2:30?" (if user speaks Spanish)
-
-FORBIDDEN:
-- "I found available slots..."
-- "Here are the options..."
-- "Would you like to book..."
-- Any response longer than 10 words
-
-JUST ASK: "[time] [day] ok?"
-=== END CONTROL ===
-"""
-
-        return ""
+        DEPRECATED: Use PromptComposer.compose() instead.
+        """
+        return build_constraints_section(constraints)
 
     def _build_messages(self, system_prompt: str, ctx: PipelineContext) -> List[Dict]:
         """Build messages list for LLM."""
