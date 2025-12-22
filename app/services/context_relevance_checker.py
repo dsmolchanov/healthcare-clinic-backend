@@ -22,7 +22,7 @@ class ContextRelevanceChecker:
 
     def __init__(self, llm_factory=None):
         self._llm_factory = llm_factory
-        self.model = os.environ.get('CONTEXT_CHECKER_MODEL', 'gemini-3-flash-preview')
+        self.model = os.environ.get('CONTEXT_CHECKER_MODEL', 'gpt-4o-mini')
 
     async def _get_factory(self):
         """Get or create LLM factory instance"""
