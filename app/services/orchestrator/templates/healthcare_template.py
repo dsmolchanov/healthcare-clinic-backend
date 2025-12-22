@@ -749,26 +749,13 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         return "normal"
 
     def intent_router(self, state: HealthcareConversationState) -> str:
-        """Route based on classified intent"""
-        # Check for FAQ queries using keyword detection
-        message_lower = state.get('message', '').lower()
+        """Route all messages to general - let LLM use tools to handle intents.
 
-        # FAQ keywords (hours, location, insurance, parking, etc.)
-        if any(word in message_lower for word in ['hours', 'open', 'location', 'address', 'where', 'parking', 'do you accept', 'do you offer']):
-            return 'faq_query'
-
-        # Price queries - use stem matching for Russian morphology
-        price_stems = ['price', 'cost', 'fee', 'how much', 'сколько', 'стои', 'цен', 'стоимост']
-        if any(stem in message_lower for stem in price_stems):
-            return 'price_query'
-
-        intent = state.get('intent', 'general')
-        if intent == 'appointment':
-            return 'appointment'
-        elif intent == 'insurance':
-            return 'insurance'
-        else:
-            return 'general'
+        Legacy keyword-based routing removed. The process_node now uses LLM with
+        tools (query_service_prices, check_availability, etc.) to handle all intents.
+        """
+        # All messages go to process_node which has tool calling
+        return 'general'
 
     async def process(
         self,
