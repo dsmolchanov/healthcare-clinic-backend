@@ -437,57 +437,27 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
 
     async def price_query_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
         """
-        Handle price queries using cached services from context.
+        Enrich context with price query results for LLM.
 
-        Uses in-memory search on pre-cached clinic_services instead of database queries.
-        Services are cached during hydration step via get_clinic_bundle RPC.
+        This node ONLY searches and stores data - it does NOT generate responses.
+        The process_node will use this data to generate a natural LLM response.
+
+        Pattern: Nodes enrich context → LLM generates response
         """
         logger.debug(f"Price query - session: {state['session_id']}")
 
-        # Get language for localized responses
         language = state.get('metadata', {}).get('language', 'en')
-
-        # Localized message templates for natural conversation
-        messages = {
-            'ru': {
-                'no_services': "Извините, информация об услугах временно недоступна.",
-                'single': "{name} стоит {price}.",
-                'single_with_desc': "{name} стоит {price}. {desc}",
-                'multiple_intro': "Вот что я нашёл по вашему запросу:\n",
-                'item': "• {name} — {price}",
-                'contact': "цена по запросу",
-                'more': "\nЕсть ещё {} услуг. Хотите узнать подробнее?",
-                'not_found': "К сожалению, не нашёл услуги по запросу «{}». Какая именно услуга вас интересует?",
-            },
-            'es': {
-                'no_services': "Lo siento, la información de servicios no está disponible.",
-                'single': "{name} cuesta {price}.",
-                'single_with_desc': "{name} cuesta {price}. {desc}",
-                'multiple_intro': "Esto es lo que encontré:\n",
-                'item': "• {name} — {price}",
-                'contact': "consultar precio",
-                'more': "\nHay {} servicios más. ¿Desea más información?",
-                'not_found': "No encontré servicios para «{}». ¿Qué servicio le interesa?",
-            },
-            'en': {
-                'no_services': "Sorry, service information is temporarily unavailable.",
-                'single': "{name} costs {price}.",
-                'single_with_desc': "{name} costs {price}. {desc}",
-                'multiple_intro': "Here's what I found:\n",
-                'item': "• {name} — {price}",
-                'contact': "contact us for pricing",
-                'more': "\nThere are {} more services. Want to know more?",
-                'not_found': "I couldn't find services matching \"{}\". What service are you looking for?",
-            }
-        }
-        msg = messages.get(language, messages['en'])
 
         # Get cached services from context (populated by hydration step)
         cached_services = state.get('context', {}).get('clinic_services', [])
 
         if not cached_services:
             logger.warning(f"No cached services available for price query")
-            state['response'] = msg['no_services']
+            state['context']['price_query'] = {
+                'success': False,
+                'error': 'no_services_cached',
+                'results': []
+            }
             state['audit_trail'].append({
                 "node": "price_query",
                 "timestamp": datetime.utcnow().isoformat(),
@@ -504,13 +474,9 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
 
         # Remove common price-related words in multiple languages
         noise_words = [
-            # English
             'how', 'much', 'is', 'the', 'what', 'price', 'cost', 'fee', 'of', 'for', 'a', 'an',
-            # Russian
             'сколько', 'стоит', 'цена', 'стоимость', 'какая', 'какой', 'у', 'вас',
-            # Spanish
             'cuánto', 'cuesta', 'precio', 'cuanto', 'el', 'la', 'los', 'las', 'de', 'para',
-            # Punctuation
             '?', ',', '.', '!', '¿', '¡'
         ]
         for word in noise_words:
@@ -520,46 +486,32 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         # Search cached services with multilingual support
         services = self._search_services_in_memory(cached_services, search_terms, language)
 
-        if services:
-            # Format response naturally based on result count
-            first_service = services[0]
-            name = self._get_localized_field(first_service, 'name', language)
-            price = first_service.get('base_price') or first_service.get('price')
-            currency = first_service.get('currency', 'USD')
-            price_str = f"{float(price):.0f} {currency}" if price else msg['contact']
+        # Store results in context for LLM to use
+        # Format results with localized names for easier LLM consumption
+        formatted_results = []
+        for svc in services[:5]:  # Top 5 results
+            formatted_results.append({
+                'name': self._get_localized_field(svc, 'name', language),
+                'price': svc.get('base_price') or svc.get('price'),
+                'currency': svc.get('currency', 'USD'),
+                'description': self._get_localized_field(svc, 'description', language),
+                'duration_minutes': svc.get('duration_minutes'),
+                'category': svc.get('category')
+            })
 
-            if len(services) == 1:
-                # Single result - conversational response
-                desc = self._get_localized_field(first_service, 'description', language)
-                if desc:
-                    state['response'] = msg['single_with_desc'].format(
-                        name=name, price=price_str, desc=desc[:80]
-                    )
-                else:
-                    state['response'] = msg['single'].format(name=name, price=price_str)
-            else:
-                # Multiple results - brief list (max 4)
-                response_parts = [msg['multiple_intro']]
-                for service in services[:4]:
-                    svc_name = self._get_localized_field(service, 'name', language)
-                    svc_price = service.get('base_price') or service.get('price')
-                    svc_currency = service.get('currency', 'USD')
-                    svc_price_str = f"{float(svc_price):.0f} {svc_currency}" if svc_price else msg['contact']
-                    response_parts.append(msg['item'].format(name=svc_name, price=svc_price_str))
+        state['context']['price_query'] = {
+            'success': True,
+            'search_terms': search_terms,
+            'results': formatted_results,
+            'total_matches': len(services)
+        }
 
-                if len(services) > 4:
-                    response_parts.append(msg['more'].format(len(services) - 4))
-
-                state['response'] = '\n'.join(response_parts)
-
-            state['context']['services_found'] = services
-        else:
-            state['response'] = msg['not_found'].format(search_terms)
+        # DO NOT set state['response'] - let process_node (LLM) generate it
 
         state['audit_trail'].append({
             "node": "price_query",
             "timestamp": datetime.utcnow().isoformat(),
-            "services_found": len(services) if services else 0,
+            "services_found": len(services),
             "search_terms": search_terms,
             "cache_hit": True,
             "cached_services_count": len(cached_services)
@@ -708,27 +660,18 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
                 "top_score": faq_results[0].get('relevance_score', 0) if faq_results else 0
             })
 
-            # If high confidence match, format response directly
+            # Don't set response here - let process_node generate it via LLM
+            # The faq_results are stored in context for process_node to use
             if state['context']['faq_success']:
                 logger.info(f"FAQ found with high confidence: {faq_results[0]['question']}")
-                # Format top FAQ as response
-                faq = faq_results[0]
-                state['response'] = f"**{faq['question']}**\n\n{faq['answer']}"
-
-                # Add related FAQs if multiple found
-                if len(faq_results) > 1:
-                    state['response'] += "\n\n**Related questions:**"
-                    for i, related in enumerate(faq_results[1:3], 2):
-                        state['response'] += f"\n{i}. {related['question']}"
             else:
                 logger.info(f"FAQ match low confidence or no results, will try RAG fallback")
-                state['response'] = None  # Let RAG or LLM handle
 
         except Exception as e:
             logger.error(f"FAQ lookup error: {e}", exc_info=True)
             state['context']['faq_results'] = []
             state['context']['faq_success'] = False
-            state['response'] = None  # Fall back to general processing
+            # Don't set response - let process_node handle via LLM
 
         return state
 
@@ -937,6 +880,112 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
                 'error': str(e),
                 'state_transition': None,
             }
+
+    async def process_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Healthcare-specific process node that uses enriched context from specialized nodes.
+
+        This overrides base process_node to:
+        1. Check for specialized context (price_query, faq_results, etc.)
+        2. Inject those results prominently into the LLM prompt
+        3. Let LLM generate natural, conversational responses
+
+        Pattern: Nodes enrich context → LLM generates response
+        """
+        logger.debug(f"Healthcare process_node - session: {state['session_id']}")
+
+        # Check for specialized context that needs to be included in prompt
+        pipeline_ctx = state.get('context', {})
+        price_query = pipeline_ctx.get('price_query', {})
+        faq_results = pipeline_ctx.get('faq_results', [])
+
+        # Build specialized context section for LLM
+        specialized_context = []
+
+        # Include price query results if available
+        if price_query.get('success') and price_query.get('results'):
+            results = price_query['results']
+            price_info = "User asked about prices. Here are the matching services:\n"
+            for svc in results:
+                name = svc.get('name', 'Service')
+                price = svc.get('price')
+                currency = svc.get('currency', 'USD')
+                if price:
+                    price_info += f"- {name}: {price} {currency}\n"
+                else:
+                    price_info += f"- {name}: price varies\n"
+            specialized_context.append(price_info)
+            logger.info(f"[process_node] Injecting price query results: {len(results)} services")
+
+        # Include FAQ results if available (high confidence matches)
+        if faq_results and len(faq_results) > 0:
+            faq = faq_results[0]
+            if faq.get('relevance_score', 0) > 0.5:
+                faq_info = f"Relevant FAQ found:\nQ: {faq.get('question', '')}\nA: {faq.get('answer', '')}"
+                specialized_context.append(faq_info)
+                logger.info(f"[process_node] Injecting FAQ result")
+
+        # If we have specialized context, create enhanced prompt
+        if specialized_context:
+            # Get language for response
+            language = state.get('metadata', {}).get('language', 'en')
+            language_instruction = {
+                'ru': 'Respond in Russian.',
+                'es': 'Respond in Spanish.',
+                'pt': 'Respond in Portuguese.',
+                'he': 'Respond in Hebrew.',
+                'en': 'Respond in English.'
+            }.get(language, 'Respond in English.')
+
+            specialized_section = "\n\n".join(specialized_context)
+
+            # Build enhanced system prompt
+            enhanced_prompt = f"""You are a friendly healthcare assistant. Use the following information to answer the user's question naturally and conversationally.
+
+{specialized_section}
+
+Instructions:
+- {language_instruction}
+- Be natural and conversational, not robotic
+- Present prices in a helpful way, not as a formatted list
+- If multiple services match, mention the most relevant ones
+- Don't say "Here are the prices" - be more natural
+- Keep the response concise but friendly"""
+
+            if self.llm_factory:
+                try:
+                    messages = [
+                        {"role": "system", "content": enhanced_prompt},
+                        {"role": "user", "content": state['message']}
+                    ]
+
+                    response = await self.llm_factory.generate(
+                        messages=messages,
+                        model=self.primary_model,
+                        temperature=0.7,
+                        max_tokens=500
+                    )
+
+                    state['response'] = response.content
+                    state['metadata']['llm_provider'] = response.provider
+                    state['metadata']['llm_model'] = response.model
+                    state['metadata']['specialized_context_used'] = True
+
+                    state['audit_trail'].append({
+                        "node": "process",
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "llm_used": True,
+                        "specialized_context": True,
+                        "context_types": list(pipeline_ctx.keys())
+                    })
+
+                    return state
+
+                except Exception as e:
+                    logger.warning(f"LLM with specialized context failed: {e}, falling back to base")
+
+        # Fall back to base implementation for general queries
+        return await super().process_node(state)
 
     def _determine_state_transition(self, result: Dict[str, Any]) -> Optional[str]:
         """
