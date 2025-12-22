@@ -190,6 +190,7 @@ class PriceQueryTool:
         Use the multilingual resilient search with synonym expansion
 
         Strategy:
+        0. First try direct name_ru ILIKE search (fast path for Russian queries)
         1. Normalize query
         2. Expand synonyms
         3. Try multilingual search for each synonym until hit
@@ -197,6 +198,38 @@ class PriceQueryTool:
         """
         try:
             t0 = time.perf_counter()
+
+            # Fast path: try direct name_ru search first for Russian queries
+            if any(ord(c) > 1024 for c in query):  # Contains Cyrillic
+                try:
+                    direct_response = (
+                        self.healthcare_client.table("services")
+                        .select("id, name, name_ru, description, base_price, category, duration_minutes, currency, code")
+                        .eq("clinic_id", self.clinic_id)
+                        .eq("is_active", True)
+                        .ilike("name_ru", f"%{query}%")
+                        .limit(limit)
+                        .execute()
+                    )
+                    if direct_response.data:
+                        logger.info(f"✅ Direct name_ru search found {len(direct_response.data)} results for '{query}'")
+                        services = []
+                        for service in direct_response.data:
+                            services.append({
+                                "id": service["id"],
+                                "name": service.get("name_ru") or service["name"],
+                                "description": service.get("description", ""),
+                                "price": float(service["base_price"]) if service.get("base_price") else None,
+                                "currency": service.get("currency", "USD"),
+                                "category": service.get("category", ""),
+                                "duration_minutes": service.get("duration_minutes", 30),
+                                "code": service.get("code", ""),
+                                "relevance_score": 1.0,
+                                "search_stage": "direct_name_ru"
+                            })
+                        return services
+                except Exception as e:
+                    logger.debug(f"Direct name_ru search failed: {e}")
 
             # Generate session ID if not provided
             if not session_id:
@@ -374,7 +407,22 @@ class PriceQueryTool:
 
             response = query_builder.execute()
 
-            # If no results with name search, try description
+            # If no results with name search, try name_ru (Russian)
+            if not response.data and query:
+                query_builder = (
+                    self.healthcare_client.table("services")
+                    .select("id, name, name_ru, description, base_price, category, duration_minutes, currency, code")
+                    .eq("clinic_id", self.clinic_id)
+                    .eq("is_active", True)
+                    .ilike("name_ru", f"%{query}%")
+                    .order("name", desc=False)
+                    .limit(limit)
+                )
+                if category:
+                    query_builder = query_builder.ilike("category", f"%{category}%")
+                response = query_builder.execute()
+
+            # If still no results, try description
             if not response.data and query:
                 query_builder = (
                     self.healthcare_client.table("services")
