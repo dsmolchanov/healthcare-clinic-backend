@@ -6,6 +6,7 @@ Extends base orchestrator with PHI protection and appointment handling
 
 import sys
 import os
+import re
 
 from ..base_langgraph import BaseLangGraphOrchestrator, BaseConversationState, ComplianceMode, last_value
 from langgraph.graph import StateGraph, END
@@ -455,14 +456,18 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         search_terms = message_lower
 
         # Remove common price-related words in multiple languages
-        noise_words = [
-            'how', 'much', 'is', 'the', 'what', 'price', 'cost', 'fee', 'of', 'for', 'a', 'an',
-            'сколько', 'стоит', 'цена', 'стоимость', 'какая', 'какой', 'у', 'вас',
-            'cuánto', 'cuesta', 'precio', 'cuanto', 'el', 'la', 'los', 'las', 'de', 'para',
-            '?', ',', '.', '!', '¿', '¡'
+        # Use regex for Russian to handle morphological variants
+        noise_patterns = [
+            r'\bhow\b', r'\bmuch\b', r'\bis\b', r'\bthe\b', r'\bwhat\b', r'\bprice\b',
+            r'\bcost\b', r'\bfee\b', r'\bof\b', r'\bfor\b', r'\ba\b', r'\ban\b',
+            r'\bсколько\b', r'\bстои\w*\b', r'\bцен\w*\b', r'\bстоимост\w*\b',
+            r'\bкак\w*\b', r'\bу\b', r'\bвас\b', r'\bскажи\b', r'\bскажите\b',
+            r'\bcuánto\b', r'\bcuesta\b', r'\bprecio\b', r'\bcuanto\b',
+            r'\bel\b', r'\bla\b', r'\blos\b', r'\blas\b', r'\bde\b', r'\bpara\b',
+            r'[?,.!¿¡]'
         ]
-        for word in noise_words:
-            search_terms = search_terms.replace(word, ' ')
+        for pattern in noise_patterns:
+            search_terms = re.sub(pattern, ' ', search_terms, flags=re.IGNORECASE)
         search_terms = ' '.join(search_terms.split()).strip()
 
         # Search cached services with multilingual support
@@ -752,8 +757,9 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         if any(word in message_lower for word in ['hours', 'open', 'location', 'address', 'where', 'parking', 'do you accept', 'do you offer']):
             return 'faq_query'
 
-        # Price queries
-        if any(word in message_lower for word in ['price', 'cost', 'fee', 'how much', 'сколько', 'стоит', 'цена', 'стоимость']):
+        # Price queries - use stem matching for Russian morphology
+        price_stems = ['price', 'cost', 'fee', 'how much', 'сколько', 'стои', 'цен', 'стоимост']
+        if any(stem in message_lower for stem in price_stems):
             return 'price_query'
 
         intent = state.get('intent', 'general')
