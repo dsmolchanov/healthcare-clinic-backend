@@ -64,8 +64,11 @@ class GeminiAdapter(LLMAdapter):
                 logger.warning(f"Gemini response blocked by safety filters")
                 raise ValueError("Response blocked by safety filters")
 
+            # Extract text, filtering out thinking content
+            content = self._extract_response_text(response)
+
             return LLMResponse(
-                content=response.text if response.text else "",
+                content=content,
                 tool_calls=[],
                 provider=self.provider,
                 model=self.model,
@@ -119,8 +122,11 @@ class GeminiAdapter(LLMAdapter):
             # Normalize tool calls
             tool_calls = self.normalize_tool_calls(response)
 
+            # Extract text, filtering out thinking content
+            content = self._extract_response_text(response)
+
             return LLMResponse(
-                content=response.text if response.text else None,
+                content=content if content else None,
                 tool_calls=tool_calls,
                 provider=self.provider,
                 model=self.model,
@@ -161,14 +167,47 @@ class GeminiAdapter(LLMAdapter):
             contents=gemini_contents,
             config=config
         ):
-            if chunk.text:
-                yield chunk.text
+            # Filter out thinking content from streaming chunks
+            if chunk.candidates and chunk.candidates[0].content.parts:
+                for part in chunk.candidates[0].content.parts:
+                    # Skip thinking parts
+                    if hasattr(part, 'thought') and part.thought:
+                        continue
+                    if hasattr(part, 'text') and part.text:
+                        yield part.text
 
     def sanitize_parameters(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Remove unsupported parameters for Gemini"""
         # Gemini supports: top_p, top_k
         allowed = {'top_p', 'top_k'}
         return {k: v for k, v in params.items() if k in allowed}
+
+    def _extract_response_text(self, response: Any) -> str:
+        """
+        Extract text from response, filtering out thinking/thought content.
+
+        Gemini thinking models (2.5+, 3.x) may include 'thought' parts that contain
+        internal reasoning. These should not be sent to users.
+        """
+        if not response.candidates or not response.candidates[0].content.parts:
+            return ""
+
+        text_parts = []
+        for part in response.candidates[0].content.parts:
+            # Skip thinking/thought parts - check for 'thought' attribute
+            if hasattr(part, 'thought') and part.thought:
+                logger.debug(f"Filtered out thinking content: {part.text[:100] if part.text else ''}...")
+                continue
+
+            # Skip parts with thought_signature (encrypted thinking state)
+            if hasattr(part, 'thought_signature') and part.thought_signature:
+                continue
+
+            # Only include text parts (not function calls)
+            if hasattr(part, 'text') and part.text:
+                text_parts.append(part.text)
+
+        return "".join(text_parts)
 
     def normalize_tool_calls(self, response: Any) -> List[ToolCall]:
         """Normalize Gemini function calls to common format"""
