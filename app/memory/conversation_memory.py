@@ -52,10 +52,11 @@ class ConversationMemoryManager:
     """Manages persistent conversation memory with Supabase and mem0"""
 
     def __init__(self):
-        # Initialize Supabase client
+        # Initialize Supabase client with service role key to bypass RLS
+        # This is needed to read from healthcare.conversation_logs
         self.supabase: Client = create_client(
             os.environ.get('SUPABASE_URL', ''),
-            os.environ.get('SUPABASE_ANON_KEY', '')
+            os.environ.get('SUPABASE_SERVICE_KEY', '') or os.environ.get('SUPABASE_ANON_KEY', '')
         )
 
         # Session cache to avoid duplicate RPC calls
