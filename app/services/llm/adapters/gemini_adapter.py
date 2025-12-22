@@ -125,6 +125,11 @@ class GeminiAdapter(LLMAdapter):
             # Extract text, filtering out thinking content
             content = self._extract_response_text(response)
 
+            # Store raw response content for multi-turn conversations (preserves thought_signature)
+            raw_content = None
+            if response.candidates and response.candidates[0].content:
+                raw_content = response.candidates[0].content
+
             return LLMResponse(
                 content=content if content else None,
                 tool_calls=tool_calls,
@@ -135,7 +140,8 @@ class GeminiAdapter(LLMAdapter):
                     'output_tokens': response.usage_metadata.candidates_token_count if response.usage_metadata else 0,
                     'total_tokens': response.usage_metadata.total_token_count if response.usage_metadata else 0
                 },
-                latency_ms=latency_ms
+                latency_ms=latency_ms,
+                raw_response=raw_content
             )
 
         except Exception as e:
@@ -210,18 +216,33 @@ class GeminiAdapter(LLMAdapter):
         return "".join(text_parts)
 
     def normalize_tool_calls(self, response: Any) -> List[ToolCall]:
-        """Normalize Gemini function calls to common format"""
+        """Normalize Gemini function calls to common format, preserving thought_signature"""
         if not response.candidates[0].content.parts:
             return []
 
         normalized = []
-        for part in response.candidates[0].content.parts:
+        for idx, part in enumerate(response.candidates[0].content.parts):
             if hasattr(part, 'function_call') and part.function_call:
                 fc = part.function_call
+
+                # Extract thought_signature if present (required for Gemini 3 thinking models)
+                metadata = {}
+                if hasattr(part, 'thought_signature') and part.thought_signature:
+                    # Store as base64 string for JSON serialization
+                    import base64
+                    if isinstance(part.thought_signature, bytes):
+                        metadata['thought_signature'] = base64.b64encode(part.thought_signature).decode('utf-8')
+                    else:
+                        metadata['thought_signature'] = str(part.thought_signature)
+                    logger.debug(f"Captured thought_signature for function {fc.name}")
+
+                tool_call_id = f"gemini_{fc.name}_{int(time.time() * 1000)}_{idx}"
+
                 normalized.append(ToolCall(
-                    id=f"gemini_{fc.name}_{int(time.time() * 1000)}",  # Generate ID
+                    id=tool_call_id,
                     name=fc.name,
-                    arguments=dict(fc.args)
+                    arguments=dict(fc.args),
+                    metadata=metadata if metadata else None
                 ))
 
         return normalized
@@ -243,6 +264,12 @@ class GeminiAdapter(LLMAdapter):
             # Extract system instruction (Gemini handles separately)
             if role == 'system':
                 system_instruction = content
+                continue
+
+            # Check for raw Gemini content (preserves thought_signature)
+            raw_content = msg.get('_raw_gemini_content')
+            if raw_content and isinstance(raw_content, Content):
+                gemini_contents.append(raw_content)
                 continue
 
             # Convert user messages
@@ -273,12 +300,31 @@ class GeminiAdapter(LLMAdapter):
                         except json.JSONDecodeError:
                             func_args = {}
 
-                    parts.append(Part(
+                    # Check for thought_signature in metadata
+                    metadata = tc.get('metadata', {}) or {}
+                    thought_sig = metadata.get('thought_signature')
+
+                    fc_part = Part(
                         function_call=FunctionCall(
                             name=func.get('name', ''),
                             args=func_args
                         )
-                    ))
+                    )
+
+                    # Re-attach thought_signature if present
+                    if thought_sig:
+                        import base64
+                        try:
+                            # Decode from base64 if it was encoded
+                            if isinstance(thought_sig, str):
+                                fc_part.thought_signature = base64.b64decode(thought_sig)
+                            else:
+                                fc_part.thought_signature = thought_sig
+                            logger.debug(f"Re-attached thought_signature to function call")
+                        except Exception as e:
+                            logger.warning(f"Failed to decode thought_signature: {e}")
+
+                    parts.append(fc_part)
 
                 if parts:
                     gemini_contents.append(Content(role='model', parts=parts))

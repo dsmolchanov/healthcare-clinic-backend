@@ -292,7 +292,7 @@ class LLMGenerationStep(PipelineStep):
                                         desired_doctor=new_doctor_id
                                     )
 
-                    # Add tool results to messages
+                    # Add tool results to messages (include metadata for Gemini thought_signature)
                     messages.append({
                         "role": "assistant",
                         "content": llm_response.content or "",
@@ -303,7 +303,8 @@ class LLMGenerationStep(PipelineStep):
                                 "function": {
                                     "name": tc.name,
                                     "arguments": json.dumps(tc.arguments) if isinstance(tc.arguments, dict) else tc.arguments
-                                }
+                                },
+                                "metadata": tc.metadata  # Preserve provider-specific metadata (e.g., Gemini thought_signature)
                             }
                             for tc in llm_response.tool_calls
                         ]

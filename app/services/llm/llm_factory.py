@@ -198,10 +198,10 @@ class LLMFactory:
 
         # Route to model with tool support
         if not model:
-            # Default to gpt-4o-mini for tool calling
-            # Note: gemini-3-flash-preview requires thought_signature preservation for multi-turn tool calling
-            model = "gpt-4o-mini"
-            logger.info(f"Using gpt-4o-mini for tool calling (default)")
+            # Default to gemini-3-flash-preview for tool calling (fast, 1M context)
+            # Note: thought_signature is preserved via metadata in tool_calls
+            model = "gemini-3-flash-preview"
+            logger.info(f"Using gemini-3-flash-preview for tool calling (default)")
 
         # Get adapter
         adapter = await self.create_adapter(model)

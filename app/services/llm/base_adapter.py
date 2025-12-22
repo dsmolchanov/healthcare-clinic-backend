@@ -17,6 +17,7 @@ class ToolCall(BaseModel):
     id: str  # Unique ID for correlation
     name: str
     arguments: Dict[str, Any]
+    metadata: Optional[Dict[str, Any]] = None  # Provider-specific data (e.g., Gemini thought_signature)
 
 
 class LLMResponse(BaseModel):
@@ -28,6 +29,10 @@ class LLMResponse(BaseModel):
     usage: Dict[str, int]  # {input_tokens, output_tokens, total_tokens}
     latency_ms: int
     ttft_ms: Optional[int] = None
+    raw_response: Optional[Any] = None  # Raw provider response for preserving context (e.g., Gemini thought_signature)
+
+    class Config:
+        arbitrary_types_allowed = True
 
 
 class ModelCapability(BaseModel):
