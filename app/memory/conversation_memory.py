@@ -992,6 +992,7 @@ class ConversationMemoryManager:
             )
 
         clean_phone = phone_number.replace("@s.whatsapp.net", "")
+        logger.info(f"[get_conversation_history] phone={clean_phone}, clinic={clinic_id}, session_id={session_id}, include_all={include_all_sessions}")
 
         # Calculate cutoff time for message filtering
         from datetime import timezone
@@ -1018,11 +1019,13 @@ class ConversationMemoryManager:
             elif include_all_sessions:
                 # Get all messages from all sessions for this phone number
                 # Use LIKE matching to handle @lid/@s.whatsapp.net suffixes
+                logger.info(f"[get_conversation_history] Querying sessions with user_identifier LIKE '{clean_phone}%' AND clinic_id={clinic_id}")
                 sessions_result = self.supabase.schema('public').table('conversation_sessions').select('id').like(
                     'user_identifier', f'{clean_phone}%'
                 ).eq(
                     'metadata->>clinic_id', clinic_id
                 ).execute()
+                logger.info(f"[get_conversation_history] Found {len(sessions_result.data) if sessions_result.data else 0} sessions")
 
                 if not sessions_result.data:
                     return []
