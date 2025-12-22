@@ -350,82 +350,64 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         else:
             state['appointment_type'] = 'general'
 
-        # Use appointment tools if available
-        if self.appointment_tools:
-            # Check if user wants to book, cancel, or reschedule
-            if any(word in message for word in ['cancel', 'cancellation']):
-                # Handle cancellation
-                state['response'] = (
-                    "I can help you cancel your appointment. "
-                    "Please provide your appointment ID or the date/time of your appointment."
-                )
-            elif any(word in message for word in ['reschedule', 'change', 'move']):
-                # Handle rescheduling
-                state['response'] = (
-                    "I can help you reschedule your appointment. "
-                    "Please provide your current appointment details and your preferred new time."
-                )
-            else:
-                # Check availability for new appointment
-                availability_result = await self.appointment_tools.check_availability(
-                    doctor_id=state.get('doctor_id'),
-                    date=state.get('preferred_date'),
-                    appointment_type=state['appointment_type'],
-                    duration_minutes=30 if state['appointment_type'] == 'checkup' else 60
-                )
+        # Detect user action
+        action = 'book'  # default
+        if any(word in message for word in ['cancel', 'cancellation']):
+            action = 'cancel'
+        elif any(word in message for word in ['reschedule', 'change', 'move']):
+            action = 'reschedule'
 
-                if availability_result['success'] and availability_result.get('available_slots'):
-                    slots = availability_result['available_slots']
-                    state['context']['available_slots'] = slots
+        # Initialize appointment query context
+        appointment_query = {
+            'action': action,
+            'appointment_type': state['appointment_type'],
+            'preferred_date': state.get('preferred_date'),
+            'preferred_time': state.get('preferred_time'),
+            'doctor_id': state.get('doctor_id'),
+            'available_slots': [],
+            'has_availability': False,
+            'error': None,
+        }
 
-                    # Format response with available times
-                    if len(slots) > 3:
-                        # Show first 3 slots
-                        slot_list = []
-                        for slot in slots[:3]:
-                            start = datetime.fromisoformat(slot['start'])
-                            slot_list.append(start.strftime('%B %d at %I:%M %p'))
-
-                        state['response'] = (
-                            f"I can help you schedule a {state['appointment_type']}. "
-                            f"Here are some available times:\n"
-                            f"• {slot_list[0]}\n"
-                            f"• {slot_list[1]}\n"
-                            f"• {slot_list[2]}\n"
-                            f"\nWould any of these work for you? I have {len(slots)} total slots available."
-                        )
-                    else:
-                        state['response'] = (
-                            f"I can help you schedule a {state['appointment_type']}. "
-                            f"We have {len(slots)} available slots. "
-                            "What date and time works best for you?"
-                        )
-                else:
-                    state['response'] = (
-                        "I apologize, but we don't have any immediate availability. "
-                        "Would you like to check another date or be added to our waitlist?"
+        # Gather availability data if booking
+        if action == 'book':
+            if self.appointment_tools:
+                try:
+                    availability_result = await self.appointment_tools.check_availability(
+                        doctor_id=state.get('doctor_id'),
+                        date=state.get('preferred_date'),
+                        appointment_type=state['appointment_type'],
+                        duration_minutes=30 if state['appointment_type'] == 'checkup' else 60
                     )
-        elif self.appointment_service:
-            # Fall back to original appointment service if available
-            available_slots = await self.appointment_service.get_available_slots(
-                appointment_type=state['appointment_type'],
-                date_range=7
-            )
 
-            if available_slots:
-                state['context']['available_slots'] = available_slots
-                state['response'] = (
-                    f"I can help you schedule a {state['appointment_type']}. "
-                    f"We have {len(available_slots)} available slots in the next week. "
-                    "What date and time works best for you?"
-                )
-            else:
-                state['response'] = (
-                    "I apologize, but we don't have any immediate availability. "
-                    "Would you like to be added to our waitlist?"
-                )
-        else:
-            state['response'] = "I'll help you schedule an appointment. Please provide your preferred date and time."
+                    if availability_result['success'] and availability_result.get('available_slots'):
+                        slots = availability_result['available_slots']
+                        appointment_query['available_slots'] = slots
+                        appointment_query['has_availability'] = True
+                        state['context']['available_slots'] = slots
+                except Exception as e:
+                    logger.warning(f"Error checking availability: {e}")
+                    appointment_query['error'] = str(e)
+
+            elif self.appointment_service:
+                try:
+                    available_slots = await self.appointment_service.get_available_slots(
+                        appointment_type=state['appointment_type'],
+                        date_range=7
+                    )
+                    if available_slots:
+                        appointment_query['available_slots'] = available_slots
+                        appointment_query['has_availability'] = True
+                        state['context']['available_slots'] = available_slots
+                except Exception as e:
+                    logger.warning(f"Error checking availability: {e}")
+                    appointment_query['error'] = str(e)
+
+        # Store in context for LLM to generate response
+        state['context']['appointment_query'] = appointment_query
+        logger.info(f"[appointment_handler] Stored context: action={action}, has_availability={appointment_query['has_availability']}")
+
+        # DO NOT set state['response'] - let process_node handle via LLM
 
         state['audit_trail'].append({
             "node": "appointment_handler",
@@ -694,15 +676,34 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
             return "end"
 
     async def insurance_verify_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
-        """Verify insurance information"""
+        """
+        Gather insurance verification context for LLM.
+
+        This node ONLY gathers and stores data - it does NOT generate responses.
+        The process_node will use this data to generate a natural LLM response.
+
+        Pattern: Nodes enrich context → LLM generates response
+        """
         logger.debug(f"Insurance verification - session: {state['session_id']}")
 
-        # Placeholder for insurance verification
+        # Check for any provided insurance info in the message
+        message = state.get('message', '').lower()
+        has_provider = any(word in message for word in ['aetna', 'cigna', 'united', 'blue cross', 'kaiser', 'humana'])
+        has_member_id = any(char.isdigit() for char in message) and len([c for c in message if c.isdigit()]) > 5
+
+        # Store insurance context for LLM
+        state['context']['insurance_query'] = {
+            'action': 'verify',
+            'has_provider_info': has_provider,
+            'has_member_id': has_member_id,
+            'verified': False,
+            'needs_info': not (has_provider and has_member_id),
+        }
+
         state['insurance_verified'] = False
-        state['response'] = (
-            "I can help verify your insurance coverage. "
-            "Please provide your insurance provider and member ID."
-        )
+
+        # DO NOT set state['response'] - let process_node handle via LLM
+        logger.info(f"[insurance_verify] Stored context: needs_info={not (has_provider and has_member_id)}")
 
         state['audit_trail'].append({
             "node": "insurance_verify",
@@ -898,6 +899,8 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         pipeline_ctx = state.get('context', {})
         price_query = pipeline_ctx.get('price_query', {})
         faq_results = pipeline_ctx.get('faq_results', [])
+        appointment_query = pipeline_ctx.get('appointment_query', {})
+        insurance_query = pipeline_ctx.get('insurance_query', {})
 
         # Build specialized context section for LLM
         specialized_context = []
@@ -925,6 +928,80 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
                 specialized_context.append(faq_info)
                 logger.info(f"[process_node] Injecting FAQ result")
 
+        # Include appointment query results if available
+        if appointment_query:
+            action = appointment_query.get('action', 'book')
+            appointment_type = appointment_query.get('appointment_type', 'appointment')
+            has_availability = appointment_query.get('has_availability', False)
+            available_slots = appointment_query.get('available_slots', [])
+
+            if action == 'cancel':
+                appt_info = (
+                    "User wants to CANCEL an appointment.\n"
+                    "Ask them for their appointment ID or the date/time of their appointment to proceed."
+                )
+            elif action == 'reschedule':
+                appt_info = (
+                    "User wants to RESCHEDULE an appointment.\n"
+                    "Ask them for their current appointment details and their preferred new time."
+                )
+            elif has_availability and available_slots:
+                # Format slots for LLM
+                slot_descriptions = []
+                for slot in available_slots[:5]:  # Limit to 5 slots
+                    start = slot.get('start', '')
+                    if start:
+                        try:
+                            dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                            slot_descriptions.append(dt.strftime('%B %d at %I:%M %p'))
+                        except:
+                            slot_descriptions.append(start)
+
+                appt_info = (
+                    f"User wants to book a {appointment_type}.\n"
+                    f"Available time slots ({len(available_slots)} total):\n"
+                    + "\n".join(f"- {s}" for s in slot_descriptions)
+                    + "\nHelp them choose a time or offer alternatives if needed."
+                )
+            else:
+                appt_info = (
+                    f"User wants to book a {appointment_type}.\n"
+                    "No immediate availability found.\n"
+                    "Offer to check another date, add them to a waitlist, or suggest alternatives."
+                )
+
+            specialized_context.append(appt_info)
+            logger.info(f"[process_node] Injecting appointment context: action={action}, has_availability={has_availability}")
+
+        # Include insurance query results if available
+        if insurance_query:
+            needs_info = insurance_query.get('needs_info', True)
+            has_provider = insurance_query.get('has_provider_info', False)
+            has_member_id = insurance_query.get('has_member_id', False)
+
+            if needs_info:
+                missing = []
+                if not has_provider:
+                    missing.append("insurance provider name")
+                if not has_member_id:
+                    missing.append("member ID")
+
+                insurance_info = (
+                    "User wants to verify their insurance coverage.\n"
+                    f"Still need: {', '.join(missing)}.\n"
+                    "Ask them for the missing information in a helpful way."
+                )
+            else:
+                insurance_info = (
+                    "User wants to verify their insurance coverage.\n"
+                    "They've provided their insurance provider and member ID.\n"
+                    "Let them know you'll verify their coverage and get back to them, "
+                    "or ask if they have any other questions."
+                )
+
+            specialized_context.append(insurance_info)
+            logger.info(f"[process_node] Injecting insurance context: needs_info={needs_info}")
+
         # If we have specialized context, create enhanced prompt
         if specialized_context:
             # Get language for response
@@ -948,8 +1025,9 @@ Instructions:
 - {language_instruction}
 - Be natural and conversational, not robotic
 - Present prices in a helpful way, not as a formatted list
+- For appointments: mention 2-3 available times naturally, not as a bullet list
+- If user wants to cancel/reschedule, be helpful and ask for needed info
 - If multiple services match, mention the most relevant ones
-- Don't say "Here are the prices" - be more natural
 - Keep the response concise but friendly"""
 
             if self.llm_factory:
