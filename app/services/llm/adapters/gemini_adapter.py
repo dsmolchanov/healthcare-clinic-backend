@@ -1,9 +1,10 @@
 import os
 import json
 import time
-from typing import Dict, List, Any, Optional, AsyncIterator
+from typing import Dict, List, Any, Optional, AsyncIterator, Tuple
 from google import genai
 from google.genai import types
+from google.genai.types import Content, Part, FunctionCall, FunctionResponse
 from app.services.llm.base_adapter import LLMAdapter, LLMResponse, ToolCall, ModelCapability
 import logging
 
@@ -36,36 +37,42 @@ class GeminiAdapter(LLMAdapter):
 
         params = self.sanitize_parameters(kwargs)
 
-        # Convert messages to Gemini format
-        gemini_messages = self._convert_messages(messages)
+        # Convert messages and extract system instruction
+        system_instruction, gemini_contents = self._convert_messages(messages)
 
         try:
+            config = types.GenerateContentConfig(
+                temperature=temperature,
+                max_output_tokens=max_tokens or self.capability.max_output_tokens,
+                **params
+            )
+
+            # Add system instruction if present
+            if system_instruction:
+                config.system_instruction = system_instruction
+
             response = await self.client.aio.models.generate_content(
                 model=self.model,
-                contents=gemini_messages,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens or self.capability.max_output_tokens,
-                    **params
-                )
+                contents=gemini_contents,
+                config=config
             )
 
             latency_ms = int((time.time() - start_time) * 1000)
 
             # Handle safety blocks
-            if response.candidates[0].finish_reason == 'SAFETY':
+            if response.candidates and response.candidates[0].finish_reason == 'SAFETY':
                 logger.warning(f"Gemini response blocked by safety filters")
                 raise ValueError("Response blocked by safety filters")
 
             return LLMResponse(
-                content=response.text,
+                content=response.text if response.text else "",
                 tool_calls=[],
                 provider=self.provider,
                 model=self.model,
                 usage={
-                    'input_tokens': response.usage_metadata.prompt_token_count,
-                    'output_tokens': response.usage_metadata.candidates_token_count,
-                    'total_tokens': response.usage_metadata.total_token_count
+                    'input_tokens': response.usage_metadata.prompt_token_count if response.usage_metadata else 0,
+                    'output_tokens': response.usage_metadata.candidates_token_count if response.usage_metadata else 0,
+                    'total_tokens': response.usage_metadata.total_token_count if response.usage_metadata else 0
                 },
                 latency_ms=latency_ms
             )
@@ -76,7 +83,7 @@ class GeminiAdapter(LLMAdapter):
 
     async def generate_with_tools(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
@@ -86,19 +93,25 @@ class GeminiAdapter(LLMAdapter):
         start_time = time.time()
 
         params = self.sanitize_parameters(kwargs)
-        gemini_messages = self._convert_messages(messages)
+        system_instruction, gemini_contents = self._convert_messages(messages)
         gemini_tools = self._convert_tools(tools)
 
         try:
+            config = types.GenerateContentConfig(
+                temperature=temperature,
+                max_output_tokens=max_tokens or self.capability.max_output_tokens,
+                tools=gemini_tools,
+                **params
+            )
+
+            # Add system instruction if present
+            if system_instruction:
+                config.system_instruction = system_instruction
+
             response = await self.client.aio.models.generate_content(
                 model=self.model,
-                contents=gemini_messages,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens or self.capability.max_output_tokens,
-                    tools=gemini_tools,  # Tools should be in config, not separate parameter
-                    **params
-                )
+                contents=gemini_contents,
+                config=config
             )
 
             latency_ms = int((time.time() - start_time) * 1000)
@@ -112,9 +125,9 @@ class GeminiAdapter(LLMAdapter):
                 provider=self.provider,
                 model=self.model,
                 usage={
-                    'input_tokens': response.usage_metadata.prompt_token_count,
-                    'output_tokens': response.usage_metadata.candidates_token_count,
-                    'total_tokens': response.usage_metadata.total_token_count
+                    'input_tokens': response.usage_metadata.prompt_token_count if response.usage_metadata else 0,
+                    'output_tokens': response.usage_metadata.candidates_token_count if response.usage_metadata else 0,
+                    'total_tokens': response.usage_metadata.total_token_count if response.usage_metadata else 0
                 },
                 latency_ms=latency_ms
             )
@@ -132,16 +145,21 @@ class GeminiAdapter(LLMAdapter):
     ) -> AsyncIterator[str]:
         """Stream response chunks"""
         params = self.sanitize_parameters(kwargs)
-        gemini_messages = self._convert_messages(messages)
+        system_instruction, gemini_contents = self._convert_messages(messages)
+
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens or self.capability.max_output_tokens,
+            **params
+        )
+
+        if system_instruction:
+            config.system_instruction = system_instruction
 
         async for chunk in self.client.aio.models.generate_content_stream(
             model=self.model,
-            contents=gemini_messages,
-            config=types.GenerateContentConfig(
-                temperature=temperature,
-                max_output_tokens=max_tokens or self.capability.max_output_tokens,
-                **params
-            )
+            contents=gemini_contents,
+            config=config
         ):
             if chunk.text:
                 yield chunk.text
@@ -169,12 +187,86 @@ class GeminiAdapter(LLMAdapter):
 
         return normalized
 
-    def _convert_messages(self, messages: List[Dict[str, str]]) -> str:
-        """Convert OpenAI message format to Gemini format"""
-        # Simple conversion: join user messages
-        # For more complex conversion, handle system/user/assistant separately
-        user_messages = [m['content'] for m in messages if m['role'] == 'user']
-        return '\n'.join(user_messages)
+    def _convert_messages(self, messages: List[Dict[str, Any]]) -> Tuple[Optional[str], List[Content]]:
+        """
+        Convert OpenAI message format to Gemini format.
+
+        Returns:
+            Tuple of (system_instruction, contents_list)
+        """
+        system_instruction = None
+        gemini_contents = []
+
+        for msg in messages:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+
+            # Extract system instruction (Gemini handles separately)
+            if role == 'system':
+                system_instruction = content
+                continue
+
+            # Convert user messages
+            if role == 'user':
+                gemini_contents.append(Content(
+                    role='user',
+                    parts=[Part(text=content if content else '')]
+                ))
+
+            # Convert assistant messages (may include tool calls)
+            elif role == 'assistant':
+                parts = []
+
+                # Add text content if present
+                if content:
+                    parts.append(Part(text=content))
+
+                # Add tool/function calls if present
+                tool_calls = msg.get('tool_calls', [])
+                for tc in tool_calls:
+                    func = tc.get('function', {})
+                    func_args = func.get('arguments', '{}')
+
+                    # Parse arguments if string
+                    if isinstance(func_args, str):
+                        try:
+                            func_args = json.loads(func_args)
+                        except json.JSONDecodeError:
+                            func_args = {}
+
+                    parts.append(Part(
+                        function_call=FunctionCall(
+                            name=func.get('name', ''),
+                            args=func_args
+                        )
+                    ))
+
+                if parts:
+                    gemini_contents.append(Content(role='model', parts=parts))
+
+            # Convert tool results
+            elif role == 'tool':
+                tool_name = msg.get('name', msg.get('tool_call_id', 'unknown'))
+                tool_content = content
+
+                # Parse content if JSON string
+                if isinstance(tool_content, str):
+                    try:
+                        tool_content = json.loads(tool_content)
+                    except json.JSONDecodeError:
+                        tool_content = {'result': tool_content}
+
+                gemini_contents.append(Content(
+                    role='user',  # Tool responses are from user perspective in Gemini
+                    parts=[Part(
+                        function_response=FunctionResponse(
+                            name=tool_name,
+                            response=tool_content if isinstance(tool_content, dict) else {'result': tool_content}
+                        )
+                    )]
+                ))
+
+        return system_instruction, gemini_contents
 
     def _convert_tools(self, tools: List[Dict[str, Any]]) -> List[types.Tool]:
         """Convert OpenAI tool format to Gemini Tool format"""
