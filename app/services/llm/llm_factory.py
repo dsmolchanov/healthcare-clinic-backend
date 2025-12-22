@@ -23,10 +23,10 @@ class LLMFactory:
         """Lazily initialize builtin model capabilities"""
         if not cls.BUILTIN_MODELS:
             cls.BUILTIN_MODELS = {
-                'gemini-3-flash': ModelCapability(
+                'gemini-3-flash-preview': ModelCapability(
                     provider='google',
-                    model_name='gemini-3-flash',
-                    display_name='Gemini 3 Flash',
+                    model_name='gemini-3-flash-preview',
+                    display_name='Gemini 3 Flash Preview',
                     input_price_per_1m=0.10,
                     output_price_per_1m=0.40,
                     max_input_tokens=1000000,
@@ -113,10 +113,10 @@ class LLMFactory:
                 capability = await self.capability_matrix.load_model(model_name)
             except Exception as e:
                 logger.warning(f"Failed to load model {model_name} from database: {e}")
-                # Default to gemini-3-flash if model not found
-                if 'gemini-3-flash' in builtin:
-                    logger.info(f"Falling back to gemini-3-flash")
-                    capability = builtin['gemini-3-flash']
+                # Default to gemini-3-flash-preview if model not found
+                if 'gemini-3-flash-preview' in builtin:
+                    logger.info(f"Falling back to gemini-3-flash-preview")
+                    capability = builtin['gemini-3-flash-preview']
                 elif 'gpt-4o-mini' in builtin:
                     logger.info(f"Falling back to gpt-4o-mini")
                     capability = builtin['gpt-4o-mini']
@@ -198,9 +198,9 @@ class LLMFactory:
 
         # Route to model with tool support
         if not model:
-            # Default to gemini-3-flash for tool calling (fast, cost-effective, 1M context)
-            model = "gemini-3-flash"
-            logger.info(f"Using gemini-3-flash for tool calling (default)")
+            # Default to gemini-3-flash-preview for tool calling (fast, cost-effective, 1M context)
+            model = "gemini-3-flash-preview"
+            logger.info(f"Using gemini-3-flash-preview for tool calling (default)")
 
         # Get adapter
         adapter = await self.create_adapter(model)
@@ -243,8 +243,8 @@ class LLMFactory:
         try:
             default_model = await self.capability_matrix.get_default_model()
         except Exception as e:
-            logger.warning(f"Failed to get default model: {e}, using builtin gemini-3-flash")
-            adapter = await self.create_adapter("gemini-3-flash")
+            logger.warning(f"Failed to get default model: {e}, using builtin gemini-3-flash-preview")
+            adapter = await self.create_adapter("gemini-3-flash-preview")
             response = await adapter.generate(
                 messages=messages,
                 temperature=temperature,
@@ -255,9 +255,9 @@ class LLMFactory:
             return response
 
         if default_model.model_name == failed_model:
-            # Default already failed, try gemini-3-flash builtin
-            logger.warning("Default model failed, trying gemini-3-flash fallback")
-            adapter = await self.create_adapter("gemini-3-flash")
+            # Default already failed, try gemini-3-flash-preview builtin
+            logger.warning("Default model failed, trying gemini-3-flash-preview fallback")
+            adapter = await self.create_adapter("gemini-3-flash-preview")
         else:
             logger.warning(f"Falling back to default model: {default_model.model_name}")
             adapter = await self.create_adapter(default_model.model_name)
@@ -281,9 +281,9 @@ class LLMFactory:
         max_tokens: Optional[int],
         **kwargs
     ) -> LLMResponse:
-        """Fallback to gemini-3-flash for tool calling"""
-        # Try gemini-3-flash first (builtin, no DB dependency)
-        fallback_model = "gemini-3-flash" if failed_model != "gemini-3-flash" else "gpt-4o-mini"
+        """Fallback to gemini-3-flash-preview for tool calling"""
+        # Try gemini-3-flash-preview first (builtin, no DB dependency)
+        fallback_model = "gemini-3-flash-preview" if failed_model != "gemini-3-flash-preview" else "gpt-4o-mini"
         logger.warning(f"Tool calling failed, falling back to {fallback_model}")
         adapter = await self.create_adapter(fallback_model)
 
