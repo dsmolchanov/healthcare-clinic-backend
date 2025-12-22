@@ -198,9 +198,9 @@ class LLMFactory:
 
         # Route to model with tool support
         if not model:
-            # Default to gemini-3-flash-preview for tool calling (fast, cost-effective, 1M context)
-            model = "gemini-3-flash-preview"
-            logger.info(f"Using gemini-3-flash-preview for tool calling (default)")
+            # Default to gpt-4o-mini for tool calling (stable, proven)
+            model = "gpt-4o-mini"
+            logger.info(f"Using gpt-4o-mini for tool calling (default)")
 
         # Get adapter
         adapter = await self.create_adapter(model)
