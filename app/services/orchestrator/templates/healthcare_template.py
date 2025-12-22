@@ -447,28 +447,37 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         # Get language for localized responses
         language = state.get('metadata', {}).get('language', 'en')
 
-        # Localized messages
+        # Localized message templates for natural conversation
         messages = {
             'ru': {
                 'no_services': "Извините, информация об услугах временно недоступна.",
-                'header': "Вот цены на наши услуги:\n",
-                'contact': "Свяжитесь с нами",
-                'more': "\n... и ещё {} услуг доступно.",
-                'not_found': "Не удалось найти услуги по запросу '{}'. Уточните, пожалуйста, какая услуга вас интересует?",
+                'single': "{name} стоит {price}.",
+                'single_with_desc': "{name} стоит {price}. {desc}",
+                'multiple_intro': "Вот что я нашёл по вашему запросу:\n",
+                'item': "• {name} — {price}",
+                'contact': "цена по запросу",
+                'more': "\nЕсть ещё {} услуг. Хотите узнать подробнее?",
+                'not_found': "К сожалению, не нашёл услуги по запросу «{}». Какая именно услуга вас интересует?",
             },
             'es': {
-                'no_services': "Lo siento, la información de servicios no está disponible temporalmente.",
-                'header': "Aquí están los precios de nuestros servicios:\n",
-                'contact': "Contáctenos",
-                'more': "\n... y {} servicios más disponibles.",
-                'not_found': "No encontré servicios para '{}'. ¿Podría ser más específico?",
+                'no_services': "Lo siento, la información de servicios no está disponible.",
+                'single': "{name} cuesta {price}.",
+                'single_with_desc': "{name} cuesta {price}. {desc}",
+                'multiple_intro': "Esto es lo que encontré:\n",
+                'item': "• {name} — {price}",
+                'contact': "consultar precio",
+                'more': "\nHay {} servicios más. ¿Desea más información?",
+                'not_found': "No encontré servicios para «{}». ¿Qué servicio le interesa?",
             },
             'en': {
                 'no_services': "Sorry, service information is temporarily unavailable.",
-                'header': "Here are the prices for our services:\n",
-                'contact': "Contact us",
-                'more': "\n... and {} more services available.",
-                'not_found': "I couldn't find services matching '{}'. Could you be more specific?",
+                'single': "{name} costs {price}.",
+                'single_with_desc': "{name} costs {price}. {desc}",
+                'multiple_intro': "Here's what I found:\n",
+                'item': "• {name} — {price}",
+                'contact': "contact us for pricing",
+                'more': "\nThere are {} more services. Want to know more?",
+                'not_found': "I couldn't find services matching \"{}\". What service are you looking for?",
             }
         }
         msg = messages.get(language, messages['en'])
@@ -512,30 +521,37 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         services = self._search_services_in_memory(cached_services, search_terms, language)
 
         if services:
-            # Format response with prices
-            response_parts = [msg['header']]
-            for i, service in enumerate(services[:5], 1):  # Show top 5
-                # Get localized name
-                name = self._get_localized_field(service, 'name', language)
-                price = service.get('base_price') or service.get('price')
-                currency = service.get('currency', 'USD')
+            # Format response naturally based on result count
+            first_service = services[0]
+            name = self._get_localized_field(first_service, 'name', language)
+            price = first_service.get('base_price') or first_service.get('price')
+            currency = first_service.get('currency', 'USD')
+            price_str = f"{float(price):.0f} {currency}" if price else msg['contact']
 
-                if price:
-                    price_str = f"{float(price):.2f} {currency}"
-                else:
-                    price_str = msg['contact']
-
-                response_parts.append(f"{i}. {name} - {price_str}")
-
-                # Add description if available
-                desc = self._get_localized_field(service, 'description', language)
+            if len(services) == 1:
+                # Single result - conversational response
+                desc = self._get_localized_field(first_service, 'description', language)
                 if desc:
-                    response_parts.append(f"   {desc[:100]}")
+                    state['response'] = msg['single_with_desc'].format(
+                        name=name, price=price_str, desc=desc[:80]
+                    )
+                else:
+                    state['response'] = msg['single'].format(name=name, price=price_str)
+            else:
+                # Multiple results - brief list (max 4)
+                response_parts = [msg['multiple_intro']]
+                for service in services[:4]:
+                    svc_name = self._get_localized_field(service, 'name', language)
+                    svc_price = service.get('base_price') or service.get('price')
+                    svc_currency = service.get('currency', 'USD')
+                    svc_price_str = f"{float(svc_price):.0f} {svc_currency}" if svc_price else msg['contact']
+                    response_parts.append(msg['item'].format(name=svc_name, price=svc_price_str))
 
-            if len(services) > 5:
-                response_parts.append(msg['more'].format(len(services) - 5))
+                if len(services) > 4:
+                    response_parts.append(msg['more'].format(len(services) - 4))
 
-            state['response'] = '\n'.join(response_parts)
+                state['response'] = '\n'.join(response_parts)
+
             state['context']['services_found'] = services
         else:
             state['response'] = msg['not_found'].format(search_terms)
