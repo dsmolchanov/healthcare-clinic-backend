@@ -1017,8 +1017,9 @@ class ConversationMemoryManager:
 
             elif include_all_sessions:
                 # Get all messages from all sessions for this phone number
-                sessions_result = self.supabase.schema('public').table('conversation_sessions').select('id').eq(
-                    'user_identifier', clean_phone
+                # Use LIKE matching to handle @lid/@s.whatsapp.net suffixes
+                sessions_result = self.supabase.schema('public').table('conversation_sessions').select('id').like(
+                    'user_identifier', f'{clean_phone}%'
                 ).eq(
                     'metadata->>clinic_id', clinic_id
                 ).execute()
