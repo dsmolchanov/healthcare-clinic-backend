@@ -347,7 +347,7 @@ class PromptComposer:
             return ""
 
         # Import here to avoid circular imports
-        from packages.services.orchestrator.preference_narrowing import NarrowingAction
+        from app.domain.preferences.narrowing import NarrowingAction
 
         if instruction.action == NarrowingAction.ASK_QUESTION:
             # Build question guidance from type + args
