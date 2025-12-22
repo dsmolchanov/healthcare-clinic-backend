@@ -104,6 +104,8 @@ class PriceQueryTool:
 
             for service in services:
                 name = (service.get('name') or '').lower()
+                name_ru = (service.get('name_ru') or '').lower()
+                name_en = (service.get('name_en') or '').lower()
                 desc = (service.get('description') or '').lower()
                 service_category = (service.get('category') or '').lower()
 
@@ -111,11 +113,13 @@ class PriceQueryTool:
                 if category and category.lower() not in service_category:
                     continue
 
-                # Check if query matches name or description
-                if query_lower in name or query_lower in desc:
+                # Check if query matches any name field or description
+                if query_lower in name or query_lower in name_ru or query_lower in name_en or query_lower in desc:
+                    # Use Russian name for Russian queries, otherwise English
+                    display_name = service.get('name_ru') if query_lower in name_ru else service.get('name')
                     matches.append({
                         "id": service["id"],
-                        "name": service["name"],
+                        "name": display_name or service["name"],
                         "description": service.get("description", ""),
                         "price": float(service["base_price"]) if service.get("base_price") else None,
                         "currency": service.get("currency", "USD"),
