@@ -367,9 +367,7 @@ app.include_router(evolution_mock.router)
 from app.api import whatsapp_webhook
 app.include_router(whatsapp_webhook.router)
 
-# Include simple WhatsApp webhook for testing
-from app.api import whatsapp_webhook_simple
-app.include_router(whatsapp_webhook_simple.router)
+# Simple WhatsApp webhook removed (Phase 3 - LLM Factory Unification)
 
 # Include Evolution webhook with proper URL pattern
 from app.api import evolution_webhook

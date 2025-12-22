@@ -1264,7 +1264,7 @@ IMPORTANT BEHAVIORS:
             import asyncio
             import time
             import json
-            from openai import AsyncOpenAI
+            # AsyncOpenAI removed - LLM Factory handles all provider calls (Phase 3)
 
             # Track LLM metrics
             llm_start = time.time()
@@ -1418,37 +1418,9 @@ IMPORTANT BEHAVIORS:
                     }
 
                 except (ValueError, RuntimeError) as factory_error:
-                    # Factory not available (table doesn't exist), fallback to direct OpenAI GPT-5-nano
-                    logger.warning(f"LLM Factory not available ({factory_error}), using direct OpenAI GPT-5-nano")
-
-                    api_key = os.environ.get("OPENAI_API_KEY")
-                    if not api_key:
-                        raise RuntimeError("OPENAI_API_KEY not configured")
-
-                    client = AsyncOpenAI(api_key=api_key)
-                    openai_response = await asyncio.wait_for(
-                        client.chat.completions.create(
-                            model="gpt-5-nano",
-                            messages=messages,
-                            # temperature not set - GPT-5-nano only supports default (1.0)
-                            max_completion_tokens=300  # GPT-5-nano requires max_completion_tokens, not max_tokens
-                        ),
-                        timeout=10.0
-                    )
-                    ai_response = openai_response.choices[0].message.content
-
-                    # Calculate LLM latency
-                    llm_latency_ms = int((time.time() - llm_start) * 1000)
-
-                    # Store metrics for OpenAI fallback
-                    self._llm_metrics = {
-                        'llm_provider': 'openai',
-                        'llm_model': 'gpt-5-nano',
-                        'llm_tokens_input': openai_response.usage.prompt_tokens if openai_response.usage else 0,
-                        'llm_tokens_output': openai_response.usage.completion_tokens if openai_response.usage else 0,
-                        'llm_latency_ms': llm_latency_ms,
-                        'llm_cost_usd': self._calculate_gpt5_nano_cost(openai_response.usage) if openai_response.usage else 0
-                    }
+                    # LLM Factory is required - no fallback to direct OpenAI (Phase 3: LLM Factory Unification)
+                    logger.error(f"LLM Factory error: {factory_error}")
+                    raise RuntimeError(f"LLM generation failed: {factory_error}")
 
             except asyncio.TimeoutError:
                 logger.error("LLM call exceeded 20s timeout, using fallback")
