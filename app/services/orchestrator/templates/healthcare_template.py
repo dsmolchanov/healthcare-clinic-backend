@@ -436,7 +436,12 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         return state
 
     async def price_query_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
-        """Handle price queries using the price query tool"""
+        """
+        Handle price queries using cached services from context.
+
+        Uses in-memory search on pre-cached clinic_services instead of database queries.
+        Services are cached during hydration step via get_clinic_bundle RPC.
+        """
         logger.debug(f"Price query - session: {state['session_id']}")
 
         # Get language for localized responses
@@ -445,81 +450,204 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         # Localized messages
         messages = {
             'ru': {
-                'no_tool': "Извините, но у меня сейчас нет доступа к информации о ценах.",
+                'no_services': "Извините, информация об услугах временно недоступна.",
                 'header': "Вот цены на наши услуги:\n",
                 'contact': "Свяжитесь с нами",
                 'more': "\n... и ещё {} услуг доступно.",
-                'not_found': "Не удалось найти цены на '{}'. Уточните, пожалуйста, какая услуга вас интересует?",
-                'error': "Извините, возникла проблема с получением информации о ценах."
+                'not_found': "Не удалось найти услуги по запросу '{}'. Уточните, пожалуйста, какая услуга вас интересует?",
             },
             'es': {
-                'no_tool': "Lo siento, no tengo acceso a la información de precios en este momento.",
+                'no_services': "Lo siento, la información de servicios no está disponible temporalmente.",
                 'header': "Aquí están los precios de nuestros servicios:\n",
                 'contact': "Contáctenos",
                 'more': "\n... y {} servicios más disponibles.",
-                'not_found': "No pude encontrar precios para '{}'. ¿Podría ser más específico sobre qué servicio le interesa?",
-                'error': "Lo siento, tengo problemas para acceder a la información de precios."
+                'not_found': "No encontré servicios para '{}'. ¿Podría ser más específico?",
             },
             'en': {
-                'no_tool': "I apologize, but I don't have access to pricing information right now.",
+                'no_services': "Sorry, service information is temporarily unavailable.",
                 'header': "Here are the prices for our services:\n",
                 'contact': "Contact us",
                 'more': "\n... and {} more services available.",
-                'not_found': "I couldn't find specific pricing for '{}'. Could you please be more specific about which service you're interested in?",
-                'error': "I apologize, I'm having trouble accessing pricing information right now."
+                'not_found': "I couldn't find services matching '{}'. Could you be more specific?",
             }
         }
         msg = messages.get(language, messages['en'])
 
-        if not self.price_query_tool:
-            state['response'] = msg['no_tool']
+        # Get cached services from context (populated by hydration step)
+        cached_services = state.get('context', {}).get('clinic_services', [])
+
+        if not cached_services:
+            logger.warning(f"No cached services available for price query")
+            state['response'] = msg['no_services']
+            state['audit_trail'].append({
+                "node": "price_query",
+                "timestamp": datetime.utcnow().isoformat(),
+                "services_found": 0,
+                "cache_hit": False
+            })
             return state
 
-        try:
-            # Extract service keywords from message
-            message_lower = state.get('message', '').lower()
+        logger.info(f"[price_query] Searching {len(cached_services)} cached services (no DB call)")
 
-            # Remove common price-related words to get service name
-            search_terms = message_lower
-            for word in ['how', 'much', 'is', 'the', 'what', 'price', 'cost', 'fee', 'of', 'for',
-                        'сколько', 'стоит', 'цена', 'стоимость', 'cuánto', 'cuesta', 'precio', '?', ',']:
-                search_terms = search_terms.replace(word, ' ')
-            search_terms = ' '.join(search_terms.split()).strip()
+        # Extract search terms from message
+        message_lower = state.get('message', '').lower()
+        search_terms = message_lower
 
-            # Query services
-            services = await self.price_query_tool.get_services_by_query(
-                query=search_terms if search_terms else None,
-                limit=5
-            )
+        # Remove common price-related words in multiple languages
+        noise_words = [
+            # English
+            'how', 'much', 'is', 'the', 'what', 'price', 'cost', 'fee', 'of', 'for', 'a', 'an',
+            # Russian
+            'сколько', 'стоит', 'цена', 'стоимость', 'какая', 'какой', 'у', 'вас',
+            # Spanish
+            'cuánto', 'cuesta', 'precio', 'cuanto', 'el', 'la', 'los', 'las', 'de', 'para',
+            # Punctuation
+            '?', ',', '.', '!', '¿', '¡'
+        ]
+        for word in noise_words:
+            search_terms = search_terms.replace(word, ' ')
+        search_terms = ' '.join(search_terms.split()).strip()
 
-            if services:
-                # Format response with prices
-                response_parts = [msg['header']]
-                for i, service in enumerate(services[:3], 1):  # Show top 3
-                    price_str = f"{service['price']:.2f} {service['currency']}" if service['price'] else msg['contact']
-                    response_parts.append(f"{i}. {service['name']} - {price_str}")
-                    if service.get('description'):
-                        response_parts.append(f"   {service['description']}")
+        # Search cached services with multilingual support
+        services = self._search_services_in_memory(cached_services, search_terms, language)
 
-                if len(services) > 3:
-                    response_parts.append(msg['more'].format(len(services) - 3))
+        if services:
+            # Format response with prices
+            response_parts = [msg['header']]
+            for i, service in enumerate(services[:5], 1):  # Show top 5
+                # Get localized name
+                name = self._get_localized_field(service, 'name', language)
+                price = service.get('base_price') or service.get('price')
+                currency = service.get('currency', 'USD')
 
-                state['response'] = '\n'.join(response_parts)
-                state['context']['services_found'] = services
-            else:
-                state['response'] = msg['not_found'].format(search_terms)
+                if price:
+                    price_str = f"{float(price):.2f} {currency}"
+                else:
+                    price_str = msg['contact']
 
-        except Exception as e:
-            logger.error(f"Price query error: {e}")
-            state['response'] = msg['error']
+                response_parts.append(f"{i}. {name} - {price_str}")
+
+                # Add description if available
+                desc = self._get_localized_field(service, 'description', language)
+                if desc:
+                    response_parts.append(f"   {desc[:100]}")
+
+            if len(services) > 5:
+                response_parts.append(msg['more'].format(len(services) - 5))
+
+            state['response'] = '\n'.join(response_parts)
+            state['context']['services_found'] = services
+        else:
+            state['response'] = msg['not_found'].format(search_terms)
 
         state['audit_trail'].append({
             "node": "price_query",
             "timestamp": datetime.utcnow().isoformat(),
-            "services_found": len(state.get('context', {}).get('services_found', []))
+            "services_found": len(services) if services else 0,
+            "search_terms": search_terms,
+            "cache_hit": True,
+            "cached_services_count": len(cached_services)
         })
 
         return state
+
+    def _search_services_in_memory(
+        self,
+        services: list,
+        query: str,
+        language: str = 'en'
+    ) -> list:
+        """
+        Search services in memory with multilingual support.
+
+        Args:
+            services: List of cached service dicts
+            query: Search query (already cleaned)
+            language: Language code for field priority
+
+        Returns:
+            List of matching services, sorted by relevance
+        """
+        if not query:
+            # Return all services if no query
+            return services[:10]
+
+        query_lower = query.lower()
+        query_words = query_lower.split()
+
+        # Define field search priority by language
+        name_fields = {
+            'ru': ['name_ru', 'name', 'name_en'],
+            'es': ['name_es', 'name', 'name_en'],
+            'en': ['name_en', 'name'],
+            'pt': ['name_pt', 'name', 'name_en'],
+            'he': ['name_he', 'name', 'name_en'],
+        }.get(language, ['name', 'name_en'])
+
+        scored_results = []
+
+        for service in services:
+            score = 0
+            matched_name = None
+
+            # Check name fields
+            for field in name_fields:
+                value = service.get(field, '')
+                if value:
+                    value_lower = value.lower()
+
+                    # Exact match
+                    if query_lower == value_lower:
+                        score = 100
+                        matched_name = value
+                        break
+
+                    # Query contained in name
+                    if query_lower in value_lower:
+                        score = max(score, 80)
+                        matched_name = value
+
+                    # All query words found in name
+                    if all(word in value_lower for word in query_words):
+                        score = max(score, 70)
+                        matched_name = value
+
+                    # Any query word found
+                    word_matches = sum(1 for word in query_words if word in value_lower)
+                    if word_matches > 0:
+                        word_score = 30 + (word_matches * 10)
+                        if word_score > score:
+                            score = word_score
+                            matched_name = value
+
+            # Also check category
+            category = service.get('category', '').lower()
+            if category and query_lower in category:
+                score = max(score, 40)
+
+            if score > 0:
+                scored_results.append((score, service, matched_name))
+
+        # Sort by score descending
+        scored_results.sort(key=lambda x: x[0], reverse=True)
+
+        return [s[1] for s in scored_results]
+
+    def _get_localized_field(self, service: dict, field: str, language: str) -> str:
+        """Get localized field value with fallback."""
+        # Try localized field first
+        localized_key = f"{field}_{language}"
+        value = service.get(localized_key)
+        if value:
+            return value
+
+        # Fallback to default field
+        value = service.get(field)
+        if value:
+            return value
+
+        # Fallback to English
+        return service.get(f"{field}_en", '')
 
     async def faq_lookup_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
         """
