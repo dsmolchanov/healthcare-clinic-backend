@@ -196,24 +196,43 @@ class GeminiAdapter(LLMAdapter):
         internal reasoning. These should not be sent to users.
         """
         if not response.candidates or not response.candidates[0].content.parts:
+            logger.warning("No candidates or parts in response")
             return ""
 
         text_parts = []
-        for part in response.candidates[0].content.parts:
+        num_parts = len(response.candidates[0].content.parts)
+        logger.info(f"Extracting text from {num_parts} parts")
+
+        for idx, part in enumerate(response.candidates[0].content.parts):
+            # Log part details for debugging
+            has_thought = hasattr(part, 'thought') and part.thought
+            has_sig = hasattr(part, 'thought_signature') and part.thought_signature
+            has_text = hasattr(part, 'text') and part.text
+            has_fc = hasattr(part, 'function_call') and part.function_call
+
+            logger.info(f"Part {idx}: thought={has_thought}, sig={has_sig}, text={has_text}, fc={has_fc}")
+
             # Skip thinking/thought parts - check for 'thought' attribute
-            if hasattr(part, 'thought') and part.thought:
-                logger.debug(f"Filtered out thinking content: {part.text[:100] if part.text else ''}...")
+            if has_thought:
+                logger.debug(f"Filtered out thinking content from part {idx}")
                 continue
 
-            # Skip parts with thought_signature (encrypted thinking state)
-            if hasattr(part, 'thought_signature') and part.thought_signature:
+            # Don't skip parts just because they have thought_signature
+            # Only skip if it's ONLY a signature (no text)
+            if has_sig and not has_text:
+                logger.debug(f"Skipping signature-only part {idx}")
                 continue
 
-            # Only include text parts (not function calls)
-            if hasattr(part, 'text') and part.text:
+            # Include text parts (not function calls)
+            if has_text:
                 text_parts.append(part.text)
+                logger.debug(f"Added text from part {idx}: {part.text[:50] if len(part.text) > 50 else part.text}...")
 
-        return "".join(text_parts)
+        result = "".join(text_parts)
+        if not result:
+            logger.warning(f"No text extracted from {len(response.candidates[0].content.parts)} parts")
+
+        return result
 
     def normalize_tool_calls(self, response: Any) -> List[ToolCall]:
         """Normalize Gemini function calls to common format, preserving thought_signature"""
