@@ -30,7 +30,8 @@ class ProjectNameSpanProcessor:
 
     def on_start(self, span, parent_context=None):
         # Add project name attribute to every span
-        span.set_attribute("openinference.project.name", self.project_name)
+        # Arize requires "arize.project.name" specifically (not openinference.project.name)
+        span.set_attribute("arize.project.name", self.project_name)
 
     def on_end(self, span):
         self._batch_processor.on_end(span)
@@ -96,9 +97,10 @@ def init_arize():
                 ProjectNameSpanProcessor(project_name, arize_exporter)
             )
         else:
-            # Create new provider with OpenInference resource attributes
+            # Create new provider with Arize resource attributes
+            # Arize requires "arize.project.name" specifically
             resource = Resource.create({
-                "openinference.project.name": project_name,
+                "arize.project.name": project_name,
                 "service.name": "healthcare-backend",
             })
             _tracer_provider = TracerProvider(resource=resource)
