@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import os
 
-from app.db.supabase_client import get_supabase_client
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ class OutboxProcessor:
     """
 
     def __init__(self):
-        self.supabase = get_supabase_client(schema='healthcare')
+        self._supabase = None
         self.running = False
         self.poll_interval = float(os.getenv('OUTBOX_POLL_INTERVAL', '0.5'))  # 500ms
         self.batch_size = int(os.getenv('OUTBOX_BATCH_SIZE', '10'))
@@ -34,6 +34,21 @@ class OutboxProcessor:
             f"OutboxProcessor initialized: poll_interval={self.poll_interval}s, "
             f"batch_size={self.batch_size}, max_retries={self.max_retries}"
         )
+
+    def _get_supabase(self, force_new: bool = False):
+        """Get Supabase client, optionally forcing a fresh connection."""
+        if self._supabase is None or force_new:
+            # Import here to get fresh client
+            from app.database import create_supabase_client, _supabase_clients
+
+            if force_new:
+                # Clear cached client to force reconnection
+                _supabase_clients.pop('healthcare', None)
+                logger.info("Cleared cached Supabase client, forcing reconnection")
+
+            self._supabase = create_supabase_client('healthcare')
+
+        return self._supabase
 
     async def start(self):
         """Start processing loop"""
@@ -69,19 +84,35 @@ class OutboxProcessor:
         Fetch messages that need delivery
 
         Returns messages in pending or failed state with retry_count < max_retries
+        Handles HTTP/2 connection termination by forcing client reconnection.
         """
-        try:
-            result = self.supabase.table('outbound_messages').select('*').in_(
-                'delivery_status', ['pending', 'failed']
-            ).lt(
-                'retry_count', self.max_retries
-            ).order('created_at').limit(self.batch_size).execute()
+        for attempt in range(2):  # Try twice: once with cached client, once with fresh
+            try:
+                supabase = self._get_supabase(force_new=(attempt > 0))
+                result = supabase.table('outbound_messages').select('*').in_(
+                    'delivery_status', ['pending', 'failed']
+                ).lt(
+                    'retry_count', self.max_retries
+                ).order('created_at').limit(self.batch_size).execute()
 
-            return result.data if result.data else []
+                return result.data if result.data else []
 
-        except Exception as e:
-            logger.error(f"Failed to fetch pending messages: {e}", exc_info=True)
-            return []
+            except (httpx.RemoteProtocolError, httpx.ConnectError) as e:
+                # HTTP/2 GOAWAY or connection error - force reconnection on next attempt
+                logger.warning(
+                    f"Connection error (attempt {attempt + 1}/2): {e}. "
+                    f"Will reconnect on next attempt."
+                )
+                self._supabase = None  # Clear cached reference
+                if attempt == 1:
+                    logger.error(f"Failed to fetch pending messages after reconnect: {e}")
+                    return []
+
+            except Exception as e:
+                logger.error(f"Failed to fetch pending messages: {e}", exc_info=True)
+                return []
+
+        return []
 
     async def _process_message(self, msg: Dict[str, Any]):
         """
@@ -209,9 +240,22 @@ class OutboxProcessor:
             if 'retry_count' in kwargs:
                 update_data['retry_count'] = kwargs['retry_count']
 
-            self.supabase.table('outbound_messages').update(update_data).eq(
+            supabase = self._get_supabase()
+            supabase.table('outbound_messages').update(update_data).eq(
                 'id', message_id
             ).execute()
+
+        except (httpx.RemoteProtocolError, httpx.ConnectError) as e:
+            # Connection error - try once more with fresh client
+            logger.warning(f"Connection error updating status, retrying: {e}")
+            self._supabase = None
+            try:
+                supabase = self._get_supabase(force_new=True)
+                supabase.table('outbound_messages').update(update_data).eq(
+                    'id', message_id
+                ).execute()
+            except Exception as retry_error:
+                logger.error(f"Failed to update outbox status after retry: {retry_error}")
 
         except Exception as e:
             logger.error(f"Failed to update outbox status: {e}", exc_info=True)
