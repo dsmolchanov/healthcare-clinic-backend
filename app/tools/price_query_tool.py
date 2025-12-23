@@ -4,11 +4,14 @@ Price Query Tool - Get service prices from the healthcare.services table
 This tool allows the orchestrator to query service prices, descriptions, and details
 for the clinic to provide accurate pricing information to patients.
 
-Uses multi-layer resilient search:
+Uses multi-layer resilient search (search_services_v2):
 - Layer 0: Exact alias matching (zero-miss for key services)
-- Layer 1: Dual-language FTS (Russian + English)
-- Layer 2: FTS with OR relaxation and prefix matching
-- Layer 3: Trigram fuzzy matching (typo tolerance)
+- Layer 1: Alias trigram matching (typo tolerance on aliases)
+- Layer 2: Vector similarity search (semantic "meaning matching" via pgvector)
+- Layer 3: Name trigram matching (typo tolerance on service names)
+- Layer 4: Full-text search (FTS with prefix matching)
+
+Falls back to search_services_v1 when vector embeddings unavailable.
 
 CACHING STRATEGY:
 - All services are preloaded into Redis on startup (see app/startup_warmup.py)
@@ -26,12 +29,14 @@ from supabase.client import ClientOptions
 from postgrest.exceptions import APIError
 from app.utils.text_normalization import (
     normalize_query,
-    expand_synonyms,
     format_price_reply,
     quick_reply
 )
 
 logger = logging.getLogger(__name__)
+
+# Vector search configuration
+VECTOR_SEARCH_MIN_SIMILARITY = 0.40  # Threshold for semantic matching (aligned with search_services_v2)
 
 # Latency budget for price queries (800ms)
 PRICE_QUERY_BUDGET_MS = 800
@@ -77,6 +82,109 @@ class PriceQueryTool:
         if redis_client:
             from app.services.clinic_data_cache import ClinicDataCache
             self.cache = ClinicDataCache(redis_client, default_ttl=3600)
+
+        # Vector search initialization (behind feature flag)
+        self.vector_search_enabled = self._check_vector_search_feature()
+        self._embedding_generator = None  # Lazy loaded
+
+    def _check_vector_search_feature(self) -> bool:
+        """Check if vector search is enabled for this clinic."""
+        try:
+            response = self.healthcare_client.from_('clinics').select(
+                'feature_vector_search'
+            ).eq('id', self.clinic_id).single().execute()
+            return response.data.get('feature_vector_search', False) if response.data else False
+        except Exception as e:
+            logger.debug(f"Vector search feature check failed: {e}")
+            return False
+
+    def _get_embedding_generator(self):
+        """Lazy load embedding generator."""
+        if self._embedding_generator is None:
+            try:
+                from app.utils.embedding_utils import get_embedding_generator
+                self._embedding_generator = get_embedding_generator()
+            except Exception as e:
+                logger.warning(f"Failed to initialize embedding generator: {e}")
+                self._embedding_generator = None
+        return self._embedding_generator
+
+    def _detect_language(self, query: str) -> str:
+        """Detect language of query based on character analysis."""
+        # Simple detection: Cyrillic = Russian, else English
+        if any('\u0400' <= c <= '\u04FF' for c in query):
+            return 'ru'
+        # Check for Spanish/Portuguese common characters
+        if any(c in query.lower() for c in 'áéíóúñü'):
+            return 'es'
+        return 'en'
+
+    async def _vector_search(
+        self,
+        query: str,
+        language: str = 'en',
+        limit: int = 5,
+        min_similarity: float = VECTOR_SEARCH_MIN_SIMILARITY
+    ) -> List[Dict]:
+        """Semantic vector search for services (shadow mode).
+
+        Args:
+            query: User's natural language query
+            language: Target language for embeddings
+            limit: Max results to return
+            min_similarity: Minimum cosine similarity threshold
+
+        Returns:
+            List of matching services with similarity scores
+        """
+        if not self.vector_search_enabled:
+            return []
+
+        generator = self._get_embedding_generator()
+        if generator is None:
+            return []
+
+        try:
+            # Generate query embedding
+            query_embedding = generator.generate(query)
+
+            if query_embedding.sum() == 0:
+                logger.warning("Failed to generate query embedding")
+                return []
+
+            # Call vector search RPC
+            response = self.healthcare_client.rpc(
+                'search_services_by_vector',
+                {
+                    'p_clinic_id': self.clinic_id,
+                    'p_query_embedding': query_embedding.tolist(),
+                    'p_language': language,
+                    'p_limit': limit * 2,  # Fetch extra, filter in Python
+                    'p_min_similarity': min_similarity - 0.1  # Slightly lower, filter precisely here
+                }
+            ).execute()
+
+            # Filter and rank results
+            results = []
+            for row in response.data or []:
+                if row['similarity_score'] >= min_similarity:
+                    results.append({
+                        'id': row['service_id'],
+                        'name': row['service_name'],
+                        'similarity': row['similarity_score'],
+                        'search_stage': 'vector_similarity'
+                    })
+
+            # Log for shadow mode analysis
+            if results:
+                logger.info(f"[SHADOW] Vector search found {len(results)} results for '{query}' "
+                           f"(top: {results[0]['name']} @ {results[0]['similarity']:.3f})")
+
+            return results[:limit]
+
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}")
+            return []
 
     async def _search_cached_services(
         self,
@@ -127,7 +235,10 @@ class PriceQueryTool:
                         "duration_minutes": service.get("duration_minutes", 30),
                         "code": service.get("code", ""),
                         "relevance_score": 1.0,  # Simple match, no scoring
-                        "search_stage": "cached"
+                        "search_stage": "cached",
+                        # Include i18n JSONB fields for format_price_reply()
+                        "name_i18n": service.get("name_i18n", {}),
+                        "description_i18n": service.get("description_i18n", {})
                     })
 
             if matches:
@@ -208,7 +319,7 @@ class PriceQueryTool:
                 try:
                     direct_response = (
                         self.healthcare_client.table("services")
-                        .select("id, name, name_ru, description, base_price, category, duration_minutes, currency, code")
+                        .select("id, name, name_ru, description, base_price, category, duration_minutes, currency, code, name_i18n, description_i18n")
                         .eq("clinic_id", self.clinic_id)
                         .eq("is_active", True)
                         .ilike("name_ru", f"%{query}%")
@@ -229,7 +340,10 @@ class PriceQueryTool:
                                 "duration_minutes": service.get("duration_minutes", 30),
                                 "code": service.get("code", ""),
                                 "relevance_score": 1.0,
-                                "search_stage": "direct_name_ru"
+                                "search_stage": "direct_name_ru",
+                                # Include i18n JSONB fields for format_price_reply()
+                                "name_i18n": service.get("name_i18n", {}),
+                                "description_i18n": service.get("description_i18n", {})
                             })
                         return services
                 except Exception as e:
@@ -245,27 +359,71 @@ class PriceQueryTool:
                 except ValueError:
                     session_id = str(uuid.uuid4())
 
-            # Normalize and expand query
+            # Normalize query - synonym expansion now handled by database alias layer
             normalized = normalize_query(query)
-            synonyms = expand_synonyms(query)
 
-            logger.info(
-                f"🔍 Query expansion: '{query}' → normalized: '{normalized}' → "
-                f"synonyms: {synonyms[:3]}..." if len(synonyms) > 3 else f"synonyms: {synonyms}"
-            )
+            # Detect language for vector search
+            language = self._detect_language(query)
+
+            # Generate query embedding if vector search is enabled
+            query_embedding = None
+            if self.vector_search_enabled:
+                generator = self._get_embedding_generator()
+                if generator is not None:
+                    try:
+                        query_embedding = generator.generate(query)
+                        if query_embedding.sum() == 0:
+                            query_embedding = None
+                            logger.warning(f"Zero embedding generated for '{query}'")
+                    except Exception as e:
+                        logger.warning(f"Embedding generation failed for '{query}': {e}")
+                        query_embedding = None
+
+            logger.info(f"🔍 Searching for: '{query}' → normalized: '{normalized}' (lang: {language}, vector: {query_embedding is not None})")
 
             all_results = {}  # service_id → service (de-dup)
 
-            # Try multilingual search for each synonym
-            for synonym in synonyms[:5]:  # Limit to 5 synonyms to avoid excessive queries
-                elapsed_ms = (time.perf_counter() - t0) * 1000
-                if elapsed_ms > PRICE_QUERY_BUDGET_MS:
-                    logger.warning(f"⏱️ Search budget exceeded ({elapsed_ms:.0f}ms), stopping synonym expansion")
-                    break
-
+            # Use search_services_v2 with vector support if embedding available
+            # Otherwise fallback to v1
+            if query_embedding is not None:
                 payload = {
                     'p_clinic_id': self.clinic_id,
-                    'p_query': synonym,
+                    'p_query': normalized,
+                    'p_query_embedding': query_embedding.tolist(),
+                    'p_limit': limit,
+                    'p_min_score': 0.01,
+                    'p_session_id': session_id,
+                    'p_language': language
+                }
+
+                try:
+                    response = self.healthcare_client.rpc(
+                        'search_services_v2',
+                        payload
+                    ).execute()
+                    logger.debug(f"Using search_services_v2 with vector embedding")
+                except APIError as api_err:
+                    logger.warning(
+                        "search_services_v2 RPC failed for '%s': %s. Falling back to v1.",
+                        normalized,
+                        getattr(api_err, 'message', api_err)
+                    )
+                    # Fallback to v1
+                    response = self.api_client.rpc(
+                        'search_services_v1',
+                        {
+                            'p_clinic_id': self.clinic_id,
+                            'p_query': normalized,
+                            'p_limit': limit,
+                            'p_min_score': 0.01,
+                            'p_session_id': session_id
+                        }
+                    ).execute()
+            else:
+                # No embedding - use v1
+                payload = {
+                    'p_clinic_id': self.clinic_id,
+                    'p_query': normalized,
                     'p_limit': limit,
                     'p_min_score': 0.01,
                     'p_session_id': session_id
@@ -278,31 +436,38 @@ class PriceQueryTool:
                     ).execute()
                 except APIError as api_err:
                     logger.warning(
-                        "Primary service search RPC failed for synonym '%s': %s. Falling back to legacy multilingual search.",
-                        synonym,
+                        "Primary service search RPC failed for '%s': %s. Falling back to legacy multilingual search.",
+                        normalized,
                         getattr(api_err, 'message', api_err)
                     )
                     response = self.healthcare_client.rpc(
                         'search_services_multilingual',
                         payload
                     ).execute()
-                except Exception as syn_err:
-                    logger.warning(f"Synonym search failed for '{synonym}': {syn_err}")
-                    continue
 
-                if response.data:
-                    for service in response.data:
-                        if service["id"] not in all_results:
-                            all_results[service["id"]] = service
+            if response.data:
+                for service in response.data:
+                    if service["id"] not in all_results:
+                        all_results[service["id"]] = service
 
+                logger.info(
+                    f"✅ Found {len(response.data)} results for '{normalized}' "
+                    f"(stage: {response.data[0].get('search_stage', 'unknown')})"
+                )
+            else:
+                logger.debug(f"❌ No results for '{normalized}'")
+
+            # Vector search is now active in the cascade (via search_services_v2)
+            # Log when vector_similarity stage was used for monitoring
+            if self.vector_search_enabled and all_results:
+                stages_used = set(r.get('search_stage', '') for r in all_results.values())
+                if 'vector_similarity' in stages_used:
+                    # Log vector search success for monitoring
+                    top_result = list(all_results.values())[0]
                     logger.info(
-                        f"✅ Found {len(response.data)} results for synonym '{synonym}' "
-                        f"(stage: {response.data[0].get('search_stage', 'unknown')})"
+                        f"[VECTOR] Semantic match: '{query}' → '{top_result.get('name')}' "
+                        f"(score: {top_result.get('relevance_score', 0):.2f})"
                     )
-                    # Stop after first successful match
-                    break
-                else:
-                    logger.debug(f"❌ No results for synonym '{synonym}'")
 
             # Convert to list and apply category filter
             services = []
@@ -321,7 +486,10 @@ class PriceQueryTool:
                     "duration_minutes": service.get("duration_minutes", 30),
                     "code": service.get("code", ""),
                     "relevance_score": service.get("relevance_score", 0.0),
-                    "search_stage": service.get("search_stage", "unknown")
+                    "search_stage": service.get("search_stage", "unknown"),
+                    # Include i18n JSONB fields for format_price_reply() (may be None from RPC)
+                    "name_i18n": service.get("name_i18n", {}),
+                    "description_i18n": service.get("description_i18n", {})
                 })
 
             elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -348,7 +516,7 @@ class PriceQueryTool:
         try:
             query_builder = (
                 self.healthcare_client.table("services")
-                .select("id, name, description, base_price, category, duration_minutes, currency, code")
+                .select("id, name, description, base_price, category, duration_minutes, currency, code, name_i18n, description_i18n")
                 .eq("clinic_id", self.clinic_id)
                 .eq("is_active", True)
                 .order("category", desc=False)
@@ -375,7 +543,10 @@ class PriceQueryTool:
                     "category": service.get("category", ""),
                     "duration_minutes": service.get("duration_minutes", 30),
                     "code": service.get("code", ""),
-                    "search_stage": "category_list"
+                    "search_stage": "category_list",
+                    # Include i18n JSONB fields for format_price_reply()
+                    "name_i18n": service.get("name_i18n", {}),
+                    "description_i18n": service.get("description_i18n", {})
                 })
 
             return services
@@ -396,7 +567,7 @@ class PriceQueryTool:
         try:
             query_builder = (
                 self.healthcare_client.table("services")
-                .select("id, name, description, base_price, category, duration_minutes, currency, code")
+                .select("id, name, description, base_price, category, duration_minutes, currency, code, name_i18n, description_i18n")
                 .eq("clinic_id", self.clinic_id)
                 .eq("is_active", True)
                 .order("name", desc=False)
@@ -415,7 +586,7 @@ class PriceQueryTool:
             if not response.data and query:
                 query_builder = (
                     self.healthcare_client.table("services")
-                    .select("id, name, name_ru, description, base_price, category, duration_minutes, currency, code")
+                    .select("id, name, name_ru, description, base_price, category, duration_minutes, currency, code, name_i18n, description_i18n")
                     .eq("clinic_id", self.clinic_id)
                     .eq("is_active", True)
                     .ilike("name_ru", f"%{query}%")
@@ -430,7 +601,7 @@ class PriceQueryTool:
             if not response.data and query:
                 query_builder = (
                     self.healthcare_client.table("services")
-                    .select("id, name, description, base_price, category, duration_minutes, currency, code")
+                    .select("id, name, description, base_price, category, duration_minutes, currency, code, name_i18n, description_i18n")
                     .eq("clinic_id", self.clinic_id)
                     .eq("is_active", True)
                     .ilike("description", f"%{query}%")
@@ -455,7 +626,10 @@ class PriceQueryTool:
                     "category": service.get("category", ""),
                     "duration_minutes": service.get("duration_minutes", 30),
                     "code": service.get("code", ""),
-                    "search_stage": "fallback_ilike"
+                    "search_stage": "fallback_ilike",
+                    # Include i18n JSONB fields for format_price_reply()
+                    "name_i18n": service.get("name_i18n", {}),
+                    "description_i18n": service.get("description_i18n", {})
                 })
 
             return services
@@ -573,12 +747,10 @@ class PriceQueryTool:
                 )
                 return quick_reply(language)
 
-            # Format deterministic response
+            # Format deterministic response using i18n-aware format_price_reply
             service = services[0]
             response = format_price_reply(
-                service_name=service["name"],
-                price=service["price"] or 0,
-                currency=service.get("currency", "USD"),
+                service=service,
                 language=language,
                 unit="per surface"  # Default unit, can be customized
             )
