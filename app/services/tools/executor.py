@@ -108,10 +108,22 @@ class ToolExecutor:
                 })
             }, prior_results  # Return unchanged prior_results
 
-        # Apply suggested fixes
+        # Apply ONLY hard fixes (from prior results), NOT soft suggestions
+        # Soft suggestions like service_name preferences should NOT be auto-applied
+        # when the user has clearly changed their intent (e.g., pain → consultation)
         if suggested_fixes:
-            logger.info(f"🔄 Applying suggested fixes: {suggested_fixes}")
-            tool_args.update(suggested_fixes)
+            # Filter out soft suggestions - only apply hard fixes from dependencies
+            soft_suggestion_fields = {'service_name', 'doctor_name'}  # User intent can override these
+            hard_fixes = {k: v for k, v in suggested_fixes.items() if k not in soft_suggestion_fields}
+            soft_fixes = {k: v for k, v in suggested_fixes.items() if k in soft_suggestion_fields}
+
+            if hard_fixes:
+                logger.info(f"🔄 Applying hard fixes: {hard_fixes}")
+                tool_args.update(hard_fixes)
+
+            if soft_fixes:
+                # Log but don't apply - LLM made a conscious choice
+                logger.info(f"ℹ️  Ignoring soft suggestions (LLM choice respected): {soft_fixes}")
 
         # Check for calendar call budget (specific logic for check_availability)
         if tool_name == "check_availability":

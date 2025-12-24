@@ -2,20 +2,33 @@
 Healthcare LangGraph Template
 HIPAA-compliant orchestrator for healthcare/dental conversations
 Extends base orchestrator with PHI protection and appointment handling
+
+Phase 2 Enhancements:
+- Guardrail node (runs BEFORE supervisor for security)
+- Language detection node (replaces RoutingStep language detection)
+- Session init node with TTL handling for action proposals
+- Simple answer agent for fast FAQ path
+- Session-aware hydration with parallel fetch
+- Plan-then-Execute pattern for bookings
 """
 
 import sys
 import os
 import re
+import asyncio
 
 from ..base_langgraph import BaseLangGraphOrchestrator, BaseConversationState, ComplianceMode, last_value
 from langgraph.graph import StateGraph, END
 from typing import Optional, Dict, Any, List, Annotated
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # Import ConversationState for unified state tracking
 from app.models.conversation_state import FlowState, ConversationState
+
+# Import action models for Plan-then-Execute
+from app.services.orchestrator.models.action_plan import ActionPlan, PlanStep, ActionType, PlanExecutionResult
+from app.services.orchestrator.models.action_proposal import ActionProposal, ActionProposalType, is_confirmation_response
 
 # Import appointment tools
 try:
@@ -54,6 +67,43 @@ class HealthcareConversationState(BaseConversationState):
     flow_state: Annotated[str, last_value]  # FlowState.value
     active_task: Annotated[Optional[Dict[str, Any]], last_value]  # BookingTask as dict
     next_agent: Annotated[Optional[str], last_value]  # Supervisor routing decision
+
+    # Phase 2: Guardrail fields
+    is_emergency: Annotated[bool, last_value]
+    phi_detected: Annotated[bool, last_value]
+    allowed_tools: Annotated[List[str], last_value]
+    blocked_tools: Annotated[List[str], last_value]
+    guardrail_action: Annotated[Optional[str], last_value]  # 'escalate', 'restrict', 'allow'
+    escalation_reason: Annotated[Optional[str], last_value]
+
+    # Phase 2: Language detection
+    detected_language: Annotated[str, last_value]
+
+    # Phase 2: Context hydration
+    context_hydrated: Annotated[bool, last_value]
+    previous_session_summary: Annotated[Optional[Dict[str, Any]], last_value]
+
+    # Phase 2: Fast path
+    fast_path: Annotated[bool, last_value]
+    lane: Annotated[Optional[str], last_value]
+
+    # Phase 2: Plan-then-Execute
+    action_plan: Annotated[Optional[Dict[str, Any]], last_value]
+    plan_results: Annotated[Optional[Dict[str, Any]], last_value]
+    plan_completed_steps: Annotated[List[str], last_value]
+    plan_execution_error: Annotated[Optional[str], last_value]
+    plan_failed_step: Annotated[Optional[str], last_value]
+    plan_needs_replanning: Annotated[bool, last_value]
+
+    # Phase 2: Action Proposal (HITL confirmation)
+    action_proposal: Annotated[Optional[Dict[str, Any]], last_value]
+    awaiting_confirmation: Annotated[bool, last_value]
+    pending_action: Annotated[Optional[Dict[str, Any]], last_value]
+    pending_action_timestamp: Annotated[Optional[str], last_value]
+    pending_action_expired: Annotated[bool, last_value]
+    user_confirmed: Annotated[bool, last_value]
+    proposal_verified: Annotated[bool, last_value]
+    verification_error: Annotated[Optional[str], last_value]
 
 
 class HealthcareLangGraph(BaseLangGraphOrchestrator):
@@ -139,6 +189,14 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         """
         Build healthcare-specific workflow graph with supervisor routing.
 
+        Phase 2 Enhanced Architecture:
+        - Guardrail node runs BEFORE supervisor (security-first)
+        - Language detection moved inside graph
+        - Session init handles TTL for pending actions
+        - Simple answer agent for fast FAQ path
+        - Hydration with parallel context fetch
+        - Plan-then-Execute for scheduling operations
+
         Phase 3: Unified Graph-Gateway Architecture
         - Supervisor node replaces fragmented intent routing
         - Routes to scheduling_agent (appointment) or info_agent (FAQ/price/general)
@@ -147,7 +205,20 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         # Start with base graph
         workflow = super()._build_graph()
 
-        # Add healthcare-specific nodes
+        # ==============================================
+        # Phase 2: New nodes
+        # ==============================================
+        workflow.add_node("guardrail", self.guardrail_node)
+        workflow.add_node("language_detect", self.language_detect_node)
+        workflow.add_node("session_init", self.session_init_node)
+        workflow.add_node("hydrate_context", self.hydrate_context_node)
+        workflow.add_node("simple_answer", self.simple_answer_node)
+        workflow.add_node("planner", self.planner_node)
+        workflow.add_node("executor", self.executor_node)
+
+        # ==============================================
+        # Existing healthcare nodes
+        # ==============================================
         workflow.add_node("phi_check", self.phi_check_node)
         workflow.add_node("emergency_check", self.emergency_check_node)
         workflow.add_node("phi_redact", self.phi_redact_node)
@@ -165,10 +236,40 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         workflow.add_node("faq_lookup", self.faq_lookup_node)
         workflow.add_node("insurance_verify", self.insurance_verify_node)
 
-        # Rewire flow for healthcare with supervisor
-        # Entry → Emergency Check → PHI Check → Supervisor
-        workflow.add_edge("entry", "emergency_check")
+        # ==============================================
+        # Phase 2: Enhanced flow with guardrail FIRST
+        # Entry → Language Detect → Session Init → Guardrail → Hydrate → Simple Answer → ...
+        # ==============================================
 
+        # Entry starts the enhanced pipeline
+        workflow.add_edge("entry", "language_detect")
+        workflow.add_edge("language_detect", "session_init")
+        workflow.add_edge("session_init", "guardrail")
+
+        # Guardrail routing - escalate immediately for emergencies
+        workflow.add_conditional_edges(
+            "guardrail",
+            self.guardrail_router,
+            {
+                "escalate": "phi_redact",  # Emergency goes straight to redact then exit
+                "continue": "hydrate_context"
+            }
+        )
+
+        # After hydration, try simple answer first (fast path)
+        workflow.add_edge("hydrate_context", "simple_answer")
+
+        # Simple answer routing - exit early if FAQ handled
+        workflow.add_conditional_edges(
+            "simple_answer",
+            self.simple_answer_router,
+            {
+                "exit": "phi_redact",  # Fast path handled, skip to exit
+                "continue": "emergency_check"  # Continue to existing flow
+            }
+        )
+
+        # Legacy emergency check (now secondary to guardrail)
         if self.enable_emergency_detection:
             workflow.add_conditional_edges(
                 "emergency_check",
@@ -181,7 +282,7 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         else:
             workflow.add_edge("emergency_check", "phi_check")
 
-        # PHI check leads to supervisor (skip compliance_check if not needed)
+        # PHI check leads to supervisor
         workflow.add_edge("phi_check", "supervisor")
 
         # Supervisor routing (replaces intent_classify routing)
@@ -189,13 +290,34 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
             "supervisor",
             self.supervisor_router,
             {
-                "scheduling": "scheduling_agent",
+                "scheduling": "planner",  # Phase 2: Plan-then-Execute for scheduling
                 "info": "info_agent",
                 "exit": "phi_redact",
             }
         )
 
-        # All agents go to process then phi_redact
+        # ==============================================
+        # Phase 2: Plan-then-Execute for scheduling
+        # ==============================================
+        workflow.add_edge("planner", "executor")
+
+        # Executor routing - handle confirmation, replanning, or completion
+        workflow.add_conditional_edges(
+            "executor",
+            self.executor_router,
+            {
+                "exit": "phi_redact",  # Awaiting confirmation or complete
+                "replan": "planner",  # Need to replan
+                "error": "process",  # Error handling
+                "continue": "executor",  # More steps to execute
+                "complete": "process",  # All done, generate response
+            }
+        )
+
+        # ==============================================
+        # Existing agent flows
+        # ==============================================
+        # Legacy scheduling agent (kept for backward compatibility)
         workflow.add_edge("scheduling_agent", "process")
         workflow.add_edge("info_agent", "process")
 
@@ -983,6 +1105,724 @@ Respond with ONLY one word: scheduling, info, or exit"""
         """Route based on supervisor decision."""
         return state.get("next_agent", "info")
 
+    # ========================================================================
+    # Phase 2: New Nodes - Guardrail, Language Detection, Session Init
+    # ========================================================================
+
+    async def guardrail_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Security guardrail that runs BEFORE supervisor.
+
+        Per Opinion 4, Section 4.1:
+        "Guardrails are security checks that must run before any agentic logic."
+
+        Checks:
+        1. Emergency detection (911, immediate danger)
+        2. PHI detection in outbound responses
+        3. Tool call validation (block certain tools in certain states)
+        4. Rate limiting / abuse detection
+
+        Returns:
+            State with guardrail_action set to 'escalate', 'restrict', or 'allow'
+        """
+        logger.debug(f"Guardrail node - session: {state['session_id']}")
+
+        message = state.get('message', '').lower()
+        guardrail_action = 'allow'
+        blocked_tools = []
+        escalation_reason = None
+        is_emergency = False
+
+        # 1. Emergency detection (highest priority)
+        emergency_patterns = [
+            # English
+            '911', 'emergency', 'heart attack', 'cant breathe', "can't breathe",
+            'severe bleeding', 'suicidal', 'overdose', 'dying', 'severe pain',
+            # Russian
+            'помогите', 'умираю', 'острая боль', 'сильная боль', 'скорая',
+            # Spanish
+            'emergencia', 'no puedo respirar', 'dolor severo', 'urgente', 'dolor agudo',
+            # Portuguese
+            'emergência', 'dor forte', 'não consigo respirar',
+            # Hebrew
+            'חירום', 'כאב חזק',
+        ]
+        if any(pattern in message for pattern in emergency_patterns):
+            is_emergency = True
+            guardrail_action = 'escalate'
+            escalation_reason = 'emergency_detected'
+            logger.warning(f"[guardrail] Emergency detected in message: {message[:50]}...")
+
+        # 2. PHI in outbound - check if we're about to send PHI
+        # (This is checked after response generation in phi_redact_node)
+        # Here we just mark if PHI was detected in incoming message
+        phi_patterns = [
+            r'\b\d{3}-\d{2}-\d{4}\b',  # SSN
+            r'\b\d{9}\b',  # 9-digit number (possible SSN)
+        ]
+        import re
+        phi_detected = any(re.search(p, message) for p in phi_patterns)
+
+        # 3. Tool restrictions based on state
+        flow_state = state.get('flow_state', 'idle')
+        if flow_state == 'escalated':
+            # In escalated state, block all booking tools
+            blocked_tools = ['book_appointment', 'cancel_appointment', 'reschedule_appointment']
+            guardrail_action = 'restrict' if guardrail_action != 'escalate' else guardrail_action
+
+        # 4. Abuse detection (simple rate check - in practice use Redis)
+        # This is a placeholder - real implementation would check Redis
+
+        # Calculate allowed tools
+        all_tools = ['check_availability', 'book_appointment', 'cancel_appointment',
+                     'query_prices', 'query_services', 'query_doctors']
+        allowed_tools = [t for t in all_tools if t not in blocked_tools]
+
+        # Update state
+        state['is_emergency'] = is_emergency
+        state['phi_detected'] = phi_detected
+        state['allowed_tools'] = allowed_tools
+        state['blocked_tools'] = blocked_tools
+        state['guardrail_action'] = guardrail_action
+        state['escalation_reason'] = escalation_reason
+
+        state['audit_trail'].append({
+            "node": "guardrail",
+            "timestamp": datetime.utcnow().isoformat(),
+            "action": guardrail_action,
+            "is_emergency": is_emergency,
+            "phi_detected": phi_detected,
+            "blocked_tools": blocked_tools,
+        })
+
+        return state
+
+    def guardrail_router(self, state: HealthcareConversationState) -> str:
+        """Route based on guardrail action."""
+        action = state.get('guardrail_action', 'allow')
+        if action == 'escalate':
+            return 'escalate'
+        # 'restrict' and 'allow' both continue to supervisor
+        return 'continue'
+
+    async def language_detect_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Detect language from user message.
+
+        Replaces RoutingStep language detection - now happens inside the graph.
+        Uses character analysis for fast, reliable detection.
+        """
+        logger.debug(f"Language detect node - session: {state['session_id']}")
+
+        message = state.get('message', '')
+        language = 'en'  # Default
+
+        if message:
+            text_len = len(message)
+            if text_len > 0:
+                # Cyrillic → Russian
+                cyrillic = sum(1 for c in message if '\u0400' <= c <= '\u04FF')
+                if cyrillic / text_len > 0.3:
+                    language = 'ru'
+                else:
+                    # Hebrew
+                    hebrew = sum(1 for c in message if '\u0590' <= c <= '\u05FF')
+                    if hebrew / text_len > 0.3:
+                        language = 'he'
+                    else:
+                        # Spanish indicators
+                        message_lower = message.lower()
+                        spanish_markers = ['hola', 'gracias', 'señor', 'está', 'qué', 'cómo', 'buenos', 'buenas']
+                        if any(m in message_lower for m in spanish_markers):
+                            language = 'es'
+                        else:
+                            # Portuguese indicators
+                            portuguese_markers = ['olá', 'obrigado', 'você', 'não', 'bom dia']
+                            if any(m in message_lower for m in portuguese_markers):
+                                language = 'pt'
+
+        state['detected_language'] = language
+        state['metadata']['language'] = language
+
+        state['audit_trail'].append({
+            "node": "language_detect",
+            "timestamp": datetime.utcnow().isoformat(),
+            "detected_language": language,
+        })
+
+        return state
+
+    async def session_init_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Initialize session state, handle TTL for pending actions.
+
+        Per Opinion 3 feedback:
+        - Expired proposals are cleared on first message
+        - TTL prevents "zombie" confirmations
+        - Session rotation on timeout
+
+        Checks:
+        1. Is there a pending action proposal?
+        2. Has it expired (TTL exceeded)?
+        3. Is this message a confirmation/rejection?
+        """
+        logger.debug(f"Session init node - session: {state['session_id']}")
+
+        # Check for pending action from previous turn
+        pending_action = state.get('pending_action')
+        pending_timestamp = state.get('pending_action_timestamp')
+        awaiting_confirmation = state.get('awaiting_confirmation', False)
+        proposal_expired = False
+        user_confirmed = False
+
+        if pending_action and pending_timestamp:
+            try:
+                # Parse timestamp
+                ts = datetime.fromisoformat(pending_timestamp.replace('Z', '+00:00'))
+                age_seconds = (datetime.now(timezone.utc) - ts).total_seconds()
+                ttl = pending_action.get('ttl_seconds', 3600)
+
+                if age_seconds > ttl:
+                    # Proposal expired - clear it
+                    proposal_expired = True
+                    logger.info(f"[session_init] Pending action expired after {age_seconds:.0f}s (TTL: {ttl}s)")
+                    state['pending_action'] = None
+                    state['awaiting_confirmation'] = False
+                    awaiting_confirmation = False
+
+            except Exception as e:
+                logger.warning(f"[session_init] Error checking pending action TTL: {e}")
+
+        # If awaiting confirmation and message is short, check for confirmation
+        if awaiting_confirmation and not proposal_expired:
+            message = state.get('message', '').lower().strip()
+            language = state.get('detected_language', 'en')
+            confirmation = is_confirmation_response(message, language)
+
+            if confirmation is True:
+                user_confirmed = True
+                logger.info(f"[session_init] User confirmed pending action")
+            elif confirmation is False:
+                # User rejected - clear pending action
+                state['pending_action'] = None
+                state['awaiting_confirmation'] = False
+                logger.info(f"[session_init] User rejected pending action")
+
+        # Update state
+        state['pending_action_expired'] = proposal_expired
+        state['user_confirmed'] = user_confirmed
+
+        state['audit_trail'].append({
+            "node": "session_init",
+            "timestamp": datetime.utcnow().isoformat(),
+            "awaiting_confirmation": awaiting_confirmation,
+            "proposal_expired": proposal_expired,
+            "user_confirmed": user_confirmed,
+        })
+
+        return state
+
+    async def hydrate_context_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Session-aware context hydration with parallel fetch.
+
+        Per Opinion 4, Section 2.2:
+        "Parallel hydration of clinic, patient, services, and doctors context."
+
+        Uses asyncio.gather for parallel DB calls:
+        - Clinic profile
+        - Patient profile (if phone number available)
+        - Clinic services (cached with TTL)
+        - Clinic doctors (cached with TTL)
+        - Previous session summary (for continuity)
+        """
+        logger.debug(f"Hydrate context node - session: {state['session_id']}")
+
+        # Skip if already hydrated (from pipeline context)
+        if state.get('context_hydrated'):
+            logger.debug("[hydrate_context] Already hydrated from pipeline, skipping")
+            return state
+
+        clinic_id = state.get('metadata', {}).get('clinic_id') or self.clinic_id
+        phone_number = state.get('metadata', {}).get('phone_number')
+        session_id = state.get('session_id')
+
+        # Prepare fetch tasks
+        async def fetch_clinic():
+            if not clinic_id or not self.supabase_client:
+                return {}
+            try:
+                result = self.supabase_client.table('clinics').select('*').eq('id', clinic_id).single().execute()
+                return result.data if result.data else {}
+            except Exception as e:
+                logger.warning(f"[hydrate_context] Failed to fetch clinic: {e}")
+                return {}
+
+        async def fetch_patient():
+            if not phone_number or not self.supabase_client:
+                return {}
+            try:
+                result = self.supabase_client.table('patients').select('*').eq('phone', phone_number).single().execute()
+                return result.data if result.data else {}
+            except Exception as e:
+                logger.debug(f"[hydrate_context] No patient found for phone: {e}")
+                return {}
+
+        async def fetch_services():
+            if not clinic_id or not self.supabase_client:
+                return []
+            try:
+                result = self.supabase_client.table('services').select('*').eq('clinic_id', clinic_id).execute()
+                return result.data if result.data else []
+            except Exception as e:
+                logger.warning(f"[hydrate_context] Failed to fetch services: {e}")
+                return []
+
+        async def fetch_doctors():
+            if not clinic_id or not self.supabase_client:
+                return []
+            try:
+                result = self.supabase_client.table('doctors').select('*').eq('clinic_id', clinic_id).execute()
+                return result.data if result.data else []
+            except Exception as e:
+                logger.warning(f"[hydrate_context] Failed to fetch doctors: {e}")
+                return []
+
+        async def fetch_previous_summary():
+            # Fetch summary of previous session (if any) for continuity
+            return {}  # Placeholder - would query session_summaries table
+
+        # Parallel fetch all context
+        try:
+            clinic, patient, services, doctors, prev_summary = await asyncio.gather(
+                fetch_clinic(),
+                fetch_patient(),
+                fetch_services(),
+                fetch_doctors(),
+                fetch_previous_summary(),
+                return_exceptions=True
+            )
+
+            # Handle any exceptions from gather
+            if isinstance(clinic, Exception):
+                logger.warning(f"[hydrate_context] clinic fetch error: {clinic}")
+                clinic = {}
+            if isinstance(patient, Exception):
+                logger.warning(f"[hydrate_context] patient fetch error: {patient}")
+                patient = {}
+            if isinstance(services, Exception):
+                logger.warning(f"[hydrate_context] services fetch error: {services}")
+                services = []
+            if isinstance(doctors, Exception):
+                logger.warning(f"[hydrate_context] doctors fetch error: {doctors}")
+                doctors = []
+            if isinstance(prev_summary, Exception):
+                logger.warning(f"[hydrate_context] prev_summary fetch error: {prev_summary}")
+                prev_summary = {}
+
+        except Exception as e:
+            logger.error(f"[hydrate_context] Parallel fetch failed: {e}")
+            clinic, patient, services, doctors, prev_summary = {}, {}, [], [], {}
+
+        # Update context
+        ctx = state.get('context', {})
+        ctx['clinic_profile'] = clinic
+        ctx['patient_profile'] = patient
+        ctx['clinic_services'] = services
+        ctx['clinic_doctors'] = doctors
+        state['context'] = ctx
+        state['context_hydrated'] = True
+        state['previous_session_summary'] = prev_summary
+
+        # Also update patient fields in state
+        if patient:
+            state['patient_id'] = patient.get('id')
+            state['patient_name'] = patient.get('name', patient.get('first_name'))
+
+        state['audit_trail'].append({
+            "node": "hydrate_context",
+            "timestamp": datetime.utcnow().isoformat(),
+            "clinic_loaded": bool(clinic),
+            "patient_loaded": bool(patient),
+            "services_count": len(services),
+            "doctors_count": len(doctors),
+        })
+
+        return state
+
+    async def simple_answer_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Fast-path node for simple FAQ/price queries.
+
+        Per Opinion 4, Section 2.5:
+        "Simple questions about hours, location, prices can be answered immediately
+        without full planning/execution cycle."
+
+        This node:
+        1. Checks if query matches FAQ patterns
+        2. Does direct context lookup (no LLM needed)
+        3. Returns formatted answer immediately
+
+        Routes to:
+        - Exit (response generated) if simple answer found
+        - Continue to supervisor if complex query
+        """
+        logger.debug(f"Simple answer node - session: {state['session_id']}")
+
+        message = state.get('message', '').lower()
+        ctx = state.get('context', {})
+        language = state.get('detected_language', 'en')
+
+        # FAQ patterns
+        hours_patterns = ['hours', 'open', 'close', 'when', 'horario', 'часы', 'работаете']
+        location_patterns = ['address', 'location', 'where', 'dirección', 'donde', 'адрес', 'где']
+        phone_patterns = ['phone', 'call', 'number', 'teléfono', 'телефон', 'номер']
+
+        clinic = ctx.get('clinic_profile', {})
+
+        # Check for hours query
+        if any(p in message for p in hours_patterns):
+            hours = clinic.get('business_hours', clinic.get('hours'))
+            if hours:
+                # Format response in user's language
+                templates = {
+                    'en': f"Our hours are: {hours}",
+                    'es': f"Nuestro horario es: {hours}",
+                    'ru': f"Наши часы работы: {hours}",
+                    'pt': f"Nosso horário é: {hours}",
+                    'he': f"שעות הפעילות שלנו: {hours}",
+                }
+                state['response'] = templates.get(language, templates['en'])
+                state['fast_path'] = True
+                state['lane'] = 'FAQ'
+                logger.info(f"[simple_answer] Fast-path hours response")
+                return state
+
+        # Check for location query
+        if any(p in message for p in location_patterns):
+            address = clinic.get('address', clinic.get('location'))
+            if address:
+                templates = {
+                    'en': f"We're located at: {address}",
+                    'es': f"Estamos ubicados en: {address}",
+                    'ru': f"Мы находимся по адресу: {address}",
+                    'pt': f"Estamos localizados em: {address}",
+                    'he': f"אנחנו נמצאים ב: {address}",
+                }
+                state['response'] = templates.get(language, templates['en'])
+                state['fast_path'] = True
+                state['lane'] = 'FAQ'
+                logger.info(f"[simple_answer] Fast-path location response")
+                return state
+
+        # Check for phone query
+        if any(p in message for p in phone_patterns):
+            phone = clinic.get('phone', clinic.get('phone_number'))
+            if phone:
+                templates = {
+                    'en': f"You can reach us at: {phone}",
+                    'es': f"Puede contactarnos al: {phone}",
+                    'ru': f"Наш телефон: {phone}",
+                    'pt': f"Você pode nos ligar em: {phone}",
+                    'he': f"ניתן ליצור קשר בטלפון: {phone}",
+                }
+                state['response'] = templates.get(language, templates['en'])
+                state['fast_path'] = True
+                state['lane'] = 'FAQ'
+                logger.info(f"[simple_answer] Fast-path phone response")
+                return state
+
+        # No simple answer found - continue to supervisor
+        state['fast_path'] = False
+
+        state['audit_trail'].append({
+            "node": "simple_answer",
+            "timestamp": datetime.utcnow().isoformat(),
+            "fast_path": state['fast_path'],
+        })
+
+        return state
+
+    def simple_answer_router(self, state: HealthcareConversationState) -> str:
+        """Route based on simple answer result."""
+        if state.get('fast_path') and state.get('response'):
+            return 'exit'  # Response generated, skip to exit
+        return 'continue'  # Continue to supervisor
+
+    # ========================================================================
+    # Phase 2: Plan-then-Execute Nodes
+    # ========================================================================
+
+    async def planner_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Create action plan for complex scheduling operations.
+
+        Per Opinion 4, Section 3.2:
+        "Plan-then-Execute patterns yield better predictability and security."
+
+        This node:
+        1. Analyzes the scheduling intent
+        2. Creates a typed ActionPlan with required steps
+        3. Identifies which steps need confirmation
+        """
+        logger.debug(f"Planner node - session: {state['session_id']}")
+
+        message = state.get('message', '').lower()
+        ctx = state.get('context', {})
+        language = state.get('detected_language', 'en')
+
+        # Determine action type from message
+        action_type = 'book'  # Default
+        if any(w in message for w in ['cancel', 'cancelar', 'отменить']):
+            action_type = 'cancel'
+        elif any(w in message for w in ['reschedule', 'reprogramar', 'перенести']):
+            action_type = 'reschedule'
+
+        # Build plan based on action type
+        steps = []
+
+        if action_type == 'book':
+            # Standard booking flow
+            steps = [
+                PlanStep(
+                    action=ActionType.CHECK_AVAILABILITY,
+                    tool_name="check_availability",
+                    arguments={
+                        "clinic_id": self.clinic_id,
+                        "patient_id": state.get('patient_id'),
+                    },
+                    requires_confirmation=False,
+                    description="Check available appointment slots"
+                ),
+                PlanStep(
+                    action=ActionType.BOOK_APPOINTMENT,
+                    tool_name="book_appointment",
+                    arguments={
+                        "clinic_id": self.clinic_id,
+                        "patient_id": state.get('patient_id'),
+                    },
+                    requires_confirmation=True,  # HITL for bookings
+                    description="Book the selected appointment"
+                ),
+            ]
+            goal = "Book appointment for patient"
+
+        elif action_type == 'cancel':
+            steps = [
+                PlanStep(
+                    action=ActionType.CANCEL_APPOINTMENT,
+                    tool_name="cancel_appointment",
+                    arguments={
+                        "patient_id": state.get('patient_id'),
+                    },
+                    requires_confirmation=True,  # HITL for cancellations
+                    description="Cancel existing appointment"
+                ),
+            ]
+            goal = "Cancel patient's appointment"
+
+        elif action_type == 'reschedule':
+            steps = [
+                PlanStep(
+                    action=ActionType.CHECK_AVAILABILITY,
+                    tool_name="check_availability",
+                    arguments={"clinic_id": self.clinic_id},
+                    requires_confirmation=False,
+                    description="Find new available slots"
+                ),
+                PlanStep(
+                    action=ActionType.RESCHEDULE_APPOINTMENT,
+                    tool_name="reschedule_appointment",
+                    arguments={"patient_id": state.get('patient_id')},
+                    requires_confirmation=True,
+                    description="Move appointment to new time"
+                ),
+            ]
+            goal = "Reschedule patient's appointment"
+
+        # Create typed plan
+        plan = ActionPlan(
+            goal=goal,
+            steps=steps,
+            requires_human_confirmation=any(s.requires_confirmation for s in steps),
+            estimated_steps=len(steps),
+        )
+
+        # Store plan in state (as dict for serialization)
+        state['action_plan'] = {
+            'goal': plan.goal,
+            'steps': [s.to_execution_dict() for s in plan.steps],
+            'requires_human_confirmation': plan.requires_human_confirmation,
+            'estimated_steps': plan.estimated_steps,
+            'created_at': plan.created_at.isoformat(),
+        }
+        state['plan_completed_steps'] = []
+        state['plan_needs_replanning'] = False
+
+        logger.info(f"[planner] Created plan: {plan.goal} with {len(steps)} steps")
+
+        state['audit_trail'].append({
+            "node": "planner",
+            "timestamp": datetime.utcnow().isoformat(),
+            "action_type": action_type,
+            "plan_steps": len(steps),
+            "requires_confirmation": plan.requires_human_confirmation,
+        })
+
+        return state
+
+    async def executor_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Execute action plan step by step.
+
+        This node:
+        1. Gets next step from plan
+        2. Checks if step requires confirmation
+        3. If confirmation needed, creates ActionProposal and pauses
+        4. If no confirmation needed, executes step
+        5. Handles errors and replanning triggers
+        """
+        logger.debug(f"Executor node - session: {state['session_id']}")
+
+        plan = state.get('action_plan')
+        if not plan:
+            logger.warning("[executor] No plan to execute")
+            return state
+
+        completed_steps = state.get('plan_completed_steps', [])
+        steps = plan.get('steps', [])
+
+        # Find next step to execute
+        next_step_idx = len(completed_steps)
+        if next_step_idx >= len(steps):
+            logger.info("[executor] All steps completed")
+            state['plan_results'] = {'success': True, 'message': 'All steps completed'}
+            return state
+
+        next_step = steps[next_step_idx]
+        step_name = next_step.get('tool_name', 'unknown')
+
+        logger.info(f"[executor] Executing step {next_step_idx + 1}/{len(steps)}: {step_name}")
+
+        # Check if step requires confirmation
+        if next_step.get('requires_confirmation'):
+            # Check if user already confirmed
+            if state.get('user_confirmed'):
+                # User confirmed - execute the step
+                logger.info(f"[executor] User confirmed, executing {step_name}")
+                state['user_confirmed'] = False  # Reset for next confirmation
+                state['awaiting_confirmation'] = False
+            else:
+                # Need confirmation - create proposal
+                proposal = ActionProposal(
+                    type=ActionProposalType.BOOK_APPOINTMENT,  # Adjust based on step
+                    patient_id=state.get('patient_id', ''),
+                    provider_id=next_step.get('arguments', {}).get('doctor_id'),
+                    slot=next_step.get('arguments', {}).get('slot'),
+                    human_summary=next_step.get('description', 'Complete the action'),
+                    execution_params=next_step.get('arguments', {}),
+                    ttl_seconds=1800,  # 30 minute TTL
+                )
+
+                state['action_proposal'] = proposal.to_state_dict()
+                state['awaiting_confirmation'] = True
+                state['pending_action'] = proposal.to_state_dict()
+                state['pending_action_timestamp'] = datetime.now(timezone.utc).isoformat()
+
+                # Generate confirmation message
+                language = state.get('detected_language', 'en')
+                state['response'] = proposal.to_confirmation_message(language)
+
+                logger.info(f"[executor] Awaiting confirmation for {step_name}")
+
+                state['audit_trail'].append({
+                    "node": "executor",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "step": step_name,
+                    "awaiting_confirmation": True,
+                })
+
+                return state
+
+        # Execute the step (no confirmation needed or already confirmed)
+        try:
+            # Get the appropriate tool
+            tool = self._get_tool_for_step(next_step)
+
+            if tool:
+                arguments = next_step.get('arguments', {})
+                result = await tool(**arguments)
+
+                # Store result
+                if not state.get('plan_results'):
+                    state['plan_results'] = {'outputs': {}}
+                state['plan_results']['outputs'][step_name] = result
+
+                # Mark step as completed
+                completed_steps.append(step_name)
+                state['plan_completed_steps'] = completed_steps
+
+                logger.info(f"[executor] Step {step_name} completed successfully")
+            else:
+                logger.warning(f"[executor] No tool found for {step_name}")
+                state['plan_execution_error'] = f"Tool not found: {step_name}"
+
+        except Exception as e:
+            logger.error(f"[executor] Step {step_name} failed: {e}")
+            state['plan_execution_error'] = str(e)
+            state['plan_failed_step'] = step_name
+
+            # Check if we should replan
+            if next_step_idx < len(steps) - 1:
+                state['plan_needs_replanning'] = True
+
+        state['audit_trail'].append({
+            "node": "executor",
+            "timestamp": datetime.utcnow().isoformat(),
+            "step": step_name,
+            "completed": step_name in completed_steps,
+            "error": state.get('plan_execution_error'),
+        })
+
+        return state
+
+    def _get_tool_for_step(self, step: Dict[str, Any]) -> Optional[Any]:
+        """Get the appropriate tool callable for a plan step."""
+        tool_name = step.get('tool_name')
+
+        if tool_name == 'check_availability' and self.appointment_tools:
+            return self.appointment_tools.check_availability
+        elif tool_name == 'book_appointment' and self.appointment_tools:
+            return self.appointment_tools.book_appointment
+        elif tool_name == 'cancel_appointment' and self.appointment_tools:
+            return self.appointment_tools.cancel_appointment
+        elif tool_name == 'query_prices' and self.price_query_tool:
+            return self.price_query_tool.get_services_by_query
+
+        return None
+
+    def executor_router(self, state: HealthcareConversationState) -> str:
+        """Route based on executor result."""
+        if state.get('awaiting_confirmation'):
+            return 'exit'  # Wait for user response
+        if state.get('plan_needs_replanning'):
+            return 'replan'
+        if state.get('plan_execution_error'):
+            return 'error'
+
+        # Check if all steps completed
+        plan = state.get('action_plan', {})
+        completed = len(state.get('plan_completed_steps', []))
+        total = len(plan.get('steps', []))
+
+        if completed >= total:
+            return 'complete'
+        return 'continue'  # More steps to execute
+
+    # ========================================================================
+    # End of Phase 2 Nodes
+    # ========================================================================
+
     async def process(
         self,
         message: str,
@@ -1070,6 +1910,37 @@ Respond with ONLY one word: scheduling, info, or exit"""
             flow_state=flow_state,
             active_task=ctx.get('active_task'),
             next_agent=None,
+            # Phase 2: Guardrail fields
+            is_emergency=False,
+            phi_detected=False,
+            allowed_tools=[],
+            blocked_tools=[],
+            guardrail_action=None,
+            escalation_reason=None,
+            # Phase 2: Language detection
+            detected_language=ctx.get('language', 'en'),
+            # Phase 2: Context hydration
+            context_hydrated=bool(ctx.get('clinic_profile')),  # True if pipeline already hydrated
+            previous_session_summary=None,
+            # Phase 2: Fast path
+            fast_path=False,
+            lane=ctx.get('lane'),
+            # Phase 2: Plan-then-Execute
+            action_plan=None,
+            plan_results=None,
+            plan_completed_steps=[],
+            plan_execution_error=None,
+            plan_failed_step=None,
+            plan_needs_replanning=False,
+            # Phase 2: Action Proposal (HITL)
+            action_proposal=None,
+            awaiting_confirmation=ctx.get('awaiting_confirmation', False),
+            pending_action=ctx.get('pending_action'),
+            pending_action_timestamp=ctx.get('pending_action_timestamp'),
+            pending_action_expired=False,
+            user_confirmed=False,
+            proposal_verified=False,
+            verification_error=None,
         )
 
         try:
