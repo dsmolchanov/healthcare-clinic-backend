@@ -1548,13 +1548,16 @@ Respond with ONLY one word: scheduling, info, or exit"""
 
         if action_type == 'book':
             # Standard booking flow
+            # check_availability expects: doctor_id, date, appointment_type, duration_minutes
             steps = [
                 PlanStep(
                     action=ActionType.CHECK_AVAILABILITY,
                     tool_name="check_availability",
                     arguments={
-                        "clinic_id": self.clinic_id,
-                        "patient_id": state.get('patient_id'),
+                        "doctor_id": state.get('doctor_id'),
+                        "date": state.get('preferred_date'),
+                        "appointment_type": state.get('appointment_type', 'general'),
+                        "duration_minutes": 30,
                     },
                     requires_confirmation=False,
                     description="Check available appointment slots"
@@ -1563,8 +1566,11 @@ Respond with ONLY one word: scheduling, info, or exit"""
                     action=ActionType.BOOK_APPOINTMENT,
                     tool_name="book_appointment",
                     arguments={
-                        "clinic_id": self.clinic_id,
-                        "patient_id": state.get('patient_id'),
+                        "patient_id": state.get('patient_id') or "unknown",
+                        "doctor_id": state.get('doctor_id'),
+                        "datetime_str": state.get('preferred_date'),  # Will be set from available slots
+                        "appointment_type": state.get('appointment_type', 'general'),
+                        "duration_minutes": 30,
                     },
                     requires_confirmation=True,  # HITL for bookings
                     description="Book the selected appointment"
@@ -1591,7 +1597,12 @@ Respond with ONLY one word: scheduling, info, or exit"""
                 PlanStep(
                     action=ActionType.CHECK_AVAILABILITY,
                     tool_name="check_availability",
-                    arguments={"clinic_id": self.clinic_id},
+                    arguments={
+                        "doctor_id": state.get('doctor_id'),
+                        "date": state.get('preferred_date'),
+                        "appointment_type": state.get('appointment_type', 'general'),
+                        "duration_minutes": 30,
+                    },
                     requires_confirmation=False,
                     description="Find new available slots"
                 ),
