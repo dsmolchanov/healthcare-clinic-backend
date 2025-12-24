@@ -129,20 +129,46 @@ class ReservationTools:
                 "available_slots": []
             }
 
-        # Validate doctor_id is valid UUID format if provided
+        # Check if doctor_id is a UUID or a doctor name
         if doctor_id is not None:
             try:
-                import uuid
-                uuid.UUID(doctor_id)
+                import uuid as uuid_module
+                uuid_module.UUID(doctor_id)
+                # Valid UUID, use as-is
             except (ValueError, AttributeError):
-                logger.error(f"Invalid doctor_id format: {doctor_id}")
-                return {
-                    "success": False,
-                    "error": "invalid_doctor_id",
-                    "message": "I encountered an error. Let me connect you with our team.",
-                    "requires_escalation": True,
-                    "available_slots": []
-                }
+                # Not a UUID - try to look up doctor by name
+                logger.info(f"doctor_id '{doctor_id}' is not a UUID, looking up by name")
+                doctor_result = self.supabase.schema('healthcare').table('doctors').select('id, first_name, last_name').eq('clinic_id', self.clinic_id).execute()
+
+                matched_doctor = None
+                doctor_name_lower = doctor_id.lower().strip()
+
+                for doc in doctor_result.data or []:
+                    first_name = (doc.get('first_name') or '').lower()
+                    last_name = (doc.get('last_name') or '').lower()
+                    full_name = f"{first_name} {last_name}"
+
+                    # Check various matching patterns
+                    if (doctor_name_lower in first_name or
+                        doctor_name_lower in last_name or
+                        doctor_name_lower in full_name or
+                        first_name in doctor_name_lower or
+                        last_name in doctor_name_lower):
+                        matched_doctor = doc
+                        break
+
+                if matched_doctor:
+                    doctor_id = matched_doctor['id']
+                    logger.info(f"Resolved doctor name to UUID: {matched_doctor['first_name']} {matched_doctor['last_name']} → {doctor_id}")
+                else:
+                    logger.warning(f"Could not find doctor matching '{doctor_id}'")
+                    return {
+                        "success": False,
+                        "error": "doctor_not_found",
+                        "message": f"I couldn't find a doctor named '{doctor_id}'. Please check the name or ask me to show available doctors.",
+                        "requires_clarification": True,
+                        "available_slots": []
+                    }
 
         try:
             # Parse preferred date
@@ -381,7 +407,7 @@ class ReservationTools:
 
         Args:
             patient_info: Patient information (name, phone, email)
-            service_id: ID of the service
+            service_id: ID of the service (UUID) or service name (will be looked up)
             datetime_str: Appointment datetime in ISO format
             doctor_id: Optional doctor ID
             notes: Optional notes for the appointment
@@ -405,8 +431,31 @@ class ReservationTools:
             # Parse datetime
             appointment_datetime = datetime.fromisoformat(datetime_str)
 
+            # Check if service_id is a UUID or a service name
+            try:
+                import uuid as uuid_module
+                uuid_module.UUID(service_id)
+                is_uuid = True
+            except (ValueError, AttributeError):
+                is_uuid = False
+                logger.info(f"service_id '{service_id}' is not a UUID, looking up by name")
+
             # Get service details from healthcare schema
-            service_result = self.supabase.schema('healthcare').table('services').select('*').eq('id', service_id).execute()
+            if is_uuid:
+                service_result = self.supabase.schema('healthcare').table('services').select('*').eq('id', service_id).execute()
+            else:
+                # Lookup by name - try multiple language columns
+                service_result = self.supabase.schema('healthcare').table('services').select('*').eq('clinic_id', self.clinic_id).or_(
+                    f'name.ilike.%{service_id}%,'
+                    f'name_ru.ilike.%{service_id}%,'
+                    f'name_en.ilike.%{service_id}%,'
+                    f'name_es.ilike.%{service_id}%'
+                ).limit(1).execute()
+                if service_result.data:
+                    # Update service_id with the actual UUID
+                    service_id = service_result.data[0]['id']
+                    logger.info(f"Resolved service name to UUID: {service_id}")
+
             if not service_result.data:
                 return {
                     "success": False,

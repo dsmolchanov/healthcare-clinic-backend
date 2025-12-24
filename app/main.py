@@ -491,15 +491,35 @@ async def deprecated_voice_api_routes(deprecated_path: str):
 
 @app.get("/health")
 async def health_check():
-    """Instant health check endpoint - NO external calls to prevent blocking"""
+    """Instant health check endpoint with memory monitoring"""
     from datetime import datetime
+    import psutil
+    import os
 
-    # Return immediately with no external I/O - prevents health check timeouts
+    # Get memory usage
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
+    memory_percent = process.memory_percent()
+
+    # Determine status based on memory usage
+    # Warning at 70%, degraded at 85%
+    if memory_percent > 85:
+        status = "degraded"
+    elif memory_percent > 70:
+        status = "warning"
+    else:
+        status = "healthy"
+
     return {
-        "status": "healthy",
+        "status": status,
         "service": "Healthcare Clinics Backend",
         "version": "1.0.0",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
+        "memory": {
+            "used_mb": round(memory_mb, 1),
+            "percent": round(memory_percent, 1),
+        }
     }
 
 @app.post("/admin/clear-cache/doctors/{clinic_id}")

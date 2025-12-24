@@ -16,6 +16,8 @@ import json
 import logging
 from typing import Dict, Any, List
 
+from app.utils.i18n_helpers import get_translation
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,11 +108,13 @@ class ClinicDataCache:
             try:
                 # Use 'active' column (current schema)
                 # Include i18n fields for multi-language search support
+                # Include JSONB columns for unified i18n access
                 result = supabase_client.schema('healthcare').table('services').select(
                     '''
                     id,name,description,base_price,category,duration_minutes,currency,code,
                     name_ru,name_en,name_es,name_pt,name_he,
-                    description_ru,description_en,description_es,description_pt,description_he
+                    description_ru,description_en,description_es,description_pt,description_he,
+                    name_i18n,description_i18n
                     '''
                 ).eq('clinic_id', clinic_id).eq('active', True).execute()
                 services = result.data if result.data else []
@@ -121,7 +125,8 @@ class ClinicDataCache:
                         '''
                         id,name,description,base_price,category,duration_minutes,currency,code,
                         name_ru,name_en,name_es,name_pt,name_he,
-                        description_ru,description_en,description_es,description_pt,description_he
+                        description_ru,description_en,description_es,description_pt,description_he,
+                        name_i18n,description_i18n
                         '''
                     ).eq('clinic_id', clinic_id).eq('is_active', True).execute()
                     services = result.data if result.data else []
@@ -143,7 +148,10 @@ class ClinicDataCache:
         language: str = 'en'
     ) -> List[Dict[str, Any]]:
         """
-        Search cached services with language-aware field matching
+        Search cached services with language-aware field matching using JSONB i18n.
+
+        Uses get_translation() helper to access name_i18n JSONB with fallback chain.
+        Falls back to columnar columns if JSONB is not populated.
 
         Args:
             cached_services: List of cached service dicts
@@ -156,36 +164,41 @@ class ClinicDataCache:
         query_lower = query.lower()
         matches = []
 
-        # Define search fields by language priority
-        field_priority = {
-            'ru': ['name_ru', 'name', 'name_en'],
-            'es': ['name_es', 'name', 'name_en'],
-            'en': ['name_en', 'name'],
-            'pt': ['name_pt', 'name', 'name_en'],
-            'he': ['name_he', 'name', 'name_en']
-        }
-
-        search_fields = field_priority.get(language, ['name', 'name_en'])
-
         for service in cached_services:
-            # Exact match in language-specific fields
-            for field in search_fields:
-                field_value = service.get(field, '')
-                if field_value and query_lower == field_value.lower():
-                    service['match_type'] = 'exact'
-                    service['match_field'] = field
-                    matches.append(service)
-                    break
+            # Get translated name using i18n helper with fallback chain
+            display_name = get_translation(service, 'name', language, fallback_languages=['en'])
+
+            if not display_name:
+                # Final fallback to columnar columns if JSONB empty
+                field_priority = {
+                    'ru': ['name_ru', 'name', 'name_en'],
+                    'es': ['name_es', 'name', 'name_en'],
+                    'en': ['name_en', 'name'],
+                    'pt': ['name_pt', 'name', 'name_en'],
+                    'he': ['name_he', 'name', 'name_en']
+                }
+                for field in field_priority.get(language, ['name', 'name_en']):
+                    display_name = service.get(field, '')
+                    if display_name:
+                        break
+
+            if not display_name:
+                continue
+
+            # Exact match first
+            if query_lower == display_name.lower():
+                match_result = service.copy()
+                match_result['match_type'] = 'exact'
+                match_result['match_field'] = f'name_{language}'
+                matches.append(match_result)
+                continue
 
             # Substring match (fallback)
-            if service not in matches:
-                for field in search_fields:
-                    field_value = service.get(field, '')
-                    if field_value and query_lower in field_value.lower():
-                        service['match_type'] = 'substring'
-                        service['match_field'] = field
-                        matches.append(service)
-                        break
+            if query_lower in display_name.lower():
+                match_result = service.copy()
+                match_result['match_type'] = 'substring'
+                match_result['match_field'] = f'name_{language}'
+                matches.append(match_result)
 
         return matches
 

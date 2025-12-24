@@ -115,9 +115,29 @@ class PreferenceNarrowingService:
             return None, []  # None signals "couldn't check", not "zero doctors"
 
         try:
+            # First, resolve service_name to service_id
+            service_result = self.supabase.schema('healthcare').table('services').select('id').eq('clinic_id', clinic_id).or_(
+                f'name.ilike.%{service_name}%,'
+                f'name_ru.ilike.%{service_name}%,'
+                f'name_en.ilike.%{service_name}%,'
+                f'name_es.ilike.%{service_name}%'
+            ).limit(1).execute()
+
+            if not service_result.data:
+                logger.warning(f"Service not found for name: {service_name}")
+                return None, []
+
+            service_id = service_result.data[0]['id']
+            logger.debug(f"Resolved service '{service_name}' to ID: {service_id}")
+
             result = self.supabase.rpc(
                 'get_doctors_by_service_v2',
-                {'p_service_name': service_name, 'p_clinic_id': clinic_id}
+                {
+                    'p_clinic_id': clinic_id,
+                    'p_service_id': service_id,
+                    'p_patient_id': None,
+                    'p_limit': 100  # Get all eligible doctors
+                }
             ).execute()
 
             doctors = result.data or []

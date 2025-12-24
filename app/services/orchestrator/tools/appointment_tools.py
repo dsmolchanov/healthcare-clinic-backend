@@ -488,13 +488,19 @@ class AppointmentTools:
         existing_appointments: List[Dict],
         duration_minutes: int
     ) -> List[TimeSlot]:
-        """Calculate available time slots"""
+        """Calculate available time slots, excluding past times"""
         if not business_hours[0] or not business_hours[1]:
             return []
 
         slots = []
         slot_duration = timedelta(minutes=duration_minutes)
-        current_time = business_hours[0]
+
+        # Get current time with 30-minute buffer for realistic booking
+        now = datetime.now()
+        min_booking_time = now + timedelta(minutes=30)
+
+        # Start from business hours or min_booking_time, whichever is later
+        current_time = max(business_hours[0], min_booking_time)
 
         # Create sorted list of existing appointment times
         blocked_times = []

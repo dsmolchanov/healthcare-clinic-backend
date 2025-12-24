@@ -132,6 +132,9 @@ class UnifiedAppointmentService:
             # FAST PATH: Return all slots within working hours as available
             # The hold-reserve pattern will catch conflicts at actual booking time
             # This trades some accuracy for significantly faster response (~20s → ~100ms)
+            #
+            # Note: _generate_time_slots now filters out past slots automatically
+            # So if clinic is closed or all slots are in the past, this list will be empty
             available_slots = [
                 TimeSlot(
                     start_time=slot_start,
@@ -142,6 +145,15 @@ class UnifiedAppointmentService:
                 )
                 for slot_start in potential_slots
             ]
+
+            # Log helpful info when no slots available
+            if not available_slots:
+                now = datetime.now()
+                logger.info(
+                    f"No available slots for {date}: working_hours={working_hours}, "
+                    f"current_time={now.strftime('%H:%M')}, "
+                    f"reason={'clinic_closed' if working_hours['start'] == working_hours['end'] else 'past_closing_time'}"
+                )
 
             return available_slots
 
@@ -1058,13 +1070,39 @@ class UnifiedAppointmentService:
         self._business_hours_cache = {}
         return self._business_hours_cache
 
-    def _generate_time_slots(self, start: datetime, end: datetime, duration_minutes: int) -> List[datetime]:
-        """Generate potential appointment time slots"""
+    def _generate_time_slots(
+        self,
+        start: datetime,
+        end: datetime,
+        duration_minutes: int,
+        filter_past: bool = True
+    ) -> List[datetime]:
+        """
+        Generate potential appointment time slots.
+
+        Args:
+            start: Start time for slot generation
+            end: End time for slot generation
+            duration_minutes: Duration of each slot
+            filter_past: If True, skip slots in the past (default: True)
+
+        Returns:
+            List of available slot start times
+        """
         slots = []
         current = start
         duration = timedelta(minutes=duration_minutes)
 
+        # Get current time with buffer for realistic booking
+        # Add 30 minutes buffer - can't book an appointment starting in 5 minutes
+        now = datetime.now()
+        min_booking_time = now + timedelta(minutes=30)
+
         while current + duration <= end:
+            # Skip slots in the past (with buffer)
+            if filter_past and current < min_booking_time:
+                current += duration
+                continue
             slots.append(current)
             current += duration
 

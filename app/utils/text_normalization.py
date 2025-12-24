@@ -1,114 +1,20 @@
 """
-Russian Text Normalization and Synonym Expansion
+Russian Text Normalization
 
 This module provides:
 1. Text normalization (NFC Unicode, lowercase, punctuation removal)
-2. Multilingual synonym expansion for common medical terms
-3. Query expansion for robust search matching
+2. Query normalization for search matching
+
+Note: Synonym expansion has been migrated to the database (healthcare.service_aliases table).
+The expand_synonyms() function is deprecated and returns only the normalized query.
 """
 
 import re
 from unicodedata import normalize
-from typing import List, Dict, Set
+from typing import List, Set
 
 # Russian punctuation patterns
 RUS_PUNCT = r"[?!.,;:()\[\]«»\"'…/\\-]+"
-
-# Service synonyms map (canonical → variants)
-# Includes Russian and English terms, lemmas, and colloquialisms
-SERVICE_SYNONYMS: Dict[str, List[str]] = {
-    # Composite filling (пломба)
-    "пломба": [
-        "пломба", "пломбирование", "пломбу", "пломбы",
-        "композит", "композитная", "композитную", "композитной",
-        "из смолы", "смола", "смолы", "смолой", "смолу",
-        "светоотверждаемая", "фотополимер", "фотополимерная"
-    ],
-    "composite filling": [
-        "composite", "resin", "filling", "tooth-colored",
-        "light-cured", "photopolymer", "bonded filling"
-    ],
-
-    # Teeth whitening
-    "отбеливание": [
-        "отбеливание", "отбелить", "отбелить зубы",
-        "белые зубы", "осветление", "осветлить"
-    ],
-    "whitening": [
-        "whitening", "bleaching", "teeth whitening",
-        "tooth whitening", "brightening"
-    ],
-
-    # Cleaning
-    "чистка": [
-        "чистка", "чистка зубов", "профчистка",
-        "гигиена", "гигиеническая чистка", "профессиональная чистка"
-    ],
-    "cleaning": [
-        "cleaning", "prophylaxis", "professional cleaning",
-        "dental cleaning", "hygiene"
-    ],
-
-    # Consultation
-    "консультация": [
-        "консультация", "прием", "осмотр", "консультацию",
-        "первичный прием", "первичная консультация"
-    ],
-    "consultation": [
-        "consultation", "exam", "checkup", "visit",
-        "initial consultation", "first visit"
-    ],
-
-    # X-ray
-    "рентген": [
-        "рентген", "снимок", "рентгеновский снимок",
-        "панорамный снимок", "ортопантомограмма", "опг"
-    ],
-    "x-ray": [
-        "x-ray", "xray", "radiograph", "panoramic",
-        "panoramic x-ray", "dental x-ray"
-    ],
-
-    # Implant
-    "имплант": [
-        "имплант", "имплантация", "имплантат",
-        "имплантанты", "импланты", "зубной имплант"
-    ],
-    "implant": [
-        "implant", "implantation", "dental implant",
-        "tooth implant", "implants"
-    ],
-
-    # Crown
-    "коронка": [
-        "коронка", "коронку", "зубная коронка",
-        "металлокерамическая", "керамическая"
-    ],
-    "crown": [
-        "crown", "dental crown", "tooth crown",
-        "porcelain crown", "ceramic crown"
-    ],
-
-    # Extraction
-    "удаление": [
-        "удаление", "удалить зуб", "вырвать зуб",
-        "экстракция", "удаление зуба"
-    ],
-    "extraction": [
-        "extraction", "tooth extraction", "removal",
-        "tooth removal", "pull tooth"
-    ],
-
-    # Root canal
-    "каналы": [
-        "каналы", "лечение каналов", "чистка каналов",
-        "пломбирование каналов", "эндодонтия"
-    ],
-    "root canal": [
-        "root canal", "endodontic", "endodontics",
-        "root canal treatment", "rct"
-    ]
-}
 
 
 def normalize_query(query: str) -> str:
@@ -152,162 +58,134 @@ def normalize_query(query: str) -> str:
 
 
 def expand_synonyms(query: str) -> List[str]:
-    """
-    Expand query to include all known synonyms
+    """DEPRECATED: Synonyms now handled by service_aliases table in database.
 
-    Strategy:
-    1. Normalize input query
-    2. Check if query matches any synonym variant
-    3. If match found, return all variants for that canonical term
-    4. If no match, return normalized query
+    This function returns only the normalized query.
+    Vector search + alias table now handles synonym matching.
 
     Args:
-        query: Search query (possibly colloquial or inflected)
+        query: Search query
 
     Returns:
-        List of search terms including all synonyms
-
-    Example:
-        >>> expand_synonyms("смолы?")
-        ["пломба", "пломбирование", "композит", "из смолы", "смола", "смолы"]
-        >>> expand_synonyms("composite")
-        ["composite", "resin", "filling", "tooth-colored"]
+        List containing only the normalized query
     """
-    if not query:
-        return []
-
     normalized = normalize_query(query)
-
-    # Check each synonym group
-    for canonical, variants in SERVICE_SYNONYMS.items():
-        # Check if normalized query matches any variant in this group
-        for variant in variants:
-            if normalized == normalize_query(variant):
-                # Return all normalized variants from this group
-                return list({normalize_query(v) for v in variants + [canonical]})
-
-    # No synonym match found, return normalized query
-    return [normalized]
+    return [normalized] if normalized else []
 
 
 def get_all_searchable_terms(query: str) -> Set[str]:
-    """
-    Get all searchable terms including partial matches
+    """Get searchable terms without synonym expansion.
 
-    This is useful for fuzzy matching where you want to try:
-    - Full query
-    - Individual words
-    - Synonym expansions
+    Synonym expansion now handled by database alias table.
 
     Args:
         query: Raw search query
 
     Returns:
-        Set of all searchable terms
-
-    Example:
-        >>> get_all_searchable_terms("композитная пломба")
-        {"композитная пломба", "композитная", "пломба", "пломбирование", ...}
+        Set of normalized query and individual words
     """
-    terms: Set[str] = set()
+    if not query:
+        return set()
 
-    # Add normalized full query
+    terms: Set[str] = set()
     normalized = normalize_query(query)
+
     if normalized:
         terms.add(normalized)
-
-    # Add individual words
-    words = normalized.split()
-    for word in words:
-        if word and len(word) >= 3:  # Skip very short words
-            terms.add(word)
-
-            # Expand synonyms for each word
-            synonyms = expand_synonyms(word)
-            terms.update(synonyms)
-
-    # Expand synonyms for full query
-    full_synonyms = expand_synonyms(query)
-    terms.update(full_synonyms)
+        # Add individual words >= 3 chars
+        words = normalized.split()
+        terms.update(w for w in words if len(w) >= 3)
 
     return terms
 
 
 def format_price_reply(
-    service_name: str,
-    price: float,
-    currency: str = "USD",
+    service: dict,
     language: str = "ru",
     unit: str = "per surface"
 ) -> str:
     """
-    Format deterministic price reply without LLM
+    Format deterministic price reply using database i18n values.
+
+    Uses get_translation() helper to access service name from name_i18n JSONB.
+    Removes hardcoded service_names_ru dictionary.
 
     Args:
-        service_name: Service name (will be localized if needed)
-        price: Price value
-        currency: Currency code (USD, EUR, RUB, MXN)
-        language: Language code (ru, en)
+        service: Service dict with name_i18n, base_price, currency fields
+        language: Language code (ru, en, es, pt, he)
         unit: Unit description
 
     Returns:
         Formatted price message with CTA
 
     Example:
-        >>> format_price_reply("Composite filling", 80.0, "USD", "ru")
+        >>> service = {'name': 'Composite filling', 'name_i18n': {'ru': 'Композитная пломба'}, 'base_price': 80.0, 'currency': 'USD'}
+        >>> format_price_reply(service, "ru")
         "Композитная пломба: $80.00 за одну поверхность. Записать вас на удобное время?"
     """
+    from app.utils.i18n_helpers import get_translation
+
+    # Get translated name from database JSONB field
+    service_name = get_translation(service, 'name', language, fallback_languages=['en'])
+
+    # Fallback to base name if no translation
+    if not service_name:
+        service_name = service.get('name', 'Service')
+
+    # Get price and currency from service dict
+    # Support both 'price' (from RPC results) and 'base_price' (from raw table)
+    price = service.get('price') or service.get('base_price', 0) or 0
+    currency = service.get('currency', 'USD') or 'USD'
+
     # Currency symbols
     currency_symbols = {
         "USD": "$",
         "EUR": "€",
         "MXN": "$",
         "RUB": "₽",
-        "GBP": "£"
+        "GBP": "£",
+        "ILS": "₪"
     }
     symbol = currency_symbols.get(currency, f"{currency} ")
 
-    # Localize service name if needed
-    service_names_ru = {
-        "composite filling": "Композитная пломба",
-        "teeth whitening": "Отбеливание зубов",
-        "dental cleaning": "Профессиональная чистка",
-        "consultation": "Консультация",
-        "x-ray": "Рентген",
-        "implant": "Имплантация",
-        "crown": "Коронка",
-        "extraction": "Удаление зуба",
-        "root canal": "Лечение каналов"
-    }
-
     # Localized units
-    units_ru = {
-        "per surface": "за одну поверхность",
-        "per tooth": "за зуб",
-        "per visit": "за визит",
-        "per procedure": "за процедуру"
+    units_by_language = {
+        "ru": {
+            "per surface": "за одну поверхность",
+            "per tooth": "за зуб",
+            "per visit": "за визит",
+            "per procedure": "за процедуру"
+        },
+        "es": {
+            "per surface": "por superficie",
+            "per tooth": "por diente",
+            "per visit": "por visita",
+            "per procedure": "por procedimiento"
+        },
+        "en": {
+            "per surface": "per surface",
+            "per tooth": "per tooth",
+            "per visit": "per visit",
+            "per procedure": "per procedure"
+        }
     }
 
-    units_en = {
-        "per surface": "per surface",
-        "per tooth": "per tooth",
-        "per visit": "per visit",
-        "per procedure": "per procedure"
+    # CTA messages by language
+    cta_by_language = {
+        "ru": "Записать вас на удобное время?",
+        "es": "¿Le gustaría agendar una cita?",
+        "pt": "Gostaria de agendar uma consulta?",
+        "he": "?האם תרצה לקבוע תור",
+        "en": "Would you like to book an appointment?"
     }
 
-    if language.startswith("ru"):
-        # Russian response
-        name = service_names_ru.get(service_name.lower(), service_name)
-        unit_text = units_ru.get(unit, unit)
-        cta = "Записать вас на удобное время?"
+    # Get language-specific values with English fallback
+    lang_key = language[:2] if language else 'en'
+    units = units_by_language.get(lang_key, units_by_language['en'])
+    unit_text = units.get(unit, unit)
+    cta = cta_by_language.get(lang_key, cta_by_language['en'])
 
-        return f"{name}: {symbol}{price:.2f} {unit_text}. {cta}"
-    else:
-        # English response
-        unit_text = units_en.get(unit, unit)
-        cta = "Would you like to book an appointment?"
-
-        return f"{service_name}: {symbol}{price:.2f} {unit_text}. {cta}"
+    return f"{service_name}: {symbol}{price:.2f} {unit_text}. {cta}"
 
 
 def quick_reply(language: str = "ru") -> str:

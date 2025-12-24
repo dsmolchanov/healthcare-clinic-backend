@@ -86,10 +86,20 @@ async def health_check():
     Health check endpoint
 
     Returns basic health status and metrics.
-    Includes FSM health indicators.
+    Includes FSM health indicators and process memory usage.
     """
+    import psutil
+    import os
+    from datetime import datetime
+
     summary = get_metrics_summary()
     fsm_summary = get_fsm_summary()
+
+    # Get process memory usage
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / (1024 * 1024)
+    memory_percent = process.memory_percent()
 
     # Calculate health status
     cache_hit_rate = summary['cache']['hit_rate']
@@ -102,19 +112,33 @@ async def health_check():
     # - Error rate < 100
     # - FSM escalations < 10
     # - Bad bookings < 20
+    # - Memory usage < 85%
     is_healthy = (
         cache_hit_rate > 50
         and error_rate < 100
         and fsm_escalations < 10
         and fsm_bad_bookings < 20
+        and memory_percent < 85
     )
 
+    # Memory warning at 70%
+    if memory_percent > 85:
+        status = 'critical'
+    elif memory_percent > 70 or not is_healthy:
+        status = 'degraded'
+    else:
+        status = 'healthy'
+
     return {
-        'status': 'healthy' if is_healthy else 'degraded',
+        'status': status,
         'cache_hit_rate': cache_hit_rate,
         'errors': error_rate,
         'mem0_queue_size': summary['mem0']['queue_size'],
         'fsm_escalations': fsm_escalations,
         'fsm_bad_bookings': fsm_bad_bookings,
-        'timestamp': None  # Add timestamp if needed
+        'memory': {
+            'used_mb': round(memory_mb, 1),
+            'percent': round(memory_percent, 1),
+        },
+        'timestamp': datetime.utcnow().isoformat()
     }

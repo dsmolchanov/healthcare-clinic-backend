@@ -42,7 +42,8 @@ class SessionManagementStep(PipelineStep):
         session_controller=None,
         memory_manager=None,
         profile_manager=None,
-        supabase_client=None
+        supabase_client=None,
+        redis_client=None
     ):
         """
         Initialize with required dependencies.
@@ -52,11 +53,13 @@ class SessionManagementStep(PipelineStep):
             memory_manager: ConversationMemory for message storage
             profile_manager: ProfileManager for patient upsert
             supabase_client: Supabase client for clinic lookups
+            redis_client: Redis client for flow state persistence
         """
         self._session_controller = session_controller
         self._memory_manager = memory_manager
         self._profile_manager = profile_manager
         self._supabase = supabase_client
+        self._redis = redis_client
 
     @property
     def name(self) -> str:
@@ -137,15 +140,33 @@ class SessionManagementStep(PipelineStep):
                 }
             )
 
-        # 9. Extract turn status from session
+        # 9. Extract turn status and flow state
         if ctx.session:
             ctx.turn_status = ctx.session.get('turn_status', 'user_turn')
             ctx.last_agent_action = ctx.session.get('last_agent_action')
             ctx.pending_since = ctx.session.get('pending_since')
 
+        # 10. Load flow_state from Redis (source of truth for state)
+        if self._redis and ctx.session_id:
+            try:
+                redis_key = f"session:{ctx.session_id}"
+                stored_state = self._redis.hget(redis_key, 'conversation_state')
+                if stored_state:
+                    ctx.flow_state = stored_state if isinstance(stored_state, str) else stored_state.decode('utf-8')
+                    logger.info(f"Loaded flow_state={ctx.flow_state} from Redis")
+                else:
+                    ctx.flow_state = ctx.session.get('conversation_state', 'idle') if ctx.session else 'idle'
+                    logger.debug(f"No Redis flow_state, using session default: {ctx.flow_state}")
+            except Exception as e:
+                logger.warning(f"Failed to load flow_state from Redis: {e}")
+                ctx.flow_state = ctx.session.get('conversation_state', 'idle') if ctx.session else 'idle'
+        else:
+            ctx.flow_state = ctx.session.get('conversation_state', 'idle') if ctx.session else 'idle'
+
         logger.info(
             f"📋 Session: {ctx.session_id[:8] if ctx.session_id else 'none'}... "
-            f"(new={ctx.is_new_session}, clinic={ctx.effective_clinic_id[:8] if ctx.effective_clinic_id else 'none'}...)"
+            f"(new={ctx.is_new_session}, clinic={ctx.effective_clinic_id[:8] if ctx.effective_clinic_id else 'none'}..., "
+            f"flow_state={ctx.flow_state})"
         )
 
         return ctx, True

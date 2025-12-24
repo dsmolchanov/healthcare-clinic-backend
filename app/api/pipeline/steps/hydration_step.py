@@ -132,9 +132,11 @@ class ContextHydrationStep(PipelineStep):
         """Build session messages list for LLM context."""
         session_messages = []
         for msg in conversation_history:
+            # Database column is 'message_content', fallback to 'content' for compatibility
+            content = msg.get('message_content') or msg.get('content', '')
             session_messages.append({
                 'role': msg.get('role', 'user'),
-                'content': msg.get('content', '')
+                'content': content
             })
         return session_messages
 

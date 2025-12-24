@@ -60,10 +60,10 @@ class LangGraphExecutionStep(PipelineStep):
         """
         self.supabase = supabase_client
         self.redis = redis_client
-        # Cache up to 5 orchestrators with 15-minute TTL
-        # Conservative for 512MB: worst-case 5 × 50MB = 250MB cache
-        # 15-min TTL accommodates healthcare's async WhatsApp pacing
-        self._orchestrator_cache: TTLCache = TTLCache(maxsize=5, ttl=900)
+        # Cache up to 2 orchestrators with 10-minute TTL
+        # Conservative for 1GB: worst-case 2 × 50MB = 100MB cache
+        # 10-min TTL is sufficient for WhatsApp conversation pacing
+        self._orchestrator_cache: TTLCache = TTLCache(maxsize=2, ttl=600)
 
     @property
     def name(self) -> str:
@@ -107,13 +107,26 @@ class LangGraphExecutionStep(PipelineStep):
         logger.info(f"[LangGraph] Routing {lane} conversation for clinic {clinic_id}")
 
         try:
-            # 4. Get or create orchestrator for this clinic
+            # 4. Load flow_state from Redis (state_manager stores it there)
+            if self.redis and ctx.session_id:
+                try:
+                    redis_key = f"session:{ctx.session_id}"
+                    stored_state = self.redis.hget(redis_key, 'conversation_state')
+                    if stored_state:
+                        ctx.flow_state = stored_state if isinstance(stored_state, str) else stored_state.decode('utf-8')
+                        logger.info(f"[LangGraph] Loaded flow_state={ctx.flow_state} from Redis")
+                    else:
+                        logger.debug(f"[LangGraph] No flow_state in Redis, using default: {ctx.flow_state}")
+                except Exception as e:
+                    logger.warning(f"[LangGraph] Failed to load flow_state from Redis: {e}")
+
+            # 5. Get or create orchestrator for this clinic
             orchestrator = await self._get_orchestrator(ctx)
             if not orchestrator:
                 logger.warning("Failed to create orchestrator, falling through to LLM step")
                 return ctx, True
 
-            # 5. Build initial state from pipeline context
+            # 6. Build initial state from pipeline context
             initial_state = self._build_orchestrator_state(ctx)
 
             # 6. Execute graph

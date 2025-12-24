@@ -14,6 +14,9 @@ from typing import Optional, Dict, Any, List, Annotated
 import logging
 from datetime import datetime
 
+# Import ConversationState for unified state tracking
+from app.models.conversation_state import FlowState, ConversationState
+
 # Import appointment tools
 try:
     from ..tools.appointment_tools import AppointmentTools
@@ -46,6 +49,11 @@ class HealthcareConversationState(BaseConversationState):
     patient_id: Annotated[Optional[str], last_value]
     patient_name: Annotated[Optional[str], last_value]
     insurance_verified: Annotated[bool, last_value]
+
+    # Supervisor routing (Phase 3)
+    flow_state: Annotated[str, last_value]  # FlowState.value
+    active_task: Annotated[Optional[Dict[str, Any]], last_value]  # BookingTask as dict
+    next_agent: Annotated[Optional[str], last_value]  # Supervisor routing decision
 
 
 class HealthcareLangGraph(BaseLangGraphOrchestrator):
@@ -129,8 +137,12 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
 
     def _build_graph(self) -> StateGraph:
         """
-        Build healthcare-specific workflow graph
-        Adds PHI protection and appointment nodes
+        Build healthcare-specific workflow graph with supervisor routing.
+
+        Phase 3: Unified Graph-Gateway Architecture
+        - Supervisor node replaces fragmented intent routing
+        - Routes to scheduling_agent (appointment) or info_agent (FAQ/price/general)
+        - All paths go through phi_redact before exit
         """
         # Start with base graph
         workflow = super()._build_graph()
@@ -138,14 +150,23 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         # Add healthcare-specific nodes
         workflow.add_node("phi_check", self.phi_check_node)
         workflow.add_node("emergency_check", self.emergency_check_node)
+        workflow.add_node("phi_redact", self.phi_redact_node)
+
+        # NEW: Supervisor node replaces fragmented routing (Phase 3)
+        workflow.add_node("supervisor", self.supervisor_node)
+
+        # Specialized agent nodes (renamed for clarity)
+        workflow.add_node("scheduling_agent", self.appointment_handler_node)
+        workflow.add_node("info_agent", self.info_agent_node)  # Combines faq_lookup + price_query
+
+        # Keep legacy nodes for backward compatibility (can be removed later)
         workflow.add_node("appointment_handler", self.appointment_handler_node)
         workflow.add_node("price_query", self.price_query_node)
         workflow.add_node("faq_lookup", self.faq_lookup_node)
         workflow.add_node("insurance_verify", self.insurance_verify_node)
-        workflow.add_node("phi_redact", self.phi_redact_node)
 
-        # Rewire flow for healthcare
-        # Entry → Emergency Check → PHI Check → Compliance → Intent
+        # Rewire flow for healthcare with supervisor
+        # Entry → Emergency Check → PHI Check → Supervisor
         workflow.add_edge("entry", "emergency_check")
 
         if self.enable_emergency_detection:
@@ -153,17 +174,32 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
                 "emergency_check",
                 self.emergency_router,
                 {
-                    "emergency": "exit",  # Immediate escalation
+                    "emergency": "phi_redact",  # Emergency goes straight to redact then exit
                     "normal": "phi_check"
                 }
             )
         else:
             workflow.add_edge("emergency_check", "phi_check")
 
-        workflow.add_edge("phi_check", "compliance_check")
+        # PHI check leads to supervisor (skip compliance_check if not needed)
+        workflow.add_edge("phi_check", "supervisor")
 
-        # Intent routing is handled by _add_intent_routing() override
+        # Supervisor routing (replaces intent_classify routing)
+        workflow.add_conditional_edges(
+            "supervisor",
+            self.supervisor_router,
+            {
+                "scheduling": "scheduling_agent",
+                "info": "info_agent",
+                "exit": "phi_redact",
+            }
+        )
 
+        # All agents go to process then phi_redact
+        workflow.add_edge("scheduling_agent", "process")
+        workflow.add_edge("info_agent", "process")
+
+        # Legacy edges for backward compatibility (in case old routing still used)
         workflow.add_edge("appointment_handler", "process")
         workflow.add_edge("price_query", "process")
 
@@ -180,10 +216,18 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
 
         workflow.add_edge("insurance_verify", "process")
 
-        # Add PHI redaction before exit
-        # Note: generate_response_node now preserves response from process_node (no duplicate LLM call)
-        workflow.add_edge("generate_response", "phi_redact")
-        workflow.add_edge("phi_redact", "memory_store" if self.enable_memory else "exit")
+        # FIX: Insert phi_redact BETWEEN process and generate_response
+        # This avoids conflicting edges from generate_response
+        # Flow: process -> phi_redact -> generate_response -> exit
+        # (Base class adds generate_response -> exit or compliance_audit)
+
+        # Remove the base class edge from process to generate_response and reroute
+        # by adding our own edges
+        workflow.add_edge("process", "phi_redact")
+        workflow.add_edge("phi_redact", "generate_response")
+
+        # Note: The base class already adds generate_response -> exit (or compliance_audit -> exit)
+        # so we don't need to add another edge from generate_response
 
         return workflow
 
@@ -718,6 +762,54 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
 
         return state
 
+    async def info_agent_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Unified info agent that handles FAQ, pricing, and general info queries.
+
+        Phase 3: Combines faq_lookup and price_query logic into single agent.
+        This node enriches context - process_node generates the response.
+
+        Pattern: Nodes enrich context -> LLM generates response
+        """
+        logger.debug(f"Info agent - session: {state['session_id']}")
+
+        message = state.get('message', '').lower()
+
+        # Check for price-related queries
+        price_keywords = ['price', 'cost', 'how much', 'cuanto', 'cuesta', 'precio',
+                         'стоимость', 'сколько', 'цена', 'fee', 'charge']
+        is_price_query = any(keyword in message for keyword in price_keywords)
+
+        # Check for FAQ-type queries
+        faq_keywords = ['hours', 'location', 'address', 'open', 'close', 'where',
+                       'when', 'phone', 'parking', 'insurance', 'accept', 'horario',
+                       'donde', 'часы', 'где', 'адрес', 'работаете']
+        is_faq_query = any(keyword in message for keyword in faq_keywords)
+
+        # Gather relevant context based on query type
+        if is_price_query:
+            # Delegate to price_query_node for service lookup
+            await self.price_query_node(state)
+            logger.info(f"[info_agent] Delegated to price_query_node")
+
+        if is_faq_query:
+            # Delegate to faq_lookup_node for FAQ search
+            await self.faq_lookup_node(state)
+            logger.info(f"[info_agent] Delegated to faq_lookup_node")
+
+        # Mark that this was handled by info_agent
+        state['context']['info_agent_handled'] = True
+        state['context']['query_type'] = 'price' if is_price_query else ('faq' if is_faq_query else 'general')
+
+        state['audit_trail'].append({
+            "node": "info_agent",
+            "timestamp": datetime.utcnow().isoformat(),
+            "is_price_query": is_price_query,
+            "is_faq_query": is_faq_query
+        })
+
+        return state
+
     async def phi_redact_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
         """Redact PHI from response before sending"""
         logger.debug(f"PHI redaction - session: {state['session_id']}")
@@ -756,6 +848,140 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         """
         # All messages go to process_node which has tool calling
         return 'general'
+
+    async def supervisor_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Central routing decision with few-shot examples.
+
+        ENHANCEMENT (Expert Opinions 1 & 2):
+        - 5+ grounded examples to reduce hallucination from 10% to <2%
+        - Handles ambiguous cases like "Do you have availability for a root canal next week?"
+
+        Routes to:
+        - "scheduling" - Appointment booking, availability, rescheduling, cancellation
+        - "info" - FAQ, pricing, hours, location, insurance, service details
+        - "exit" - Simple acknowledgments, goodbyes, no response needed
+        """
+        logger.debug(f"Supervisor node - session: {state['session_id']}")
+
+        message = state["messages"][-1].content if state.get("messages") else state.get("message", "")
+        flow_state = state.get("flow_state", "idle")
+        active_task = state.get("active_task")
+
+        # Log incoming state for debugging
+        logger.info(f"[supervisor] Input: flow_state={flow_state}, active_task={active_task}, message='{message[:50]}...'")
+
+
+        # CRITICAL FIX: If already in scheduling flow, short confirmations MUST stay in scheduling
+        # This handles "Да", "Yes", "Ok", "Sí" when user is confirming a slot
+        message_lower = message.lower().strip()
+        confirmation_words = ['да', 'yes', 'ok', 'okay', 'sure', 'sí', 'si', 'хорошо', 'ладно', 'давай', 'конечно', 'угу']
+        is_short_confirmation = message_lower in confirmation_words or len(message_lower) <= 5
+
+        if flow_state == FlowState.SCHEDULING.value and is_short_confirmation:
+            # User is confirming something in scheduling flow - stay in scheduling
+            logger.info(f"[supervisor] Keeping in scheduling flow: short confirmation '{message}' in scheduling state")
+            state["next_agent"] = "scheduling"
+            state['audit_trail'].append({
+                "node": "supervisor",
+                "timestamp": datetime.utcnow().isoformat(),
+                "decision": "scheduling",
+                "reason": "short_confirmation_in_scheduling_flow",
+                "flow_state": flow_state
+            })
+            return state
+
+        # Few-shot supervisor prompt (reduces hallucination 10% -> <2%)
+        supervisor_prompt = f"""You are a routing supervisor for a healthcare clinic assistant.
+
+Current state: {flow_state}
+Active task: {active_task}
+
+CRITICAL RULE: If flow_state is "scheduling", user is in an active booking conversation.
+Short responses like "yes", "да", "ok", numbers, or times should STAY in scheduling.
+
+Route this message to the appropriate agent:
+- "scheduling" - Appointment booking, availability, rescheduling, cancellation, OR any response while in scheduling flow
+- "info" - FAQ, pricing, hours, location, insurance, service details (only if NOT in scheduling flow)
+- "exit" - Explicit goodbyes like "bye", "до свидания", "thanks bye" (NOT simple "ok" or "да")
+
+EXAMPLES (follow these patterns):
+User: "How much is a filling?" -> info
+User: "What are your hours?" -> info
+User: "I need to come in on Tuesday" -> scheduling
+User: "Do you have availability for a root canal next week?" -> scheduling (intent is booking)
+User: "My tooth hurts so bad, it's bleeding" -> info (unless flow_state is scheduling)
+User: "Thanks, bye!" -> exit
+User: "Okay" (in scheduling flow) -> scheduling (continue current task)
+User: "Да" (in scheduling flow) -> scheduling (Russian "yes" - continue booking)
+User: "16" or "16:00" (in scheduling flow) -> scheduling (time selection)
+User: "Actually, never mind" -> exit
+User: "How much does a cleaning cost?" -> info
+User: "Can I book an appointment?" -> scheduling
+User: "What services do you offer?" -> info
+User: "I want to cancel my appointment" -> scheduling
+User: "Да" or "Yes" (confirming offered slot) -> scheduling
+
+User message: {message}
+
+Respond with ONLY one word: scheduling, info, or exit"""
+
+        if self.llm_factory:
+            try:
+                response = await self.llm_factory.generate(
+                    messages=[{"role": "system", "content": supervisor_prompt}],
+                    model="gpt-4o-mini",  # Fast, cheap model for routing
+                    temperature=0.1,
+                    max_tokens=10,
+                )
+
+                decision = response.content.strip().lower()
+                # Clean up common variations
+                if "scheduling" in decision:
+                    decision = "scheduling"
+                elif "info" in decision:
+                    decision = "info"
+                elif "exit" in decision:
+                    decision = "exit"
+                else:
+                    decision = "info"  # Safe fallback
+
+                logger.info(f"[supervisor] Routing decision: {decision} for message: {message[:50]}...")
+
+            except Exception as e:
+                logger.warning(f"Supervisor LLM call failed: {e}, defaulting to info")
+                decision = "info"
+        else:
+            # Fallback to keyword-based routing if no LLM factory
+            message_lower = message.lower()
+            if any(word in message_lower for word in ['book', 'appointment', 'schedule', 'reschedule', 'cancel', 'availability', 'available']):
+                decision = "scheduling"
+            elif any(word in message_lower for word in ['bye', 'thanks', 'thank you', 'goodbye', 'ok', 'okay']):
+                decision = "exit"
+            else:
+                decision = "info"
+            logger.info(f"[supervisor] Keyword-based routing: {decision}")
+
+        state["next_agent"] = decision
+
+        # Update flow_state based on decision
+        if decision == "scheduling" and flow_state != FlowState.SCHEDULING.value:
+            state["flow_state"] = FlowState.SCHEDULING.value
+        elif decision == "info" and flow_state not in [FlowState.SCHEDULING.value]:
+            state["flow_state"] = FlowState.INFO.value
+
+        state['audit_trail'].append({
+            "node": "supervisor",
+            "timestamp": datetime.utcnow().isoformat(),
+            "decision": decision,
+            "flow_state": state.get("flow_state")
+        })
+
+        return state
+
+    def supervisor_router(self, state: HealthcareConversationState) -> str:
+        """Route based on supervisor decision."""
+        return state.get("next_agent", "info")
 
     async def process(
         self,
@@ -839,7 +1065,11 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
             doctor_id=None,
             patient_id=patient_id,
             patient_name=patient_name,
-            insurance_verified=False
+            insurance_verified=False,
+            # Phase 3: Supervisor routing fields
+            flow_state=flow_state,
+            active_task=ctx.get('active_task'),
+            next_agent=None,
         )
 
         try:
@@ -887,6 +1117,17 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         Pattern: Nodes enrich context → LLM generates response
         """
         logger.debug(f"Healthcare process_node - session: {state['session_id']}")
+
+        # EARLY RETURN: If response already set by specialized agent, skip generation
+        if state.get('response'):
+            logger.info(f"[process_node] Response already set ({len(state['response'])} chars), skipping generation")
+            state['audit_trail'].append({
+                "node": "process",
+                "timestamp": datetime.utcnow().isoformat(),
+                "skipped": True,
+                "reason": "response_already_set"
+            })
+            return state
 
         # Check for specialized context that needs to be included in prompt
         pipeline_ctx = state.get('context', {})
@@ -957,10 +1198,16 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
                     + "\nHelp them choose a time or offer alternatives if needed."
                 )
             else:
+                # Include current time context to prevent LLM hallucinating past slots
+                current_time = datetime.now()
                 appt_info = (
                     f"User wants to book a {appointment_type}.\n"
-                    "No immediate availability found.\n"
-                    "Offer to check another date, add them to a waitlist, or suggest alternatives."
+                    f"No availability found for the requested time period.\n"
+                    f"Current time is {current_time.strftime('%H:%M')} on {current_time.strftime('%B %d')}.\n"
+                    "IMPORTANT: Do NOT suggest any specific times or dates. Instead:\n"
+                    "- Ask when they would prefer to come in\n"
+                    "- Offer to add them to a waitlist if appropriate\n"
+                    "- Suggest they call the clinic for urgent needs"
                 )
 
             specialized_context.append(appt_info)
@@ -1027,8 +1274,20 @@ Instructions:
                 try:
                     messages = [
                         {"role": "system", "content": enhanced_prompt},
-                        {"role": "user", "content": state['message']}
                     ]
+
+                    # Include conversation history for context continuity
+                    # This fixes the bug where follow-up questions lose context
+                    conversation_history = state.get('context', {}).get('conversation_history', [])
+                    if conversation_history:
+                        for msg in conversation_history[-10:]:  # Last 10 messages to avoid token overflow
+                            role = msg.get('role', 'user')
+                            content = msg.get('content', msg.get('text', ''))
+                            if role in ('user', 'assistant') and content:
+                                messages.append({"role": role, "content": content})
+
+                    # Add current message
+                    messages.append({"role": "user", "content": state['message']})
 
                     response = await self.llm_factory.generate(
                         messages=messages,
@@ -1063,7 +1322,14 @@ Instructions:
         Determine flow state transition based on graph result.
 
         Maps orchestrator outcomes to Phase 3A FlowState values.
+        Uses supervisor's flow_state decision (Phase 3) when available.
         """
+        # Phase 3: Use supervisor's flow_state if set
+        flow_state = result.get('flow_state')
+        if flow_state and flow_state != 'idle':
+            logger.debug(f"Using supervisor flow_state: {flow_state}")
+            return flow_state
+
         # Check for explicit state in result
         if result.get('should_end'):
             # Check if escalation or completion
@@ -1072,7 +1338,7 @@ Instructions:
                 return 'escalated'
             return 'completed'
 
-        # Check intent for booking flow
+        # Check intent for booking flow (legacy fallback)
         intent = result.get('intent')
         if intent == 'appointment':
             # Check if appointment was booked
@@ -1084,9 +1350,9 @@ Instructions:
             else:
                 return 'collecting_slots'
 
-        # Info-seeking flows
+        # Info-seeking flows (legacy fallback)
         if intent in ('faq_query', 'price_query', 'insurance'):
-            return 'info_seeking'
+            return 'info'
 
         # No transition needed
         return None

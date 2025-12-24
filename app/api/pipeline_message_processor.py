@@ -164,7 +164,8 @@ class PipelineMessageProcessor:
                 session_controller=self.session_controller,
                 memory_manager=self.memory_manager,
                 profile_manager=self.profile_manager,
-                supabase_client=self._supabase
+                supabase_client=self._supabase,
+                redis_client=self._redis_client
             ),
             ContextHydrationStep(
                 context_hydrator=self.context_hydrator
