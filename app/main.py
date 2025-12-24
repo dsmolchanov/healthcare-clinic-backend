@@ -34,8 +34,9 @@ load_dotenv()
 from app.api.multilingual_message_processor import handle_process_message
 from app.schemas.messages import MessageRequest
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure centralized logging (container-aware: no timestamps in Docker/Fly.io)
+from app.utils.logging_config import configure_logging
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # Log module-level initialization

@@ -417,7 +417,7 @@ class AppointmentBookingService:
                 client_secret=os.environ.get('GOOGLE_CLIENT_SECRET')
             )
 
-            service = build('calendar', 'v3', credentials=creds)
+            service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
 
             # Query for events in the time range
             events_result = service.events().list(
@@ -695,7 +695,7 @@ class AppointmentBookingService:
                 refresh_token=credentials.get('refresh_token')
             )
 
-            service = build('calendar', 'v3', credentials=creds)
+            service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
 
             event = {
                 'summary': event_data['summary'],

@@ -32,16 +32,11 @@ EVOLUTION_HTTP_TIMEOUT = float(os.getenv("WA_EVOLUTION_HTTP_TIMEOUT", "15.0"))  
 INSTANCE_ADDED_CHANNEL = "wa:instances:added"
 INSTANCE_REMOVED_CHANNEL = "wa:instances:removed"
 
-# Logging configuration
+# Logging configuration - use centralized config to avoid double timestamps
+# Import logging config only if not already configured to avoid circular imports
 logger = logging.getLogger("whatsapp_queue")
 logger.setLevel(logging.INFO)
 
-# Add handler if not already configured
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        "[%(asctime)s] [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+# Propagate to root logger which has the centralized config
+# This avoids adding separate handlers with different timestamp formats
+logger.propagate = True

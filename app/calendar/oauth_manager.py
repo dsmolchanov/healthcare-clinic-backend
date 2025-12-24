@@ -486,7 +486,7 @@ class CalendarOAuthManager:
         """Get primary calendar ID from Google"""
         try:
             credentials = Credentials(token=access_token)
-            service = build('calendar', 'v3', credentials=credentials)
+            service = build('calendar', 'v3', credentials=credentials, cache_discovery=False)
 
             # Get calendar list
             calendar_list = service.calendarList().list().execute()

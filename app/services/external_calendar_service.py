@@ -772,7 +772,7 @@ class ExternalCalendarService:
             credentials = Credentials.from_authorized_user_info(
                 calendar_config['credentials']
             )
-            service = build('calendar', 'v3', credentials=credentials)
+            service = build('calendar', 'v3', credentials=credentials, cache_discovery=False)
 
             # Query for events in the time range
             events_result = service.events().list(
@@ -926,7 +926,7 @@ class ExternalCalendarService:
             credentials = Credentials.from_authorized_user_info(
                 calendar_config['credentials']
             )
-            service = build('calendar', 'v3', credentials=credentials)
+            service = build('calendar', 'v3', credentials=credentials, cache_discovery=False)
 
             # Create hold event
             event = {
@@ -1263,7 +1263,7 @@ class ExternalCalendarService:
             credentials = Credentials.from_authorized_user_info(
                 calendar_config['credentials']
             )
-            service = build('calendar', 'v3', credentials=credentials)
+            service = build('calendar', 'v3', credentials=credentials, cache_discovery=False)
 
             # Find the hold event
             holds_result = self.healthcare_supabase.table('calendar_holds').select('*').eq(
@@ -1457,7 +1457,7 @@ class ExternalCalendarService:
             # Create Google Calendar service
 
             credentials = Credentials.from_authorized_user_info(calendar_credentials)
-            service = build('calendar', 'v3', credentials=credentials)
+            service = build('calendar', 'v3', credentials=credentials, cache_discovery=False)
 
             # Prepare appointment times with Cancun timezone
             from dateutil import parser, tz
@@ -1709,7 +1709,7 @@ class ExternalCalendarService:
 
             # Create Google Calendar service
             credentials = Credentials.from_authorized_user_info(calendar_credentials)
-            service = build('calendar', 'v3', credentials=credentials)
+            service = build('calendar', 'v3', credentials=credentials, cache_discovery=False)
 
             # Check if doctor has changed - if so, delete old event and create new one
             try:
@@ -2090,7 +2090,7 @@ class ExternalCalendarService:
                 client_secret=os.getenv('GOOGLE_CLIENT_SECRET')
             )
 
-            service = build('calendar', 'v3', credentials=credentials)
+            service = build('calendar', 'v3', credentials=credentials, cache_discovery=False)
 
             # Fetch events updated in last hour
             now = datetime.utcnow()

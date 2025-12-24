@@ -34,11 +34,9 @@ if env_file.exists():
                 if key not in os.environ:
                     os.environ[key] = value.strip('"').strip("'")
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Configure centralized logging (container-aware: no timestamps in Docker/Fly.io)
+from app.utils.logging_config import configure_logging
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # Import worker after environment is loaded

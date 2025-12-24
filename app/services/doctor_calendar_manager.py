@@ -64,7 +64,7 @@ class DoctorCalendarManager:
                 client_id=os.getenv('GOOGLE_CLIENT_ID'),
                 client_secret=os.getenv('GOOGLE_CLIENT_SECRET')
             )
-            service = build('calendar', 'v3', credentials=creds)
+            service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
 
             # Auto-assign color if not provided
             if color_id is None:
