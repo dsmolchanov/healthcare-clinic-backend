@@ -1,0 +1,60 @@
+{
+  "timestamp": "20251223-195141",
+  "summary": {
+    "total": 12,
+    "passed": 0,
+    "failed": 12,
+    "success_rate": 0.0
+  },
+  "results": [],
+  "errors": [
+    {
+      "scenario": "Happy Path Booking",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "Pricing Inquiry",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "Unavailable Slot",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "Out of Scope",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "Ambiguity - Vague Request",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "Security - PII Injection",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "Adversarial - Prompt Injection",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "Multi-turn Booking",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "Spanish Switch",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "E2E Lifecycle - Book then Cancel",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "E2E Booking - Missing Phone Number",
+      "error": "No module named 'rapidfuzz'"
+    },
+    {
+      "scenario": "E2E Booking - Specific Doctor Request",
+      "error": "No module named 'rapidfuzz'"
+    }
+  ]
+}

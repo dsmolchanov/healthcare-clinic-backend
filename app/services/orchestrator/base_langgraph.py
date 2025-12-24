@@ -157,13 +157,14 @@ class BaseLangGraphOrchestrator:
         # Build the workflow graph
         self.graph = self._build_graph()
 
-        # Compile with optional checkpointing
-        if enable_checkpointing:
-            from langgraph.checkpoint.memory import MemorySaver
-            self.checkpointer = MemorySaver()
-            self.compiled_graph = self.graph.compile(checkpointer=self.checkpointer)
-        else:
-            self.compiled_graph = self.graph.compile()
+        # Checkpointing is initialized asynchronously
+        # Call await _init_checkpointer() before first use
+        self.checkpointer = None
+        self._enable_checkpointing = enable_checkpointing
+
+        # Compile without checkpointer initially
+        # Will recompile with checkpointer after async init
+        self.compiled_graph = self.graph.compile()
 
     def _build_graph(self) -> StateGraph:
         """
@@ -241,6 +242,28 @@ class BaseLangGraphOrchestrator:
         workflow.set_entry_point("entry")
 
         return workflow
+
+    async def _init_checkpointer(self) -> None:
+        """
+        Initialize checkpointer asynchronously.
+
+        Call this method before first process() call. Recompiles graph with checkpointer.
+        Uses Postgres checkpointer in production, MemorySaver in development.
+        """
+        if not self._enable_checkpointing:
+            return
+
+        if self.checkpointer is not None:
+            return  # Already initialized
+
+        try:
+            from app.services.orchestrator.checkpointer import get_checkpointer
+            self.checkpointer = await get_checkpointer()
+            self.compiled_graph = self.graph.compile(checkpointer=self.checkpointer)
+            logger.info("Graph recompiled with checkpointer")
+        except Exception as e:
+            logger.warning(f"Failed to initialize checkpointer: {e}. Continuing without checkpointing.")
+            self._enable_checkpointing = False
 
     def _add_intent_routing(self, workflow: StateGraph) -> None:
         """
@@ -662,8 +685,11 @@ class BaseLangGraphOrchestrator:
         )
 
         try:
+            # Initialize checkpointer on first call (if enabled)
+            await self._init_checkpointer()
+
             # Run the graph
-            if self.enable_checkpointing:
+            if self._enable_checkpointing and self.checkpointer is not None:
                 result = await self.compiled_graph.ainvoke(
                     initial_state,
                     {"configurable": {"thread_id": session_id}}

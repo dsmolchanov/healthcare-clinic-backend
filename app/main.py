@@ -29,7 +29,10 @@ from app.middleware.rate_limiter import webhook_limiter
 load_dotenv()
 
 # Import message processor at module level AFTER dotenv load
-from app.api.multilingual_message_processor import handle_process_message, MessageRequest
+# NOTE: multilingual_message_processor is deprecated - use app.schemas.messages for MessageRequest
+# handle_process_message still required for legacy /process-message endpoint
+from app.api.multilingual_message_processor import handle_process_message
+from app.schemas.messages import MessageRequest
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -174,16 +177,8 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to start escalation worker: {str(e)}")
         # Don't fail startup, but log the issue
 
-    # Initialize Redis for FSM (if FSM is enabled)
-    fsm_enabled = os.getenv('ENABLE_FSM', 'false').lower() == 'true'
-    if fsm_enabled:
-        try:
-            from app.fsm.redis_client import redis_client
-            await redis_client.connect()
-            logger.info("✅ Redis client connected for FSM")
-        except Exception as e:
-            logger.error(f"Failed to connect Redis for FSM: {str(e)}")
-            logger.warning("FSM will not be available")
+    # FSM system removed in Phase 1.3 cleanup - all message processing
+    # now goes through PipelineMessageProcessor -> LangGraph orchestrator
 
     # Initialize shared HTTP client without HTTP/2 (causes SSL issues)
     try:
@@ -245,15 +240,6 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down services...")
-
-    # Disconnect Redis if FSM was enabled
-    if fsm_enabled:
-        try:
-            from app.fsm.redis_client import redis_client
-            await redis_client.disconnect()
-            logger.info("✅ Redis client disconnected")
-        except Exception as e:
-            logger.error(f"Error disconnecting Redis: {e}")
 
     # Stop calendar sync worker
     try:

@@ -11,7 +11,7 @@ import os
 import aiohttp
 import json
 import asyncio
-from app.api.multilingual_message_processor import MessageRequest
+from app.schemas.messages import MessageRequest
 from app.api.pipeline_message_processor import get_message_processor
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])

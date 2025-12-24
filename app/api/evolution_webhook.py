@@ -12,7 +12,7 @@ import os
 import json
 import logging
 import asyncio
-from app.api.multilingual_message_processor import MessageRequest
+from app.schemas.messages import MessageRequest
 from app.api.pipeline_message_processor import get_message_processor
 from app.security.webhook_verification import verify_webhook_signature
 from app.services.language_service import LanguageService

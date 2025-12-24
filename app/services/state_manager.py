@@ -3,9 +3,11 @@ Unified State Manager for Conversation State.
 
 Phase 3A of Agentic Flow Architecture Refactor.
 
-This module provides a unified interface to conversation state for both
-FSM and AI paths. It wraps the underlying session storage and FSM manager
-to present a consistent ConversationState view.
+This module provides a unified interface to conversation state.
+It wraps the underlying session storage to present a consistent ConversationState view.
+
+NOTE: FSM system removed in Phase 1.3 cleanup. All state management
+now uses the AI path via session data.
 
 NOTE: This class only tracks state. Tool permissions are enforced
 by ToolStateGate reading from x_meta (Phase 1A).
@@ -22,18 +24,15 @@ logger = logging.getLogger(__name__)
 
 class UnifiedStateManager:
     """
-    Unified access to conversation state for both FSM and AI paths.
+    Unified access to conversation state.
 
-    This manager abstracts the differences between:
-    - FSM path: State stored in FSMManager with explicit state machine
-    - AI path: State inferred from session data (episode_type, turn_status)
+    This manager provides consistent state access via session data.
 
     Usage:
         manager = UnifiedStateManager(
             session_id="...",
             clinic_id="...",
             redis_client=redis,
-            use_fsm=False  # AI path
         )
         state = await manager.get_state()
         if state.allows_booking_tools():
@@ -46,7 +45,7 @@ class UnifiedStateManager:
         clinic_id: str,
         redis_client,
         supabase_client=None,
-        use_fsm: bool = False,
+        use_fsm: bool = False,  # Deprecated, kept for API compatibility
     ):
         """
         Initialize UnifiedStateManager.
@@ -55,15 +54,16 @@ class UnifiedStateManager:
             session_id: Conversation session identifier
             clinic_id: Clinic identifier
             redis_client: Redis client for session data
-            supabase_client: Supabase client (optional, for FSM persistence)
-            use_fsm: Whether to use FSM path (default: AI path)
+            supabase_client: Supabase client (optional)
+            use_fsm: Deprecated parameter, ignored (FSM removed in Phase 1.3)
         """
         self.session_id = session_id
         self.clinic_id = clinic_id
         self.redis = redis_client
         self.supabase = supabase_client
-        self.use_fsm = use_fsm
-        self._fsm_manager = None  # Lazy-loaded
+
+        if use_fsm:
+            logger.warning("use_fsm=True is deprecated - FSM removed in Phase 1.3")
 
     def _get_session_key(self, phone: str = None) -> str:
         """Get Redis key for session data."""
@@ -82,56 +82,7 @@ class UnifiedStateManager:
         Returns:
             ConversationState with flow_state and turn_status
         """
-        if self.use_fsm:
-            return await self._get_fsm_state(session_data)
-        else:
-            return await self._get_session_state(session_data)
-
-    async def _get_fsm_state(self, session_data: Optional[Dict[str, Any]] = None) -> ConversationState:
-        """
-        Get state from FSM path.
-
-        Loads FSM state and maps it to composite ConversationState.
-        """
-        # Lazy-load FSM manager
-        if self._fsm_manager is None:
-            try:
-                from app.fsm.manager import FSMManager
-                # FSMManager uses singleton redis_client internally
-                self._fsm_manager = FSMManager()
-            except ImportError:
-                logger.warning("FSMManager not available, falling back to session state")
-                return await self._get_session_state(session_data)
-
-        try:
-            # Load FSM state
-            fsm_state = await self._fsm_manager.load_state(self.session_id)
-
-            if fsm_state:
-                # Map FSM state to FlowState
-                flow_state = FlowState.from_fsm_state(fsm_state.current_state.value)
-
-                # Get turn status from session data
-                if session_data is None:
-                    session_data = await self._load_session_data()
-
-                turn_status_str = session_data.get('turn_status', 'user_turn')
-                turn_status = TurnStatus.from_session_value(turn_status_str)
-
-                return ConversationState(
-                    flow_state=flow_state,
-                    turn_status=turn_status,
-                    pending_action=session_data.get('last_agent_action'),
-                    pending_since=self._parse_datetime(session_data.get('pending_since')),
-                    episode_type=session_data.get('episode_type'),
-                )
-            else:
-                # No FSM state, use session defaults
-                return await self._get_session_state(session_data)
-
-        except Exception as e:
-            logger.warning(f"Error loading FSM state for {self.session_id}: {e}")
-            return await self._get_session_state(session_data)
+        return await self._get_session_state(session_data)
 
     async def _get_session_state(self, session_data: Optional[Dict[str, Any]] = None) -> ConversationState:
         """
@@ -227,10 +178,7 @@ class UnifiedStateManager:
         episode_type: Optional[str] = None
     ):
         """
-        Update flow state (for AI path).
-
-        Note: For FSM path, flow state is managed by FSMManager transitions.
-        This method is primarily for AI path sessions.
+        Update flow state.
 
         Args:
             state: New flow state
@@ -279,7 +227,6 @@ class UnifiedStateManager:
             clinic_id=ctx.effective_clinic_id,
             redis_client=ctx.redis_client if hasattr(ctx, 'redis_client') else None,
             supabase_client=ctx.supabase_client if hasattr(ctx, 'supabase_client') else None,
-            use_fsm=ctx.use_fsm if hasattr(ctx, 'use_fsm') else False,
         )
 
 
@@ -292,13 +239,15 @@ def get_state_manager(
     clinic_id: str,
     redis_client,
     supabase_client=None,
-    use_fsm: bool = False,
+    use_fsm: bool = False,  # Deprecated, kept for API compatibility
 ) -> UnifiedStateManager:
     """
     Get or create UnifiedStateManager for a session.
 
     Uses a simple in-memory cache to avoid creating multiple instances
     for the same session.
+
+    Note: use_fsm parameter is deprecated and ignored (FSM removed in Phase 1.3).
     """
     key = f"{session_id}:{clinic_id}"
 
@@ -308,7 +257,6 @@ def get_state_manager(
             clinic_id=clinic_id,
             redis_client=redis_client,
             supabase_client=supabase_client,
-            use_fsm=use_fsm,
         )
 
     return _state_manager_instances[key]

@@ -153,18 +153,36 @@ class ReservationTools:
                 matched_doctor = None
                 doctor_name_lower = doctor_id.lower().strip()
 
+                # Transliterate Cyrillic to Latin for matching
+                cyrillic_to_latin = {
+                    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+                    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+                    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+                    'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+                    'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya'
+                }
+                doctor_name_transliterated = ''.join(
+                    cyrillic_to_latin.get(c, c) for c in doctor_name_lower
+                )
+                logger.info(f"Doctor name lookup: '{doctor_name_lower}' → transliterated: '{doctor_name_transliterated}'")
+
                 for doc in doctor_result.data or []:
                     first_name = (doc.get('first_name') or '').lower()
                     last_name = (doc.get('last_name') or '').lower()
                     full_name = f"{first_name} {last_name}"
 
-                    # Check various matching patterns
-                    if (doctor_name_lower in first_name or
-                        doctor_name_lower in last_name or
-                        doctor_name_lower in full_name or
-                        first_name in doctor_name_lower or
-                        last_name in doctor_name_lower):
+                    # Check various matching patterns (both original and transliterated)
+                    name_to_check = doctor_name_transliterated  # Use transliterated for matching
+                    if (name_to_check in first_name or
+                        name_to_check in last_name or
+                        name_to_check in full_name or
+                        first_name in name_to_check or
+                        last_name in name_to_check or
+                        # Also check original (in case DB has Cyrillic)
+                        doctor_name_lower in first_name or
+                        doctor_name_lower in last_name):
                         matched_doctor = doc
+                        logger.info(f"Matched doctor: {first_name} {last_name}")
                         break
 
                 if matched_doctor:

@@ -92,7 +92,7 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                     "awaiting_clarification", "info_seeking"
                 ],
                 "depends_on": [],
-                "max_calls_per_turn": 2,
+                "max_calls_per_turn": 5,  # Increased from 2 - read-only info tool
                 "danger_level": "low",
                 "version": "1.0.0",
                 "requires_confirmation": False
@@ -143,7 +143,7 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                     "awaiting_clarification"
                 ],
                 "depends_on": [],
-                "max_calls_per_turn": 2,
+                "max_calls_per_turn": 5,  # Increased from 2 - may need retries with different params
                 "danger_level": "low",
                 "version": "1.0.0",
                 "requires_confirmation": False

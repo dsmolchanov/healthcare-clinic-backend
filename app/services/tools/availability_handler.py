@@ -54,38 +54,50 @@ class AvailabilityHandler(ToolHandler):
 
     def _format_clustered_slots(self, slots: list, result: dict) -> str:
         """
-        Return minimal data - let the LLM format it naturally in user's language.
+        Return top slots with doctor info - let the LLM format it naturally in user's language.
+        Includes doctor_name and doctor_id so LLM can pass correct ID to book_appointment.
         """
         from datetime import datetime, date as date_type
 
         if not slots:
             return "NO_SLOTS"
 
-        # Get the FIRST slot
-        first_slot = slots[0]
-        slot_datetime = first_slot.get('datetime', '')
+        # Return up to 3 slots to give user options
+        formatted_slots = []
+        for slot in slots[:3]:
+            slot_datetime = slot.get('datetime', '')
+            doctor_name = slot.get('doctor_name', 'Available')
+            doctor_id = slot.get('doctor_id', '')
 
-        try:
-            dt = datetime.fromisoformat(slot_datetime.replace('Z', '+00:00'))
-            date_str = dt.strftime('%Y-%m-%d')
-            time_str = dt.strftime('%H:%M')
-            weekday = dt.strftime('%A')
+            try:
+                dt = datetime.fromisoformat(slot_datetime.replace('Z', '+00:00'))
+                date_str = dt.strftime('%Y-%m-%d')
+                time_str = dt.strftime('%H:%M')
+                weekday = dt.strftime('%A')
 
-            # Calculate relative day
-            slot_date = dt.date()
-            today = date_type.today()
-            days_diff = (slot_date - today).days
+                # Calculate relative day
+                slot_date = dt.date()
+                today = date_type.today()
+                days_diff = (slot_date - today).days
 
-            if days_diff == 0:
-                relative = "today"
-            elif days_diff == 1:
-                relative = "tomorrow"
-            else:
-                relative = weekday
+                if days_diff == 0:
+                    relative = "today"
+                elif days_diff == 1:
+                    relative = "tomorrow"
+                else:
+                    relative = weekday
 
-        except (ValueError, AttributeError):
+                # Include doctor info for booking
+                # Format: "SLOT: tomorrow 2025-11-27 09:00 with Dr. Smith (doc-1)"
+                slot_str = f"SLOT: {relative} {date_str} {time_str} with {doctor_name}"
+                if doctor_id:
+                    slot_str += f" (doctor_id: {doctor_id})"
+                formatted_slots.append(slot_str)
+
+            except (ValueError, AttributeError):
+                continue
+
+        if not formatted_slots:
             return "NO_SLOTS"
 
-        # Return format with BOTH relative day AND explicit date to prevent hallucination
-        # "SLOT: Monday 2025-12-22 09:00" - date included to prevent LLM guessing wrong date
-        return f"SLOT: {relative} {date_str} {time_str}"
+        return "\n".join(formatted_slots)

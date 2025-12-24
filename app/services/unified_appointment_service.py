@@ -19,7 +19,8 @@ from ..database import get_db_connection
 import asyncpg
 
 # Phase C.1: Intelligent Scheduling Components
-from ..fsm.service_doctor_mapper import ServiceDoctorMapper
+# ServiceDoctorMapper moved from fsm module in Phase 1.3 cleanup
+from .scheduling.service_doctor_mapper import ServiceDoctorMapper
 from .scheduling.preference_scorer import PreferenceScorer
 from .scheduling.constraint_engine import ConstraintEngine
 from .resource_service import ResourceService

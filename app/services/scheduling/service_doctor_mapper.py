@@ -2,6 +2,8 @@
 Service-to-Doctor Mapping
 
 Resolves which doctors provide a given service using the eligibility matrix.
+
+NOTE: Moved from app.fsm.service_doctor_mapper in Phase 1.3 cleanup.
 """
 
 import logging
@@ -78,38 +80,3 @@ class ServiceDoctorMapper:
         )
 
         return doctors
-
-    def format_doctor_choice_prompt(
-        self,
-        doctors: List[Dict],
-        service_name: str
-    ) -> str:
-        """Format doctor list with match quality indicators"""
-
-        if len(doctors) == 1:
-            doc = doctors[0]
-            return (
-                f"Услугу '{service_name}' выполняет {doc['name']} "
-                f"({doc['specialization']}). "
-                f"Проверю доступность..."
-            )
-
-        # Group by match quality
-        preferred = [d for d in doctors if d['match_type'] == 'preferred']
-        qualified = [d for d in doctors if d['match_type'] in ('allowed', 'derived')]
-
-        lines = []
-        if preferred:
-            lines.append("⭐ Рекомендуемые врачи:")
-            for i, d in enumerate(preferred, 1):
-                lines.append(f"  {i}. {d['name']} ({d['specialization']})")
-
-        if qualified:
-            if preferred:
-                lines.append("\n✓ Квалифицированные врачи:")
-            start_num = len(preferred) + 1
-            for i, d in enumerate(qualified, start_num):
-                lines.append(f"  {i}. {d['name']} ({d['specialization']})")
-
-        lines.append(f"\nК кому хотите записаться на {service_name}?")
-        return "\n".join(lines)

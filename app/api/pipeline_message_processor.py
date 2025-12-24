@@ -28,7 +28,10 @@ logger = logging.getLogger(__name__)
 
 
 # Re-export request/response models for compatibility
-from app.api.multilingual_message_processor import MessageRequest, MessageResponse
+# NOTE: Schemas extracted to app.schemas.messages for Phase 1.1 cleanup
+# Still importing from multilingual_message_processor for backward compatibility
+# until full legacy file removal in Phase 1.2
+from app.schemas.messages import MessageRequest, MessageResponse, AgentState
 
 
 class PipelineMessageProcessor:
@@ -45,14 +48,9 @@ class PipelineMessageProcessor:
     4. RoutingStep: Classify message and handle fast-path
     5. ConstraintEnforcementStep: Extract and enforce constraints
     6. NarrowingStep: Preference narrowing computation
-    7. LangGraphExecutionStep: Route complex flows through orchestrator (Phase 3B)
-    8. LLMGenerationStep: Generate AI response with tools (fallback if LangGraph skipped)
+    7. LangGraphExecutionStep: Route SCHEDULING/COMPLEX flows through LangGraph orchestrator
+    8. LLMGenerationStep: Generate AI response with tools (fallback if LangGraph errors)
     9. PostProcessingStep: Format, log, update session
-
-    LangGraph routing (Phase 3B):
-    - Controlled by ENABLE_LANGGRAPH env var + clinic whitelist
-    - Routes SCHEDULING/COMPLEX lanes through HealthcareLangGraph orchestrator
-    - Falls through to LLMGenerationStep if disabled or skipped
 
     Usage:
         processor = PipelineMessageProcessor()
@@ -81,11 +79,12 @@ class PipelineMessageProcessor:
         from app.services.fast_path_service import FastPathService
         from app.services.session_service import SessionService
         from app.config import get_redis_client
-        from app.api.multilingual_message_processor import (
-            get_supabase_client,
-            get_public_supabase_client,
-            get_llm_factory,
-        )
+        # Use canonical imports instead of multilingual_message_processor
+        from app.database import get_healthcare_client, get_main_client
+        from app.services.llm.llm_factory import get_llm_factory
+        # Compatibility aliases
+        get_supabase_client = get_healthcare_client
+        get_public_supabase_client = get_main_client
 
         # Core services
         self.memory_manager = get_memory_manager()

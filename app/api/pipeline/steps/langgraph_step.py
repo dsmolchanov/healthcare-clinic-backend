@@ -20,13 +20,10 @@ from cachetools import TTLCache
 
 from ..base import PipelineStep
 from ..context import PipelineContext
-from app.config import (
-    ENABLE_LANGGRAPH,
-    LANGGRAPH_CLINIC_WHITELIST,
-    LANGGRAPH_ENABLED_LANES,
-)
+from app.config import LANGGRAPH_ENABLED_LANES
 from app.services.state_model import FlowState, TurnStatus, ConversationState as StateModelConversationState
 from app.services.state_manager import get_state_manager
+from app.services.orchestrator.thread_ids import make_thread_id, make_checkpoint_ns
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +37,7 @@ class LangGraphExecutionStep(PipelineStep):
     - Complex queries requiring multiple tool calls (COMPLEX lane)
     - Conversations requiring state tracking
 
-    Feature flags:
-    - ENABLE_LANGGRAPH: Master switch for LangGraph routing
-    - LANGGRAPH_CLINIC_WHITELIST: List of clinic IDs to enable (empty = disabled for all)
-    - LANGGRAPH_ENABLED_LANES: Lanes that trigger LangGraph (default: SCHEDULING, COMPLEX)
+    Always enabled for SCHEDULING/COMPLEX lanes (feature flags removed in Phase 2).
     """
 
     def __init__(
@@ -73,26 +67,16 @@ class LangGraphExecutionStep(PipelineStep):
         """
         Execute LangGraph step.
 
-        Checks feature flags and routes to orchestrator if applicable.
+        Routes SCHEDULING/COMPLEX lanes through orchestrator.
 
         Returns:
             - (ctx, False) if LangGraph handled the response (stop pipeline)
             - (ctx, True) if skipped (continue to LLMGenerationStep)
         """
         start_time = time.time()
-
-        # 1. Check master feature flag
-        if not ENABLE_LANGGRAPH:
-            logger.debug("LangGraph disabled via ENABLE_LANGGRAPH=false")
-            return ctx, True
-
-        # 2. Check clinic whitelist
         clinic_id = ctx.effective_clinic_id
-        if LANGGRAPH_CLINIC_WHITELIST and clinic_id not in LANGGRAPH_CLINIC_WHITELIST:
-            logger.debug(f"LangGraph skipped: clinic {clinic_id} not in whitelist")
-            return ctx, True
 
-        # 3. Check if lane triggers LangGraph
+        # Check if lane triggers LangGraph
         # ctx.lane may be Lane enum or string; normalize to uppercase string for comparison
         lane = ctx.lane
         if hasattr(lane, 'value'):
@@ -120,19 +104,40 @@ class LangGraphExecutionStep(PipelineStep):
                 except Exception as e:
                     logger.warning(f"[LangGraph] Failed to load flow_state from Redis: {e}")
 
-            # 5. Get or create orchestrator for this clinic
+            # 5. Generate session-scoped thread_id for checkpointer
+            patient_id = ctx.from_phone or "unknown"  # Phone as patient identifier
+            session_id = ctx.session_id or "unknown"
+            thread_id = make_thread_id(clinic_id, patient_id, session_id)
+            checkpoint_ns = make_checkpoint_ns(clinic_id)
+
+            # Store in context for observability
+            ctx.thread_id = thread_id
+            ctx.checkpoint_ns = checkpoint_ns
+
+            # Log session continuity vs rotation
+            is_new_session = getattr(ctx, 'is_new_session', False)
+            if is_new_session:
+                reset_type = getattr(ctx, 'reset_type', 'unknown')
+                logger.info(
+                    f"[LangGraph] New session - fresh thread_id: {thread_id[:30]}... "
+                    f"(reset_type={reset_type})"
+                )
+            else:
+                logger.debug(f"[LangGraph] Continuing session - thread_id: {thread_id[:30]}...")
+
+            # 6. Get or create orchestrator for this clinic
             orchestrator = await self._get_orchestrator(ctx)
             if not orchestrator:
                 logger.warning("Failed to create orchestrator, falling through to LLM step")
                 return ctx, True
 
-            # 6. Build initial state from pipeline context
+            # 7. Build initial state from pipeline context
             initial_state = self._build_orchestrator_state(ctx)
 
-            # 6. Execute graph
+            # 8. Execute graph with thread_id for checkpointing
             result = await orchestrator.process(
                 message=ctx.message,
-                session_id=ctx.session_id or "unknown",
+                session_id=session_id,
                 metadata=initial_state.get("metadata", {}),
                 context=initial_state.get("context", {}),
             )

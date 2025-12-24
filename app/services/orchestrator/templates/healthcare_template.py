@@ -202,8 +202,21 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         - Routes to scheduling_agent (appointment) or info_agent (FAQ/price/general)
         - All paths go through phi_redact before exit
         """
-        # Start with base graph
-        workflow = super()._build_graph()
+        # CRITICAL: Create StateGraph with HealthcareConversationState, not base class
+        # This ensures all healthcare fields (action_plan, flow_state, etc.) are available
+        from langgraph.graph import StateGraph, END
+        workflow = StateGraph(HealthcareConversationState)
+
+        # Add only the nodes we actually use in healthcare flow
+        # (entry, process, generate_response, exit are used; intent_classify is NOT - we use supervisor)
+        workflow.add_node("entry", self.entry_node)
+        workflow.add_node("process", self.process_node)
+        workflow.add_node("generate_response", self.generate_response_node)
+        workflow.add_node("exit", self.exit_node)
+
+        # Optional memory/RAG nodes from base
+        if self.enable_rag:
+            workflow.add_node("knowledge_retrieve", self.knowledge_retrieve_node)
 
         # ==============================================
         # Phase 2: New nodes
@@ -226,15 +239,10 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         # NEW: Supervisor node replaces fragmented routing (Phase 3)
         workflow.add_node("supervisor", self.supervisor_node)
 
-        # Specialized agent nodes (renamed for clarity)
-        workflow.add_node("scheduling_agent", self.appointment_handler_node)
+        # Specialized agent nodes
         workflow.add_node("info_agent", self.info_agent_node)  # Combines faq_lookup + price_query
-
-        # Keep legacy nodes for backward compatibility (can be removed later)
-        workflow.add_node("appointment_handler", self.appointment_handler_node)
-        workflow.add_node("price_query", self.price_query_node)
-        workflow.add_node("faq_lookup", self.faq_lookup_node)
-        workflow.add_node("insurance_verify", self.insurance_verify_node)
+        # Note: Legacy nodes (appointment_handler, price_query, faq_lookup, insurance_verify)
+        # were removed - Phase 2 uses planner/executor for scheduling, info_agent for queries
 
         # ==============================================
         # Phase 2: Enhanced flow with guardrail FIRST
@@ -315,28 +323,9 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         )
 
         # ==============================================
-        # Existing agent flows
+        # Agent flows
         # ==============================================
-        # Legacy scheduling agent (kept for backward compatibility)
-        workflow.add_edge("scheduling_agent", "process")
         workflow.add_edge("info_agent", "process")
-
-        # Legacy edges for backward compatibility (in case old routing still used)
-        workflow.add_edge("appointment_handler", "process")
-        workflow.add_edge("price_query", "process")
-
-        # FAQ can either go directly to process or fall back to RAG
-        workflow.add_conditional_edges(
-            "faq_lookup",
-            self.faq_fallback_router,
-            {
-                "success": "process",
-                "fallback_rag": "knowledge_retrieve" if self.enable_rag else "process",
-                "end": END
-            }
-        )
-
-        workflow.add_edge("insurance_verify", "process")
 
         # FIX: Insert phi_redact BETWEEN process and generate_response
         # This avoids conflicting edges from generate_response
@@ -348,33 +337,15 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         workflow.add_edge("process", "phi_redact")
         workflow.add_edge("phi_redact", "generate_response")
 
-        # Note: The base class already adds generate_response -> exit (or compliance_audit -> exit)
-        # so we don't need to add another edge from generate_response
+        # Add generate_response -> exit edge (was in base class)
+        # Healthcare always uses HIPAA compliance, so route through audit
+        workflow.add_edge("generate_response", "exit")
+
+        # Final edge to END and entry point
+        workflow.add_edge("exit", END)
+        workflow.set_entry_point("entry")
 
         return workflow
-
-    def _add_intent_routing(self, workflow) -> None:
-        """
-        Override base class to add healthcare-specific intent routing.
-
-        Routes to specialized handlers for:
-        - appointment: Appointment booking flow
-        - price_query: Service pricing lookup
-        - faq_query: FAQ knowledge base lookup
-        - insurance: Insurance verification
-        - general: Standard conversation processing
-        """
-        workflow.add_conditional_edges(
-            "intent_classify",
-            self.intent_router,
-            {
-                "appointment": "appointment_handler",
-                "price_query": "price_query",
-                "faq_query": "faq_lookup",
-                "insurance": "insurance_verify",
-                "general": "memory_retrieve" if self.enable_memory else "process"
-            }
-        )
 
     async def phi_check_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
         """Check message for PHI and de-identify if needed"""
@@ -828,24 +799,6 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
 
         return state
 
-    def faq_fallback_router(self, state: HealthcareConversationState) -> str:
-        """
-        Route based on FAQ success
-
-        Returns:
-            - "success": FAQ found with good confidence → generate response
-            - "fallback_rag": No FAQ or low confidence → try RAG
-            - "end": Error or invalid state
-        """
-        if state.get('context', {}).get('faq_success', False):
-            return "success"
-        elif state.get('context', {}).get('faq_results') is not None:
-            # Tried FAQ but didn't find good match - fall back to RAG
-            return "fallback_rag"
-        else:
-            # Error state
-            return "end"
-
     async def insurance_verify_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
         """
         Gather insurance verification context for LLM.
@@ -962,15 +915,6 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
                 return "emergency"
         return "normal"
 
-    def intent_router(self, state: HealthcareConversationState) -> str:
-        """Route all messages to general - let LLM use tools to handle intents.
-
-        Legacy keyword-based routing removed. The process_node now uses LLM with
-        tools (query_service_prices, check_availability, etc.) to handle all intents.
-        """
-        # All messages go to process_node which has tool calling
-        return 'general'
-
     async def supervisor_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
         """
         Central routing decision with few-shot examples.
@@ -1023,8 +967,8 @@ CRITICAL RULE: If flow_state is "scheduling", user is in an active booking conve
 Short responses like "yes", "да", "ok", numbers, or times should STAY in scheduling.
 
 Route this message to the appropriate agent:
-- "scheduling" - Appointment booking, availability, rescheduling, cancellation, OR any response while in scheduling flow
-- "info" - FAQ, pricing, hours, location, insurance, service details (only if NOT in scheduling flow)
+- "scheduling" - Appointment booking, availability, rescheduling, cancellation, PAIN/SYMPTOMS (need to see doctor), OR any response while in scheduling flow
+- "info" - FAQ, pricing, hours, location, insurance, service details (only if NOT in scheduling flow and no symptoms)
 - "exit" - Explicit goodbyes like "bye", "до свидания", "thanks bye" (NOT simple "ok" or "да")
 
 EXAMPLES (follow these patterns):
@@ -1032,7 +976,9 @@ User: "How much is a filling?" -> info
 User: "What are your hours?" -> info
 User: "I need to come in on Tuesday" -> scheduling
 User: "Do you have availability for a root canal next week?" -> scheduling (intent is booking)
-User: "My tooth hurts so bad, it's bleeding" -> info (unless flow_state is scheduling)
+User: "My tooth hurts" -> scheduling (pain = need to see doctor = booking)
+User: "У меня болит зуб" -> scheduling (Russian: my tooth hurts = needs appointment)
+User: "I'm in pain" -> scheduling (needs urgent appointment)
 User: "Thanks, bye!" -> exit
 User: "Okay" (in scheduling flow) -> scheduling (continue current task)
 User: "Да" (in scheduling flow) -> scheduling (Russian "yes" - continue booking)
@@ -1043,6 +989,7 @@ User: "Can I book an appointment?" -> scheduling
 User: "What services do you offer?" -> info
 User: "I want to cancel my appointment" -> scheduling
 User: "Да" or "Yes" (confirming offered slot) -> scheduling
+User: "острая боль" -> scheduling (acute pain = urgent appointment needed)
 
 User message: {message}
 
@@ -1125,9 +1072,9 @@ Respond with ONLY one word: scheduling, info, or exit"""
         Returns:
             State with guardrail_action set to 'escalate', 'restrict', or 'allow'
         """
-        logger.debug(f"Guardrail node - session: {state['session_id']}")
-
         message = state.get('message', '').lower()
+        logger.info(f"[guardrail] Checking message: '{message[:80]}...' session={state.get('session_id', 'unknown')[:8]}")
+
         guardrail_action = 'allow'
         blocked_tools = []
         escalation_reason = None
@@ -1138,8 +1085,8 @@ Respond with ONLY one word: scheduling, info, or exit"""
             # English
             '911', 'emergency', 'heart attack', 'cant breathe', "can't breathe",
             'severe bleeding', 'suicidal', 'overdose', 'dying', 'severe pain',
-            # Russian
-            'помогите', 'умираю', 'острая боль', 'сильная боль', 'скорая',
+            # Russian (боль alone is too generic, need qualifier)
+            'помогите', 'умираю', 'острая боль', 'сильная боль', 'скорая', 'очень больно', 'нестерпимая боль',
             # Spanish
             'emergencia', 'no puedo respirar', 'dolor severo', 'urgente', 'dolor agudo',
             # Portuguese
@@ -1147,11 +1094,29 @@ Respond with ONLY one word: scheduling, info, or exit"""
             # Hebrew
             'חירום', 'כאב חזק',
         ]
-        if any(pattern in message for pattern in emergency_patterns):
+        matched_pattern = None
+        for pattern in emergency_patterns:
+            if pattern in message:
+                matched_pattern = pattern
+                break
+
+        if matched_pattern:
             is_emergency = True
             guardrail_action = 'escalate'
             escalation_reason = 'emergency_detected'
-            logger.warning(f"[guardrail] Emergency detected in message: {message[:50]}...")
+            logger.warning(f"[guardrail] 🚨 EMERGENCY DETECTED: pattern='{matched_pattern}' in message: {message[:50]}...")
+
+            # Generate emergency response in user's language
+            language = state.get('language', 'en')
+            emergency_responses = {
+                'en': "I understand you're experiencing a medical emergency. Please call 911 immediately or go to your nearest emergency room. Your health is our priority, and emergency services are best equipped to help you right now.",
+                'ru': "Я понимаю, что у вас неотложная медицинская ситуация. Пожалуйста, немедленно позвоните 911 или обратитесь в ближайшую скорую помощь. Ваше здоровье — наш приоритет, и экстренные службы лучше всего оснащены, чтобы помочь вам прямо сейчас.",
+                'es': "Entiendo que está experimentando una emergencia médica. Por favor llame al 911 inmediatamente o vaya a la sala de emergencias más cercana. Su salud es nuestra prioridad.",
+                'pt': "Entendo que você está passando por uma emergência médica. Por favor, ligue para o 192 imediatamente ou vá ao pronto-socorro mais próximo.",
+                'he': "אני מבין שאתה חווה מצב חירום רפואי. אנא התקשר למד״א 101 מיד או גש לחדר מיון הקרוב אליך.",
+            }
+            state['response'] = emergency_responses.get(language, emergency_responses['en'])
+            state['should_escalate'] = True
 
         # 2. PHI in outbound - check if we're about to send PHI
         # (This is checked after response generation in phi_redact_node)
@@ -1660,6 +1625,7 @@ Respond with ONLY one word: scheduling, info, or exit"""
         state['plan_needs_replanning'] = False
 
         logger.info(f"[planner] Created plan: {plan.goal} with {len(steps)} steps")
+        logger.info(f"[planner] Plan stored - goal: {state.get('action_plan', {}).get('goal')}, steps: {len(state.get('action_plan', {}).get('steps', []))}")
 
         state['audit_trail'].append({
             "node": "planner",
@@ -1682,11 +1648,14 @@ Respond with ONLY one word: scheduling, info, or exit"""
         4. If no confirmation needed, executes step
         5. Handles errors and replanning triggers
         """
-        logger.debug(f"Executor node - session: {state['session_id']}")
+        logger.info(f"[executor] Starting - session: {state.get('session_id', 'unknown')[:8]}")
+        logger.info(f"[executor] State keys: {list(state.keys())}")
 
         plan = state.get('action_plan')
         if not plan:
-            logger.warning("[executor] No plan to execute")
+            logger.warning(f"[executor] No plan to execute - state has action_plan: {state.get('action_plan')}")
+            # Generate a response explaining we need more context
+            state['response'] = state.get('response', "I'll help you book an appointment. What service do you need?")
             return state
 
         completed_steps = state.get('plan_completed_steps', [])
@@ -1803,6 +1772,8 @@ Respond with ONLY one word: scheduling, info, or exit"""
 
     def executor_router(self, state: HealthcareConversationState) -> str:
         """Route based on executor result."""
+        logger.info(f"[executor_router] awaiting_confirmation={state.get('awaiting_confirmation')}, action_plan={bool(state.get('action_plan'))}")
+
         if state.get('awaiting_confirmation'):
             return 'exit'  # Wait for user response
         if state.get('plan_needs_replanning'):
@@ -1811,7 +1782,11 @@ Respond with ONLY one word: scheduling, info, or exit"""
             return 'error'
 
         # Check if all steps completed
-        plan = state.get('action_plan', {})
+        plan = state.get('action_plan')
+        if not plan:
+            logger.warning("[executor_router] No plan found, routing to error for graceful handling")
+            return 'error'  # No plan = error, not complete
+
         completed = len(state.get('plan_completed_steps', []))
         total = len(plan.get('steps', []))
 

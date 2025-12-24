@@ -12,9 +12,9 @@ from dotenv import load_dotenv
 # Ensure paths are correct
 sys.path.append(os.getcwd())
 
-from app.api.multilingual_message_processor import MultilingualMessageProcessor, MessageRequest
+from app.api.pipeline_message_processor import PipelineMessageProcessor, MessageRequest
 from app.services.router_service import RouterService
-from evaluation.judge import LLMJudge
+from tests.evals.judge import LLMJudge
 
 # Load environment variables
 load_dotenv()
@@ -27,7 +27,7 @@ if "OPENAI_API_KEY" not in os.environ:
 async def run_evals():
     # Parse arguments
     parser = argparse.ArgumentParser(description="Run evaluations for Healthcare Agent")
-    parser.add_argument("scenario_file", nargs="?", default="apps/healthcare-backend/evaluation/scenarios.yaml", help="Path to scenarios YAML file")
+    parser.add_argument("scenario_file", nargs="?", default="tests/evals/scenarios.yaml", help="Path to scenarios YAML file")
     parser.add_argument("--real-data", action="store_true", help="Run against real Supabase data (disable DB/Tool mocks)")
     parser.add_argument("--clinic-id", default="test-clinic", help="Clinic ID to test against (default: test-clinic)")
     args = parser.parse_args()
@@ -97,13 +97,13 @@ async def run_evals():
 
         mock_cm_instance = FakeConstraintsManager()
         # When ConstraintsManager() is called, it should return this instance
-        stack.enter_context(patch('app.api.multilingual_message_processor.ConstraintsManager', return_value=mock_cm_instance))
+        stack.enter_context(patch('app.services.conversation_constraints.ConstraintsManager', return_value=mock_cm_instance))
         # Mock Constraint Extractor
         # Mock ConstraintExtractor unless using real data
         if not args.real_data:
             mock_ce = MagicMock()
             mock_ce.detect_meta_reset.return_value = False
-            stack.enter_context(patch('app.api.multilingual_message_processor.ConstraintExtractor', return_value=mock_ce))
+            stack.enter_context(patch('app.services.constraint_extractor.ConstraintExtractor', return_value=mock_ce))
         else:
             # For real data, we might want to mock it if it's not fully configured, 
             # but to avoid MagicMock serialization errors, we should let it run or use a better mock.
@@ -113,12 +113,13 @@ async def run_evals():
         # State Echo Formatter
         mock_formatter = MagicMock()
         mock_formatter.format_response.side_effect = lambda response, *args, **kwargs: response
-        stack.enter_context(patch('app.api.multilingual_message_processor.StateEchoFormatter', return_value=mock_formatter))
-        # Mock Langfuse
-        stack.enter_context(patch('app.api.multilingual_message_processor.Langfuse'))
-        
+        stack.enter_context(patch('app.services.state_echo_formatter.StateEchoFormatter', return_value=mock_formatter))
+        # Mock Langfuse (used in multiple places)
+        stack.enter_context(patch('langfuse.Langfuse', MagicMock()))
+
         # Mock LLM Factory - We ALWAYS mock this to inject our capturing wrapper
         # This allows us to capture tool calls even when using real tools
+        # Note: Pipeline uses get_llm_factory from multilingual_message_processor for backwards compat
         mock_get_factory = stack.enter_context(patch('app.api.multilingual_message_processor.get_llm_factory'))
 
         # --- CONDITIONAL MOCKS ---
@@ -135,12 +136,12 @@ async def run_evals():
             mock_mm.get_conversation_history = AsyncMock(return_value=[])
             stack.enter_context(patch('app.memory.conversation_memory.get_memory_manager', return_value=mock_mm))
 
-            # Patch datetime in processor module to fix "Today" context
+            # Patch datetime in LLM step to fix "Today" context
             mock_dt = MagicMock()
-            # Set "now" to Sunday, Nov 23, 2025
-            mock_dt.now.return_value = datetime(2025, 11, 23, 12, 0, 0)
+            # Set "now" to Wednesday, Nov 26, 2025 (a weekday when clinic is open)
+            mock_dt.now.return_value = datetime(2025, 11, 26, 10, 0, 0)
             mock_dt.fromisoformat = datetime.fromisoformat
-            stack.enter_context(patch('app.api.multilingual_message_processor.datetime', mock_dt))
+            stack.enter_context(patch('app.api.pipeline.steps.llm_step.datetime', mock_dt))
 
             # Session Manager
             mock_sm = MagicMock()
@@ -150,12 +151,12 @@ async def run_evals():
             mock_lock.acquire.return_value.__aenter__ = AsyncMock(return_value=None)
             mock_lock.acquire.return_value.__aexit__ = AsyncMock(return_value=None)
             mock_sm.boundary_lock = mock_lock
-            stack.enter_context(patch('app.api.multilingual_message_processor.SessionManager', return_value=mock_sm))
+            stack.enter_context(patch('app.services.session_manager.SessionManager', return_value=mock_sm))
 
             # Tool State Gate (Patched in Executor)
             mock_gate = MagicMock()
             mock_gate.validate_tool_call.return_value = (True, None, None)
-            stack.enter_context(patch('app.services.tools.executor.ToolStateGate', return_value=mock_gate))
+            stack.enter_context(patch('app.services.tool_state_gate.ToolStateGate', return_value=mock_gate))
 
             # MessageContextHydrator (Replaces CacheService mock)
             mock_hydrator = MagicMock()
@@ -192,8 +193,11 @@ async def run_evals():
             })
             stack.enter_context(patch('app.services.message_context_hydrator.MessageContextHydrator', return_value=mock_hydrator))
 
-            # Supabase Client
-            stack.enter_context(patch('app.api.multilingual_message_processor.get_supabase_client'))
+            # Supabase Client (used in multiple places)
+            mock_supabase = MagicMock()
+            stack.enter_context(patch('app.api.multilingual_message_processor.get_supabase_client', return_value=mock_supabase))
+            stack.enter_context(patch('app.api.multilingual_message_processor.get_public_supabase_client', return_value=mock_supabase))
+            stack.enter_context(patch('app.database.create_supabase_client', return_value=mock_supabase))
             
             # Patch SummarySearchService instance in conversation_history_tools
             # This is needed because it's instantiated at module level
@@ -240,34 +244,48 @@ async def run_evals():
 
             # ReservationTools (Patched in Handlers)
             mock_reservation_tools = MagicMock()
+            # Slots must use 'datetime' field in ISO format (not separate date/start_time)
+            # This matches the real IntelligentScheduler output format
+            # Slots are for Nov 27 (Thursday = tomorrow) and Nov 28 (Friday)
             mock_reservation_tools.check_availability_tool = AsyncMock(return_value={
                 'success': True,
                 'available_slots': [
-                    {'date': '2025-11-23', 'start_time': '10:00', 'doctor_name': 'Dr. Smith'},
-                    {'date': '2025-11-23', 'start_time': '14:00', 'doctor_name': 'Dr. Smith'},
-                    {'date': '2025-11-24', 'start_time': '09:00', 'doctor_name': 'Dr. Shtern'},
-                    {'date': '2025-11-24', 'start_time': '11:00', 'doctor_name': 'Dr. Shtern'},
-                    {'date': '2025-11-24', 'start_time': '14:00', 'doctor_name': 'Dr. Smith'}
+                    {'datetime': '2025-11-27T09:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
+                    {'datetime': '2025-11-27T10:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
+                    {'datetime': '2025-11-27T14:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
+                    {'datetime': '2025-11-28T09:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
+                    {'datetime': '2025-11-28T11:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'}
                 ],
                 'recommendation': 'We have morning and afternoon slots available.'
             })
-            # Dynamic book_appointment mock
-            async def mock_book_appointment(service_id, datetime_str, patient_info, **kwargs):
-                # Parse datetime_str to make it look nice, or just use it directly
-                # datetime_str is likely ISO format e.g. 2025-11-24T14:00:00
-                display_date = datetime_str.replace('T', ' ')
-                # Determine doctor name based on service or random guess if not provided
-                # In a real mock, we'd check availability or doctor_id arg
-                doctor_name = "Dr. Smith"
-                if "Shtern" in str(kwargs) or "doc-2" in str(kwargs): # Simple heuristic
-                     doctor_name = "Dr. Shtern"
+            # Dynamic book_appointment mock - signature must match real reservation_tools.book_appointment_tool
+            async def mock_book_appointment(
+                patient_info,
+                service_id,
+                datetime_str,
+                doctor_id=None,
+                notes=None,
+                hold_id=None,
+                idempotency_key=None,
+                **kwargs
+            ):
+                # Parse datetime_str to make it look nice
+                display_date = datetime_str.replace('T', ' ') if datetime_str else 'Unknown'
+
+                # Determine doctor name based on doctor_id
+                doctor_name = "Dr. Smith"  # Default
+                if doctor_id == "doc-2" or (doctor_id and "shtern" in str(doctor_id).lower()):
+                    doctor_name = "Dr. Shtern"
+                elif doctor_id == "doc-1":
+                    doctor_name = "Dr. Smith"
 
                 return {
                     'success': True,
                     'appointment_id': 'appt-123',
                     'appointment': {
                         'date': display_date,
-                        'doctor_name': doctor_name
+                        'doctor_name': doctor_name,
+                        'start_time': datetime_str.split('T')[1] if datetime_str and 'T' in datetime_str else None
                     },
                     'confirmation_message': f'Appointment booked successfully for {display_date} with {doctor_name}'
                 }
@@ -353,46 +371,22 @@ async def run_evals():
         
         stack.enter_context(patch('app.api.multilingual_message_processor.get_llm_factory', new=AsyncMock(return_value=mock_factory)))
 
-        # Initialize Processor
-        processor = MultilingualMessageProcessor()
-        
-        # Mock internal async methods that might cause side effects or aren't needed for e2e
-        processor._upsert_patient_from_whatsapp = AsyncMock()
-        
-        # If mocking, we mock constraint extraction. If real, we let it run? 
-        # We mocked ConstraintExtractor above in both cases to simplify.
-        # But processor._extract_and_update_constraints calls it.
-        # Let's mock the internal method to be safe and consistent with previous runs, 
-        # unless we want to test constraint extraction too.
-        # For now, let's keep it mocked to focus on tool execution.
-        # Use real ConversationConstraints object instead of MagicMock to avoid JSON serialization errors
-        from app.services.conversation_constraints import ConversationConstraints
-        # processor._extract_and_update_constraints = AsyncMock(return_value=ConversationConstraints())
+        # Initialize Processor (using Pipeline architecture)
+        processor = PipelineMessageProcessor()
+
+        # Note: PipelineMessageProcessor uses discrete steps, no need to mock internal methods like
+        # _upsert_patient_from_whatsapp which was part of the legacy processor
 
         # --- REAL ROUTER SETUP ---
-        # Even with real data, we might want to mock the router's internal language service if it's complex,
-        # but here we use the real RouterService class.
-        # In the original script, we mocked language_service.
+        # Replace router_service with mocked language service for consistent behavior
         mock_lang_service = MagicMock()
         mock_lang_service.match_service_alias.return_value = None
         mock_lang_service.is_affirmative.return_value = False
         mock_lang_service.is_negative.return_value = False
-        
-        # If real data, we might want real SessionManager?
-        # If we didn't mock SessionManager above (in real mode), we should pass the real one?
-        # processor.router_service is initialized inside processor.__init__.
-        # If we want to inject our mocked language service but keep real session manager:
-        if args.real_data:
-            # We need to access the real session manager created inside processor
-            # But processor creates it internally.
-            # We can just replace the router service.
-            # Note: processor.session_manager is the real one in real mode.
-            real_router = RouterService(language_service=mock_lang_service, session_service=processor.session_manager)
-            processor.router_service = real_router
-        else:
-            # In mock mode, mock_sm is the session manager
-            real_router = RouterService(language_service=mock_lang_service, session_service=mock_sm)
-            processor.router_service = real_router
+
+        # PipelineMessageProcessor uses session_service (not session_manager) for RouterService
+        real_router = RouterService(language_service=mock_lang_service, session_service=processor.session_service)
+        processor.router_service = real_router
 
         # Ensure message_logger methods are async mocks
         processor.message_logger.log_message_with_metrics = AsyncMock()
@@ -400,10 +394,29 @@ async def run_evals():
         # Patch ToolExecutor.execute to capture outputs
         original_tool_execute = processor.tool_executor.execute
 
-        async def capturing_tool_execute(tool_call_id, tool_name, tool_args, context, constraints=None):
+        async def capturing_tool_execute(
+            tool_call_id,
+            tool_name,
+            tool_args,
+            context,
+            constraints=None,
+            current_state="idle",
+            tool_schemas=None,
+            prior_tool_results=None
+        ):
             try:
-                result = await original_tool_execute(tool_call_id, tool_name, tool_args, context, constraints)
-                
+                # Call original with ALL parameters - it returns a tuple (result, updated_prior_results)
+                result, updated_prior_results = await original_tool_execute(
+                    tool_call_id,
+                    tool_name,
+                    tool_args,
+                    context,
+                    constraints,
+                    current_state,
+                    tool_schemas,
+                    prior_tool_results
+                )
+
                 # Ensure output is a string for OpenAI
                 output_content = result.get("content")
                 if output_content is None:
@@ -430,7 +443,8 @@ async def run_evals():
                 "args": tool_args,
                 "output": output_content
             })
-            return result
+            # Return the tuple as expected by the caller
+            return result, updated_prior_results
 
         processor.tool_executor.execute = capturing_tool_execute
 
