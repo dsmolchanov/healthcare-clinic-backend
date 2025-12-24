@@ -42,7 +42,13 @@ class ReservationTools:
     managing holds, and handling cancellations.
     """
 
-    def __init__(self, clinic_id: str, patient_id: Optional[str] = None, business_hours: Optional[Dict] = None):
+    def __init__(
+        self,
+        clinic_id: str,
+        patient_id: Optional[str] = None,
+        business_hours: Optional[Dict] = None,
+        clinic_timezone: Optional[str] = None
+    ):
         """
         Initialize reservation tools with clinic context.
 
@@ -50,30 +56,34 @@ class ReservationTools:
             clinic_id: ID of the clinic
             patient_id: Optional patient ID for personalized operations
             business_hours: Pre-loaded business hours from clinic warmup (avoids DB fetch)
+            clinic_timezone: Pre-loaded timezone from clinic warmup (avoids DB fetch)
         """
         self.clinic_id = clinic_id
         self.patient_id = patient_id
         self.business_hours = business_hours or {}
+        self.clinic_timezone = clinic_timezone
         self.supabase = create_supabase_client()
 
-        # Initialize services with pre-loaded business hours
+        # Initialize services with pre-loaded business hours and timezone
         # Phase C: Removed deprecated AppointmentBookingService
         # self.booking_service = AppointmentBookingService(supabase_client=self.supabase)
         self.unified_service = UnifiedAppointmentService(
             supabase=self.supabase,
             clinic_id=clinic_id,
-            business_hours=business_hours
+            business_hours=business_hours,
+            clinic_timezone=clinic_timezone
         )
         self.calendar_service = ExternalCalendarService(supabase=self.supabase)
         self.scheduler = IntelligentScheduler(
             supabase=self.supabase,
             clinic_id=clinic_id,
-            business_hours=business_hours
+            business_hours=business_hours,
+            clinic_timezone=clinic_timezone
         )
         self.conflict_detector = RealtimeConflictDetector()
         self.session_manager = RedisSessionManager()
 
-        logger.info(f"Initialized ReservationTools for clinic {clinic_id}")
+        logger.info(f"Initialized ReservationTools for clinic {clinic_id} (tz={clinic_timezone})")
 
     async def check_availability_tool(
         self,

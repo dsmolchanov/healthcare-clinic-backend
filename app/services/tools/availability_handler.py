@@ -14,6 +14,7 @@ class AvailabilityHandler(ToolHandler):
         clinic_id = context.get('clinic_id')
         session_history = context.get('session_history', [])
         business_hours = context.get('business_hours', {})  # From clinic_profile warmup
+        clinic_timezone = context.get('clinic_timezone')  # From clinic_profile warmup
 
         if not clinic_id:
             return "Error: clinic_id missing from context"
@@ -29,7 +30,8 @@ class AvailabilityHandler(ToolHandler):
         reservation_tools = ReservationTools(
             clinic_id=clinic_id,
             patient_id=patient_id,
-            business_hours=business_hours  # Pass pre-loaded hours, no extra DB fetch
+            business_hours=business_hours,  # Pass pre-loaded hours, no extra DB fetch
+            clinic_timezone=clinic_timezone  # Pass pre-loaded timezone, no extra DB fetch
         )
 
         # Default to Consultation if service_name is missing

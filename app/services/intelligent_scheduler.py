@@ -96,7 +96,13 @@ class IntelligentScheduler:
     Uses machine learning, historical data, and heuristics for optimal scheduling
     """
 
-    def __init__(self, supabase: Client = None, clinic_id: str = None, business_hours: Dict = None):
+    def __init__(
+        self,
+        supabase: Client = None,
+        clinic_id: str = None,
+        business_hours: Dict = None,
+        clinic_timezone: str = None
+    ):
         if supabase:
             self.supabase = supabase
         else:
@@ -106,11 +112,13 @@ class IntelligentScheduler:
             )
         self.clinic_id = clinic_id
         self.business_hours = business_hours or {}
-        # Pass pre-loaded business hours to avoid DB fetch
+        self.clinic_timezone = clinic_timezone
+        # Pass pre-loaded business hours and timezone to avoid DB fetch
         self.appointment_service = UnifiedAppointmentService(
             supabase=self.supabase,
             clinic_id=clinic_id,
-            business_hours=business_hours
+            business_hours=business_hours,
+            clinic_timezone=clinic_timezone
         )
         self.calendar_service = ExternalCalendarService(supabase=self.supabase)
 

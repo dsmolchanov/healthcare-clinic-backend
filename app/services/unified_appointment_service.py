@@ -82,7 +82,13 @@ class UnifiedAppointmentService:
     Integrates with external calendar coordination for comprehensive scheduling
     """
 
-    def __init__(self, supabase: Client = None, clinic_id: str = None, business_hours: Dict = None):
+    def __init__(
+        self,
+        supabase: Client = None,
+        clinic_id: str = None,
+        business_hours: Dict = None,
+        clinic_timezone: str = None
+    ):
         if supabase:
             self.supabase = supabase
         else:
@@ -99,6 +105,8 @@ class UnifiedAppointmentService:
         self.clinic_id = clinic_id
         # Use pre-loaded business hours from warmup (avoids DB fetch)
         self._business_hours_cache = business_hours if business_hours else None
+        # Use pre-loaded timezone from warmup (avoids DB fetch)
+        self._clinic_timezone = clinic_timezone
 
     async def get_available_slots(
         self,
@@ -122,11 +130,15 @@ class UnifiedAppointmentService:
             # Get doctor's working hours (simplified - could be from database)
             working_hours = await self._get_doctor_working_hours(doctor_id, target_date)
 
+            # Get clinic timezone for proper time comparison
+            clinic_timezone = await self._get_clinic_timezone()
+
             # Generate potential time slots
             potential_slots = self._generate_time_slots(
                 working_hours['start'],
                 working_hours['end'],
-                duration_minutes
+                duration_minutes,
+                clinic_timezone=clinic_timezone
             )
 
             # FAST PATH: Return all slots within working hours as available
@@ -1029,15 +1041,52 @@ class UnifiedAppointmentService:
             return {'start': date.replace(hour=0, minute=0), 'end': date.replace(hour=0, minute=0)}
 
         try:
-            # Handle format "10:00-17:00" or "10:00 - 17:00"
-            parts = day_hours.replace(' ', '').split('-')
-            if len(parts) == 2:
-                start_h, start_m = map(int, parts[0].split(':'))
-                end_h, end_m = map(int, parts[1].split(':'))
-                return {
-                    'start': date.replace(hour=start_h, minute=start_m, second=0, microsecond=0),
-                    'end': date.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-                }
+            # Handle multiple formats:
+            # - "10:00-17:00" or "10:00 - 17:00" (24-hour)
+            # - "10:00 AM - 5:00 PM" (12-hour with AM/PM)
+            hours_str = day_hours.strip()
+
+            # Check for AM/PM format
+            if 'AM' in hours_str.upper() or 'PM' in hours_str.upper():
+                # Parse "10:00 AM - 5:00 PM" format
+                import re
+                match = re.match(
+                    r'(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)',
+                    hours_str,
+                    re.IGNORECASE
+                )
+                if match:
+                    start_h = int(match.group(1))
+                    start_m = int(match.group(2))
+                    start_ampm = match.group(3).upper()
+                    end_h = int(match.group(4))
+                    end_m = int(match.group(5))
+                    end_ampm = match.group(6).upper()
+
+                    # Convert to 24-hour format
+                    if start_ampm == 'PM' and start_h != 12:
+                        start_h += 12
+                    elif start_ampm == 'AM' and start_h == 12:
+                        start_h = 0
+                    if end_ampm == 'PM' and end_h != 12:
+                        end_h += 12
+                    elif end_ampm == 'AM' and end_h == 12:
+                        end_h = 0
+
+                    return {
+                        'start': date.replace(hour=start_h, minute=start_m, second=0, microsecond=0),
+                        'end': date.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+                    }
+            else:
+                # Handle format "10:00-17:00" or "10:00 - 17:00"
+                parts = hours_str.replace(' ', '').split('-')
+                if len(parts) == 2:
+                    start_h, start_m = map(int, parts[0].split(':'))
+                    end_h, end_m = map(int, parts[1].split(':'))
+                    return {
+                        'start': date.replace(hour=start_h, minute=start_m, second=0, microsecond=0),
+                        'end': date.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+                    }
         except (ValueError, IndexError) as e:
             logger.warning(f"Failed to parse business hours '{day_hours}': {e}")
 
@@ -1070,21 +1119,42 @@ class UnifiedAppointmentService:
         self._business_hours_cache = {}
         return self._business_hours_cache
 
+    async def _get_clinic_timezone(self) -> Optional[str]:
+        """Get clinic timezone (from cache or database)"""
+        # Use pre-loaded timezone from warmup if available (avoids DB fetch)
+        if self._clinic_timezone:
+            return self._clinic_timezone
+
+        if not self.clinic_id:
+            return None
+
+        try:
+            result = self.healthcare_supabase.table('clinics').select('timezone').eq('id', self.clinic_id).single().execute()
+            if result.data and result.data.get('timezone'):
+                self._clinic_timezone = result.data['timezone']  # Cache for reuse
+                return self._clinic_timezone
+        except Exception as e:
+            logger.warning(f"Failed to fetch timezone for clinic {self.clinic_id}: {e}")
+
+        return None
+
     def _generate_time_slots(
         self,
         start: datetime,
         end: datetime,
         duration_minutes: int,
-        filter_past: bool = True
+        filter_past: bool = True,
+        clinic_timezone: str = None
     ) -> List[datetime]:
         """
         Generate potential appointment time slots.
 
         Args:
-            start: Start time for slot generation
-            end: End time for slot generation
+            start: Start time for slot generation (in clinic local time)
+            end: End time for slot generation (in clinic local time)
             duration_minutes: Duration of each slot
             filter_past: If True, skip slots in the past (default: True)
+            clinic_timezone: Clinic timezone string (e.g., 'Europe/Moscow')
 
         Returns:
             List of available slot start times
@@ -1095,12 +1165,29 @@ class UnifiedAppointmentService:
 
         # Get current time with buffer for realistic booking
         # Add 30 minutes buffer - can't book an appointment starting in 5 minutes
-        now = datetime.now()
-        min_booking_time = now + timedelta(minutes=30)
+        if filter_past:
+            try:
+                from zoneinfo import ZoneInfo
+                # Get current time in clinic timezone for proper comparison
+                tz = ZoneInfo(clinic_timezone) if clinic_timezone else None
+                if tz:
+                    # Get current time in clinic timezone
+                    now_utc = datetime.now(ZoneInfo('UTC'))
+                    now_local = now_utc.astimezone(tz).replace(tzinfo=None)
+                else:
+                    now_local = datetime.now()
+                min_booking_time = now_local + timedelta(minutes=30)
+                logger.debug(f"Slot filter: now_local={now_local.strftime('%H:%M')}, min_booking={min_booking_time.strftime('%H:%M')}, tz={clinic_timezone}")
+            except Exception as e:
+                logger.warning(f"Timezone handling failed, using server time: {e}")
+                now_local = datetime.now()
+                min_booking_time = now_local + timedelta(minutes=30)
+        else:
+            min_booking_time = None
 
         while current + duration <= end:
             # Skip slots in the past (with buffer)
-            if filter_past and current < min_booking_time:
+            if filter_past and min_booking_time and current < min_booking_time:
                 current += duration
                 continue
             slots.append(current)
