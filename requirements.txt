@@ -29,7 +29,7 @@ zstandard>=0.22.0  # Compression for Redis cache - flexible version
 
 # Observability
 prometheus-client==0.19.0
-langfuse==2.57.2
+langfuse>=3.10.0
 
 # LLM Providers (native clients - not LangChain wrappers)
 openai==1.58.1
