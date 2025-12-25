@@ -7,11 +7,11 @@ starlette>=0.49.1  # Explicit pin for CVE fixes
 
 # Database
 supabase==2.15.0
-gotrue==2.11.0  # Pin to avoid pip resolution-too-deep with pytest-mock
+gotrue==2.12.4  # Upgraded for httpx 0.28+ compatibility
 asyncpg==0.29.0
 
 # HTTP Client
-httpx==0.27.2  # Downgrade for gotrue 2.11.0 compatibility (requires <0.28)
+httpx==0.28.1
 requests==2.32.4  # CVE-2024-47081
 
 # Pydantic
