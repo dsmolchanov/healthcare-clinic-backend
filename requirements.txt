@@ -7,6 +7,7 @@ starlette>=0.49.1  # Explicit pin for CVE fixes
 
 # Database
 supabase==2.15.0
+gotrue==2.11.0  # Pin to avoid pip resolution-too-deep with pytest-mock
 asyncpg==0.29.0
 
 # HTTP Client
