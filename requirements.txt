@@ -50,10 +50,9 @@ markdown==3.5.1
 tiktoken==0.8.0
 
 # Google Calendar Integration
-google-api-python-client==2.150.0
-google-auth==2.40.0
-google-auth-oauthlib==1.2.1
-google-auth-httplib2==0.2.0
+google-api-python-client==2.187.0
+google-auth==2.45.0
+google-auth-httplib2==0.3.0
 
 # Microsoft Graph SDK for Outlook Calendar
 msgraph-sdk==1.15.0
