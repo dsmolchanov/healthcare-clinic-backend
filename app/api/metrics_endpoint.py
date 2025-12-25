@@ -88,7 +88,6 @@ async def health_check():
         'status': status,
         'cache_hit_rate': cache_hit_rate,
         'errors': error_rate,
-        'mem0_queue_size': summary['mem0']['queue_size'],
         'memory': {
             'used_mb': round(memory_mb, 1),
             'percent': round(memory_percent, 1),
