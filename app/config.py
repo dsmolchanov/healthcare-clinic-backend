@@ -22,6 +22,14 @@ MESSAGE_HISTORY_MAX_TOKENS = int(os.getenv("MESSAGE_HISTORY_MAX_TOKENS", "4000")
 # Lanes that use LangGraph routing (SCHEDULING/COMPLEX flows)
 LANGGRAPH_ENABLED_LANES = ["SCHEDULING", "COMPLEX"]
 
+# WhatsApp webhook routing (Phase 3b)
+# When True, prefer token-based routing for new integrations
+# Legacy instance-name routing remains available for backwards compatibility
+USE_TOKEN_BASED_ROUTING = os.getenv("USE_TOKEN_BASED_ROUTING", "true").lower() == "true"
+
+# Log deprecation warning for legacy routing
+LOG_LEGACY_WEBHOOK_USAGE = os.getenv("LOG_LEGACY_WEBHOOK_USAGE", "true").lower() == "true"
+
 
 def get_redis_client() -> Redis:
     """

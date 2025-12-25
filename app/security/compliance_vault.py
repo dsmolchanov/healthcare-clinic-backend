@@ -51,17 +51,35 @@ class ComplianceVault:
 
     def _derive_app_key(self) -> bytes:
         """Derive application encryption key from master secret"""
-        master_secret = os.getenv('MASTER_ENCRYPTION_SECRET', 'change-this-in-production').encode()
-        salt = os.getenv('ENCRYPTION_SALT', 'change-this-salt').encode()
+        master_secret = os.getenv('MASTER_ENCRYPTION_SECRET')
+        salt = os.getenv('ENCRYPTION_SALT')
+
+        # SECURITY: No defaults allowed - these must be properly configured
+        if not master_secret or not salt:
+            raise ValueError(
+                "MASTER_ENCRYPTION_SECRET and ENCRYPTION_SALT must be set. "
+                "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+
+        # Reject known insecure defaults
+        if master_secret in ("change-this-in-production", "") or salt in ("change-this-salt", ""):
+            raise ValueError(
+                "MASTER_ENCRYPTION_SECRET and ENCRYPTION_SALT cannot use insecure defaults. "
+                "Generate secure values with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+
+        # Minimum length validation (defense in depth - also validated in startup_validation.py)
+        if len(master_secret) < 32 or len(salt) < 32:
+            raise ValueError("Encryption secrets must be at least 32 characters")
 
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=salt,
+            salt=salt.encode(),
             iterations=100000,
             backend=default_backend()
         )
-        return base64.urlsafe_b64encode(kdf.derive(master_secret))
+        return base64.urlsafe_b64encode(kdf.derive(master_secret.encode()))
 
     async def store_calendar_credentials(
         self,

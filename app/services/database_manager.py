@@ -5,6 +5,7 @@ Manages connections to separate main and healthcare databases with PHI protectio
 
 import os
 import logging
+from datetime import datetime
 from typing import Optional, Dict, Any, Union
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -398,10 +399,28 @@ class DatabaseManager:
             client = self.get_client(DatabaseType.HEALTHCARE)
             client.table('audit.phi_access_log').insert(audit_entry).execute()
         except Exception as e:
-            logger.error(f"Failed to log PHI access: {e}")
-            # Don't fail the operation if audit logging fails
-            # but alert monitoring system
-            self._alert_audit_failure(audit_entry, str(e))
+            logger.critical(f"HIPAA: Primary audit logging failed: {e}")
+
+            # Fallback to local queue - NEVER silently fail
+            try:
+                from app.services.audit_fallback import get_audit_fallback
+                fallback = get_audit_fallback()
+                await fallback.queue_audit_event({
+                    "operation": operation,
+                    "table_name": table_name,
+                    "record_id": record_id,
+                    "metadata": metadata or {},
+                    "user_id": audit_entry.get("user_id"),
+                    "user_role": audit_entry.get("user_role"),
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "error": str(e),
+                })
+                logger.warning("HIPAA: Audit event queued to fallback. Will retry.")
+            except Exception as fallback_error:
+                # Both primary and fallback failed - MUST fail operation
+                logger.critical(f"HIPAA VIOLATION: Both audit paths failed: {fallback_error}")
+                self._alert_audit_failure(audit_entry, str(e))
+                raise RuntimeError(f"PHI access audit logging failed: {e}") from e
 
     def _alert_audit_failure(self, audit_entry: Dict, error: str):
         """Alert when audit logging fails"""

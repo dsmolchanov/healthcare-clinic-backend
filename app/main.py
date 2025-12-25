@@ -18,7 +18,8 @@ import httpx
 # Apply runtime patches before additional imports that rely on OpenAI client setup.
 import app.patches.openai_httpx_fix  # noqa: E402,F401
 
-from supabase import create_client, Client
+# Supabase client - use canonical database module
+from app.database import get_healthcare_client
 # from app.api import quick_onboarding_router  # Disabled - using RPC version instead
 from app.api import quick_onboarding_rpc
 from app.api import multimodal_upload
@@ -27,6 +28,17 @@ from app.middleware.rate_limiter import webhook_limiter
 
 # Load environment variables FIRST before importing modules that need them
 load_dotenv()
+
+# Validate environment configuration (Phase 1 security - fail fast on bad config)
+# Note: Currently logs warning but doesn't exit to avoid breaking existing deployments
+# TODO: Enable validate_or_exit() after all secrets are properly configured in Fly.io
+from app.startup_validation import validate_environment
+if not validate_environment():
+    import logging as _log
+    _log.getLogger(__name__).warning(
+        "Environment validation failed - some features may not work. "
+        "See logs above for details."
+    )
 
 # Import message processor at module level AFTER dotenv load
 # NOTE: multilingual_message_processor is deprecated - use app.schemas.messages for MessageRequest
@@ -62,40 +74,10 @@ async def warmup_services(client: httpx.AsyncClient):
             logger.warning("Warmup timed out after 5s, continuing startup")
 
 
-# Get Supabase credentials
-supabase_url = os.getenv("SUPABASE_URL")
-supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-
-# Check if credentials are properly set
-if not supabase_url:
-    logger.error("SUPABASE_URL not set in .env file")
-    raise ValueError("SUPABASE_URL is required")
-
-if not supabase_key or supabase_key == "eyJhbG.." or not supabase_key.startswith("eyJ"):
-    logger.error("Invalid or missing Supabase key. Please set SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY in .env file")
-    logger.info("You can find these keys in your Supabase project settings:")
-    logger.info("1. Go to https://supabase.com/dashboard")
-    logger.info("2. Select your project")
-    logger.info("3. Go to Settings > API")
-    logger.info("4. Copy the 'anon public' or 'service_role' key")
-    raise ValueError("Valid Supabase key is required")
-
-# Initialize Supabase client with healthcare schema
-try:
-    from supabase.client import ClientOptions
-
-    # Configure client to use healthcare schema
-    options = ClientOptions(
-        schema='healthcare',
-        auto_refresh_token=True,
-        persist_session=False
-    )
-
-    supabase: Client = create_client(supabase_url, supabase_key, options=options)
-    logger.info(f"Connected to Supabase: {supabase_url} (using healthcare schema)")
-except Exception as e:
-    logger.error(f"Failed to connect to Supabase: {e}")
-    raise
+# Initialize Supabase client using canonical database module
+# Credentials are validated by startup_validation.py
+supabase = get_healthcare_client()
+logger.info("Connected to Supabase (using healthcare schema via database.py)")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -280,13 +262,70 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down HIPAA compliance systems...")
     logger.info("Healthcare Backend shutdown complete")
 
-# Create FastAPI app
+# Create FastAPI app with enhanced OpenAPI configuration (Phase 5)
 app = FastAPI(
     title="Healthcare Clinics Backend",
+    description="""
+Voice agent platform for healthcare clinics.
+
+## Features
+- WhatsApp appointment booking
+- Multi-channel message processing
+- Calendar integration
+- HIPAA-compliant audit logging
+
+## Authentication
+Protected endpoints require Bearer token authentication.
+Use the Authorize button above to set your JWT token.
+""",
     version="1.0.0",
     lifespan=lifespan,
-    redirect_slashes=False  # Prevent HTTP redirects from HTTPS requests
+    redirect_slashes=False,  # Prevent HTTP redirects from HTTPS requests
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
+
+
+# Custom OpenAPI schema with security definitions (Phase 5)
+def custom_openapi():
+    """Generate custom OpenAPI schema with security schemes."""
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    from fastapi.openapi.utils import get_openapi
+
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+
+    # Add security schemes
+    openapi_schema["components"]["securitySchemes"] = {
+        "bearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": "Enter your JWT token"
+        }
+    }
+
+    # Add tags for better organization
+    openapi_schema["tags"] = [
+        {"name": "health", "description": "Health check endpoints"},
+        {"name": "messages", "description": "Message processing endpoints"},
+        {"name": "webhooks", "description": "Webhook handlers for external services"},
+        {"name": "appointments", "description": "Appointment management"},
+        {"name": "integrations", "description": "External service integrations"},
+    ]
+
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 # Configure CORS - explicitly allow production frontend
 origins = [

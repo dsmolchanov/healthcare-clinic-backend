@@ -1,0 +1,58 @@
+[project]
+name = "healthcare-backend"
+version = "1.0.0"
+description = "Healthcare clinic backend with voice agent support"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "TID",  # flake8-tidy-imports (for banned-api)
+]
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+]
+
+# Ban direct supabase imports - enforce using database.py
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"supabase.create_client".msg = "Use app.database.get_healthcare_client() instead. See database.py docstring."
+"supabase.create_async_client".msg = "Use app.database.get_healthcare_client_async() instead. See database.py docstring."
+
+[tool.ruff.lint.per-file-ignores]
+"app/database.py" = ["TID251"]  # Allow create_client only in database.py
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+markers = [
+    "integration: marks tests as integration tests (may hit real services)",
+    "unit: marks tests as unit tests (fully mocked)",
+    "slow: marks tests as slow (>5s)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+    "app/__pycache__/*",
+    "app/*/tests/*",
+    "app/_archive/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
