@@ -262,7 +262,8 @@ class MessageRouter:
             metadata.setdefault('phone_number', metadata['from_number'])
             metadata.setdefault('from', metadata['from_number'])
         try:
-            from app.api.multilingual_message_processor import handle_process_message, MessageRequest
+            from app.api.pipeline_message_processor import handle_process_message
+            from app.schemas.messages import MessageRequest
 
             # Build request
             from_phone = (

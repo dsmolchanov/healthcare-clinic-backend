@@ -41,9 +41,8 @@ if not validate_environment():
     )
 
 # Import message processor at module level AFTER dotenv load
-# NOTE: multilingual_message_processor is deprecated - use app.schemas.messages for MessageRequest
-# handle_process_message still required for legacy /process-message endpoint
-from app.api.multilingual_message_processor import handle_process_message
+# NOTE: Using pipeline_message_processor (multilingual_message_processor is deprecated and removed)
+from app.api.pipeline_message_processor import handle_process_message
 from app.schemas.messages import MessageRequest
 
 # Configure centralized logging (container-aware: no timestamps in Docker/Fly.io)
