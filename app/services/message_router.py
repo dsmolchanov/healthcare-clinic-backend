@@ -73,6 +73,10 @@ class MessageRouter:
     """
     Dual-lane message router for optimized text/voice handling
     Routes text directly to LangGraph for <500ms responses
+
+    Phase 3: Unified voice processing
+    - Voice can optionally route through same LangGraph as text
+    - Enable with UNIFIED_VOICE_GRAPH=true
     """
 
     def __init__(
@@ -101,6 +105,14 @@ class MessageRouter:
         self.enable_metrics = enable_metrics
         self.use_direct_processing = langgraph_url == "direct"  # Flag for direct mode
 
+        # Phase 3: Unified voice graph - route voice through same LangGraph as text
+        self.enable_unified_voice = os.getenv("UNIFIED_VOICE_GRAPH", "true").lower() == "true"
+        self._voice_adapters: Dict[str, Any] = {}  # Cache adapters per clinic
+        if self.enable_unified_voice:
+            logger.info("✅ Unified voice graph enabled - voice uses same LangGraph as text")
+        else:
+            logger.info("⚠️ Unified voice graph disabled - voice routes to LiveKit API")
+
         # Phase 8: Initialize fast-path intent router
         self.intent_router = IntentRouter()
         logger.info("✅ Fast-path intent router initialized")
@@ -121,10 +133,12 @@ class MessageRouter:
         self.metrics = {
             "text_latencies": [],
             "voice_latencies": [],
+            "unified_voice_latencies": [],  # Phase 3: Track unified voice
             "routing_decisions": {},
             "fast_path_hits": 0,  # Phase 8: Track fast-path usage
             "direct_lane_hits": 0,  # Phase 9: Track direct lane usage
             "direct_lane_fallbacks": 0,  # Phase 9: Track fallbacks to LangGraph
+            "unified_voice_hits": 0,  # Phase 3: Track unified voice usage
             "total_messages": 0
         }
 
@@ -365,6 +379,112 @@ class MessageRouter:
                 "error": str(e)
             }, latency_ms
 
+    async def _get_voice_adapter(self, clinic_id: str):
+        """
+        Get or create voice adapter for clinic.
+
+        Lazy-loads adapters and caches them per clinic for reuse.
+        """
+        if clinic_id not in self._voice_adapters:
+            from app.services.voice import LangGraphVoiceAdapter
+            self._voice_adapters[clinic_id] = LangGraphVoiceAdapter(clinic_id=clinic_id)
+            logger.info(f"Created voice adapter for clinic {clinic_id}")
+        return self._voice_adapters[clinic_id]
+
+    async def route_to_unified_graph(
+        self,
+        session_id: str,
+        message: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Tuple[Dict[str, Any], float]:
+        """
+        Route voice through unified LangGraph (Phase 3).
+
+        Uses the same LangGraph as text channels, enabling:
+        - Same orchestration logic for voice + text
+        - Same tools and agents
+        - Unified session state
+
+        This is the preferred voice routing when UNIFIED_VOICE_GRAPH=true.
+
+        Args:
+            session_id: Session ID
+            message: Transcribed text from voice
+            metadata: Optional metadata (must include clinic_id)
+
+        Returns:
+            Tuple of (response, latency_ms)
+        """
+        start_time = time.perf_counter()
+        metadata = metadata or {}
+
+        clinic_id = metadata.get("clinic_id", "default")
+
+        try:
+            adapter = await self._get_voice_adapter(clinic_id)
+
+            # Get full response (non-streaming for message router)
+            result = await adapter.get_response(
+                message=message,
+                session_id=session_id,
+                metadata={
+                    "channel": "voice",
+                    **metadata,
+                }
+            )
+
+            latency_ms = (time.perf_counter() - start_time) * 1000
+
+            if self.enable_metrics:
+                self.metrics["unified_voice_latencies"].append(latency_ms)
+                self.metrics["unified_voice_hits"] += 1
+
+            logger.info(f"Unified voice response in {latency_ms:.2f}ms")
+
+            return result, latency_ms
+
+        except Exception as e:
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            logger.error(f"Unified voice error: {e}", exc_info=True)
+
+            # Fall back to LiveKit if unified graph fails
+            logger.warning("Falling back to LiveKit API")
+            return await self.route_to_livekit(
+                session_id, message, MessageType.VOICE, metadata
+            )
+
+    async def stream_voice_response(
+        self,
+        message: str,
+        session_id: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Stream voice response tokens.
+
+        This is the streaming API for voice services that need
+        real-time token delivery (e.g., for TTS latency optimization).
+
+        Args:
+            message: Transcribed text from voice
+            session_id: Session ID
+            metadata: Optional metadata (must include clinic_id)
+
+        Yields:
+            StreamingResponse chunks with token content
+        """
+        metadata = metadata or {}
+        clinic_id = metadata.get("clinic_id", "default")
+
+        adapter = await self._get_voice_adapter(clinic_id)
+
+        async for chunk in adapter.stream_response(
+            message=message,
+            session_id=session_id,
+            metadata=metadata,
+        ):
+            yield chunk
+
     async def route_message(
         self,
         message: str,
@@ -515,10 +635,19 @@ class MessageRouter:
             response["latency_ms"] = latency
 
         elif route == RoutingDecision.LIVEKIT_VOICE:
-            response, latency = await self.route_to_livekit(
-                session_id, message, message_type, metadata
-            )
-            response["routing_path"] = "livekit_voice"
+            # Phase 3: Use unified graph for voice when enabled
+            if self.enable_unified_voice and message_type == MessageType.TEXT:
+                # Voice with transcribed text → unified LangGraph
+                response, latency = await self.route_to_unified_graph(
+                    session_id, message, metadata
+                )
+                response["routing_path"] = "unified_voice_graph"
+            else:
+                # Raw voice/voice notes → LiveKit API for processing
+                response, latency = await self.route_to_livekit(
+                    session_id, message, message_type, metadata
+                )
+                response["routing_path"] = "livekit_voice"
             response["latency_ms"] = latency
 
         elif route == RoutingDecision.HYBRID:
@@ -574,6 +703,10 @@ class MessageRouter:
             index = int(len(sorted_latencies) * 0.95)
             return sorted_latencies[min(index, len(sorted_latencies) - 1)]
 
+        # Phase 3: Calculate unified voice stats
+        unified_voice_avg = sum(self.metrics["unified_voice_latencies"]) / len(self.metrics["unified_voice_latencies"]) \
+            if self.metrics["unified_voice_latencies"] else 0
+
         return {
             "total_messages": self.metrics["total_messages"],
             "routing_decisions": self.metrics["routing_decisions"],
@@ -587,6 +720,16 @@ class MessageRouter:
                 "p95_ms": calculate_p95(self.metrics["voice_latencies"]),
                 "count": len(self.metrics["voice_latencies"])
             },
+            # Phase 3: Unified voice metrics
+            "unified_voice_latency": {
+                "avg_ms": unified_voice_avg,
+                "p95_ms": calculate_p95(self.metrics["unified_voice_latencies"]),
+                "count": len(self.metrics["unified_voice_latencies"]),
+                "hits": self.metrics["unified_voice_hits"],
+            },
+            "fast_path_hits": self.metrics["fast_path_hits"],
+            "direct_lane_hits": self.metrics["direct_lane_hits"],
+            "direct_lane_fallbacks": self.metrics["direct_lane_fallbacks"],
             "target_met": text_avg < 500 if text_avg > 0 else False
         }
 

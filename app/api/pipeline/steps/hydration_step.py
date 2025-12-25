@@ -64,11 +64,11 @@ class ContextHydrationStep(PipelineStep):
             is_new_conversation=ctx.is_new_session
         )
 
-        # Unpack clinic context
-        ctx.clinic_profile = context.get('clinic', {})
-        ctx.clinic_services = context.get('services', [])
-        ctx.clinic_doctors = context.get('doctors', [])
-        ctx.clinic_faqs = context.get('faqs', [])
+        # Unpack clinic context (coerce None to empty list for safety)
+        ctx.clinic_profile = context.get('clinic') or {}
+        ctx.clinic_services = context.get('services') or []
+        ctx.clinic_doctors = context.get('doctors') or []
+        ctx.clinic_faqs = context.get('faqs') or []
 
         # Unpack patient context
         ctx.patient_profile = context.get('patient', {})

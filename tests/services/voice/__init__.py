@@ -1,0 +1,1 @@
+"""Voice adapter tests."""
