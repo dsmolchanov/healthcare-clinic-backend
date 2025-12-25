@@ -413,8 +413,17 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         # Try LLM-based tool calling first if factory is available
         if self.llm_factory:
             try:
-                # Import tool definitions
-                from app.tools.tool_definitions import APPOINTMENT_BOOKING_TOOL, PRICE_QUERY_TOOL
+                # Import canonical schemas (replaces tool_definitions.py)
+                from app.services.orchestrator.tools.canonical_schemas import (
+                    get_openai_tool_schema,
+                    validate_tool_call,
+                    BookAppointmentInput,
+                    QueryPricesInput,
+                )
+
+                # Get OpenAI tool schemas from canonical Pydantic models
+                appointment_tool_schema = get_openai_tool_schema("book_appointment")
+                price_tool_schema = get_openai_tool_schema("query_prices")
 
                 # Prepare messages with appointment context
                 messages = [
@@ -422,40 +431,52 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
                         "role": "system",
                         "content": (
                             "You are a medical appointment assistant. Use tools to book appointments and check pricing. "
-                            "Always extract appointment details (date, time, service type) before booking."
+                            "Always extract appointment details (date, time, service type) before booking. "
+                            f"Patient ID is: {state.get('patient_id')} - use this for bookings."
                         )
                     },
                     {"role": "user", "content": state['message']}
                 ]
 
-                # Call LLM with tools
+                # Call LLM with tools (schemas auto-generated from Pydantic)
                 response = await self.llm_factory.generate_with_tools(
                     messages=messages,
-                    tools=[APPOINTMENT_BOOKING_TOOL, PRICE_QUERY_TOOL],
+                    tools=[appointment_tool_schema, price_tool_schema],
                     model=self.primary_model,
                     temperature=0.3  # Lower temp for tool calling accuracy
                 )
 
-                # Execute tools if called
+                # Execute tools if called - with Pydantic validation
                 if response.tool_calls:
                     for tool_call in response.tool_calls:
-                        if tool_call.name == "query_service_prices":
-                            # Execute price query
+                        if tool_call.name == "query_prices" or tool_call.name == "query_service_prices":
+                            # Validate and execute price query
                             if self.price_query_tool:
+                                validated = validate_tool_call("query_prices", tool_call.arguments)
                                 result = await self.price_query_tool.get_services_by_query(
-                                    query=tool_call.arguments.get('query'),
-                                    limit=5
+                                    query=validated.query,
+                                    category=validated.category,
+                                    limit=validated.limit
                                 )
                                 state['metadata']['tool_results'] = result
 
                         elif tool_call.name == "book_appointment" and self.appointment_tools:
-                            # Execute booking
+                            # Inject patient_id from session context (Semantic Adapter pattern)
+                            args = dict(tool_call.arguments)
+                            if not args.get('patient_id'):
+                                args['patient_id'] = state.get('patient_id')
+
+                            # Validate arguments against canonical schema
+                            validated = validate_tool_call("book_appointment", args)
+
+                            # Execute booking with validated Pydantic model
                             booking_result = await self.appointment_tools.book_appointment(
-                                patient_id=state.get('patient_id'),
-                                doctor_id=tool_call.arguments.get('doctor_id'),
-                                appointment_datetime=tool_call.arguments.get('datetime'),
-                                appointment_type=tool_call.arguments.get('service_type'),
-                                notes=tool_call.arguments.get('notes')
+                                patient_id=validated.patient_id,
+                                doctor_id=validated.doctor_id,
+                                datetime_str=validated.datetime_str,
+                                appointment_type=validated.appointment_type,
+                                duration_minutes=validated.duration_minutes,
+                                notes=validated.notes
                             )
                             state['metadata']['booking_result'] = booking_result
 
@@ -1650,15 +1671,30 @@ Respond with ONLY one word: scheduling, info, or exit"""
 
     async def executor_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
         """
-        Execute action plan step by step.
+        Execute action plan step by step with semantic adaptation.
 
         This node:
         1. Gets next step from plan
-        2. Checks if step requires confirmation
-        3. If confirmation needed, creates ActionProposal and pauses
-        4. If no confirmation needed, executes step
-        5. Handles errors and replanning triggers
+        2. Adapts arguments using SemanticAdapter (name→UUID, natural date→ISO)
+        3. Validates arguments against canonical schema
+        4. Checks if step requires confirmation
+        5. If confirmation needed, creates ActionProposal and pauses
+        6. If no confirmation needed, executes step
+        7. Handles errors and replanning triggers
+
+        Enhanced with Semantic Adapter (per Opinion 3):
+        - Doctor names resolved to UUIDs
+        - Natural language dates parsed to ISO format
+        - Patient IDs injected from session context
         """
+        # Import semantic adapter and validation
+        from app.services.orchestrator.tools.semantic_adapter import (
+            SemanticAdapter,
+            adapt_tool_arguments,
+        )
+        from app.services.orchestrator.tools.canonical_schemas import validate_tool_call
+        from pydantic import ValidationError
+
         logger.info(f"[executor] Starting - session: {state.get('session_id', 'unknown')[:8]}")
         logger.info(f"[executor] State keys: {list(state.keys())}")
 
@@ -1668,6 +1704,14 @@ Respond with ONLY one word: scheduling, info, or exit"""
             # Generate a response explaining we need more context
             state['response'] = state.get('response', "I'll help you book an appointment. What service do you need?")
             return state
+
+        # Create SemanticAdapter for this execution context
+        adapter = SemanticAdapter(
+            clinic_id=state.get('metadata', {}).get('clinic_id', ''),
+            context=state.get('context', {}),
+            supabase_client=self.supabase if hasattr(self, 'supabase') else None,
+            clinic_timezone=state.get('metadata', {}).get('clinic_timezone', 'UTC'),
+        )
 
         completed_steps = state.get('plan_completed_steps', [])
         steps = plan.get('steps', [])
@@ -1693,14 +1737,27 @@ Respond with ONLY one word: scheduling, info, or exit"""
                 state['user_confirmed'] = False  # Reset for next confirmation
                 state['awaiting_confirmation'] = False
             else:
-                # Need confirmation - create proposal
+                # Adapt arguments before creating proposal (for display and later execution)
+                raw_args = next_step.get('arguments', {})
+                try:
+                    adapted_args = await adapt_tool_arguments(
+                        tool_name=step_name,
+                        raw_arguments=raw_args,
+                        adapter=adapter,
+                    )
+                    logger.debug(f"[executor] Adapted args for confirmation: {adapted_args}")
+                except Exception as e:
+                    logger.warning(f"[executor] Failed to adapt args for confirmation: {e}")
+                    adapted_args = raw_args
+
+                # Need confirmation - create proposal with adapted arguments
                 proposal = ActionProposal(
                     type=ActionProposalType.BOOK_APPOINTMENT,  # Adjust based on step
-                    patient_id=state.get('patient_id', ''),
-                    provider_id=next_step.get('arguments', {}).get('doctor_id'),
-                    slot=next_step.get('arguments', {}).get('slot'),
+                    patient_id=adapted_args.get('patient_id', state.get('patient_id', '')),
+                    provider_id=adapted_args.get('doctor_id'),
+                    slot=adapted_args.get('datetime_str') or adapted_args.get('slot'),
                     human_summary=next_step.get('description', 'Complete the action'),
-                    execution_params=next_step.get('arguments', {}),
+                    execution_params=adapted_args,  # Use adapted arguments
                     ttl_seconds=1800,  # 30 minute TTL
                 )
 
@@ -1720,6 +1777,7 @@ Respond with ONLY one word: scheduling, info, or exit"""
                     "timestamp": datetime.utcnow().isoformat(),
                     "step": step_name,
                     "awaiting_confirmation": True,
+                    "adapted_args": list(adapted_args.keys()),
                 })
 
                 return state
@@ -1730,8 +1788,33 @@ Respond with ONLY one word: scheduling, info, or exit"""
             tool = self._get_tool_for_step(next_step)
 
             if tool:
-                arguments = next_step.get('arguments', {})
-                result = await tool(**arguments)
+                # Get raw arguments from plan
+                raw_arguments = next_step.get('arguments', {})
+
+                # Step 1: Adapt arguments using SemanticAdapter
+                # This resolves: doctor names → UUIDs, natural dates → ISO, injects patient_id
+                adapted_arguments = await adapt_tool_arguments(
+                    tool_name=step_name,
+                    raw_arguments=raw_arguments,
+                    adapter=adapter,
+                )
+                logger.info(f"[executor] Adapted arguments for {step_name}: {list(adapted_arguments.keys())}")
+
+                # Step 2: Validate against canonical schema (catches mismatches before runtime)
+                try:
+                    validated_input = validate_tool_call(step_name, adapted_arguments)
+                    # Convert Pydantic model to dict for tool execution
+                    validated_args = validated_input.model_dump(exclude_none=True)
+                    logger.debug(f"[executor] Validated args: {validated_args}")
+                except ValidationError as ve:
+                    # Schema mismatch caught at validation, not runtime
+                    logger.error(f"[executor] Validation failed for {step_name}: {ve}")
+                    state['plan_execution_error'] = f"Invalid arguments for {step_name}: {ve.error_count()} validation errors"
+                    state['plan_failed_step'] = step_name
+                    return state
+
+                # Step 3: Execute tool with validated arguments
+                result = await tool(**validated_args)
 
                 # Store result
                 if not state.get('plan_results'):
@@ -1746,6 +1829,12 @@ Respond with ONLY one word: scheduling, info, or exit"""
             else:
                 logger.warning(f"[executor] No tool found for {step_name}")
                 state['plan_execution_error'] = f"Tool not found: {step_name}"
+
+        except ValidationError as ve:
+            # Catch any validation errors that slip through
+            logger.error(f"[executor] Validation error in {step_name}: {ve}")
+            state['plan_execution_error'] = f"Validation error: {ve}"
+            state['plan_failed_step'] = step_name
 
         except Exception as e:
             logger.error(f"[executor] Step {step_name} failed: {e}")
