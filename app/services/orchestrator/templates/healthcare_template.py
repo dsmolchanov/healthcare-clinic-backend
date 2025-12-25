@@ -239,10 +239,11 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         # NEW: Supervisor node replaces fragmented routing (Phase 3)
         workflow.add_node("supervisor", self.supervisor_node)
 
-        # Specialized agent nodes
-        workflow.add_node("info_agent", self.info_agent_node)  # Combines faq_lookup + price_query
-        # Note: Legacy nodes (appointment_handler, price_query, faq_lookup, insurance_verify)
-        # were removed - Phase 2 uses planner/executor for scheduling, info_agent for queries
+        # Specialized agent nodes - split into dynamic (tools) and static (cached FAQ)
+        workflow.add_node("dynamic_info_agent", self.dynamic_info_agent_node)  # Uses tools for prices/availability
+        workflow.add_node("static_info_agent", self.static_info_agent_node)  # Fast-path for cached FAQ
+        # Note: Legacy nodes (appointment_handler, price_query, faq_lookup, insurance_verify, info_agent)
+        # were replaced - Phase 2 uses planner/executor for scheduling, dynamic/static info agents for queries
 
         # ==============================================
         # Phase 2: Enhanced flow with guardrail FIRST
@@ -294,12 +295,14 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         workflow.add_edge("phi_check", "supervisor")
 
         # Supervisor routing (replaces intent_classify routing)
+        # Updated: 4-way routing with static_info vs dynamic_info split
         workflow.add_conditional_edges(
             "supervisor",
             self.supervisor_router,
             {
                 "scheduling": "planner",  # Phase 2: Plan-then-Execute for scheduling
-                "info": "info_agent",
+                "dynamic_info": "dynamic_info_agent",  # New: uses tools for price/availability
+                "static_info": "static_info_agent",  # New: fast-path for cached FAQ
                 "exit": "phi_redact",
             }
         )
@@ -325,7 +328,10 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         # ==============================================
         # Agent flows
         # ==============================================
-        workflow.add_edge("info_agent", "process")
+        # Dynamic info agent uses tools, then goes to process for response generation
+        workflow.add_edge("dynamic_info_agent", "process")
+        # Static info agent is fast-path, goes directly to phi_redact (response already set)
+        workflow.add_edge("static_info_agent", "phi_redact")
 
         # FIX: Insert phi_redact BETWEEN process and generate_response
         # This avoids conflicting edges from generate_response
@@ -439,11 +445,13 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
                 ]
 
                 # Call LLM with tools (schemas auto-generated from Pydantic)
+                # tool_choice='required' forces tool use for scheduling accuracy
                 response = await self.llm_factory.generate_with_tools(
                     messages=messages,
                     tools=[appointment_tool_schema, price_tool_schema],
                     model=self.primary_model,
-                    temperature=0.3  # Lower temp for tool calling accuracy
+                    temperature=0.3,  # Lower temp for tool calling accuracy
+                    tool_choice='required'  # FORCE tool use - don't let LLM skip to text
                 )
 
                 # Execute tools if called - with Pydantic validation
@@ -906,6 +914,202 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
 
         return state
 
+    async def dynamic_info_agent_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Handle dynamic info queries using LLM tool calling.
+
+        Forces tool_choice='required' to ensure backend truth is fetched.
+        Tools: query_prices (read-only)
+
+        This replaces pure-text responses for queries that need live data.
+        """
+        logger.info(f"[dynamic_info_agent] Processing with tools - session: {state['session_id'][:8]}")
+
+        message = state.get('message', '')
+        language = state.get('detected_language', 'en')
+
+        # Build system prompt for tool selection
+        system_prompt = f"""You are a healthcare clinic assistant. Answer the user's question using the available tools.
+
+For pricing questions, use the query_prices tool to get accurate, up-to-date prices.
+Always respond in {language} language.
+
+Clinic context:
+{state.get('context', {}).get('clinic_profile', {})}
+"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": message}
+        ]
+
+        # Get price tool schema
+        try:
+            from app.services.orchestrator.tools.canonical_schemas import get_openai_tool_schema
+            price_tool_schema = get_openai_tool_schema("query_prices")
+            tools = [price_tool_schema]
+        except Exception as e:
+            logger.warning(f"[dynamic_info_agent] Failed to load tool schemas: {e}")
+            # Fall back to legacy info_agent behavior
+            await self.info_agent_node(state)
+            return state
+
+        tool_calls_count = 0
+
+        if self.llm_factory:
+            try:
+                response = await self.llm_factory.generate_with_tools(
+                    messages=messages,
+                    tools=tools,
+                    model=self.primary_model,
+                    temperature=0.3,
+                    tool_choice='required'  # FORCE tool use for accuracy
+                )
+
+                # Execute any tool calls
+                if response.tool_calls:
+                    tool_calls_count = len(response.tool_calls)
+                    for tool_call in response.tool_calls:
+                        result = await self._execute_dynamic_info_tool(tool_call, state)
+                        state['context']['tool_results'] = state['context'].get('tool_results', {})
+                        state['context']['tool_results'][tool_call.name] = result
+
+                    logger.info(f"[dynamic_info_agent] Executed {tool_calls_count} tool calls")
+
+                state['context']['dynamic_info_handled'] = True
+
+            except Exception as e:
+                logger.error(f"[dynamic_info_agent] Tool calling failed: {e}")
+                # Fallback to legacy enrichment pattern
+                await self.info_agent_node(state)
+        else:
+            # No LLM factory - use legacy pattern
+            await self.info_agent_node(state)
+
+        state['audit_trail'].append({
+            "node": "dynamic_info_agent",
+            "timestamp": datetime.utcnow().isoformat(),
+            "tool_calls": tool_calls_count,
+        })
+
+        return state
+
+    async def _execute_dynamic_info_tool(self, tool_call, state: HealthcareConversationState) -> dict:
+        """Execute a dynamic info tool call and return results."""
+        tool_name = tool_call.name
+        arguments = tool_call.arguments if hasattr(tool_call, 'arguments') else {}
+
+        logger.info(f"[dynamic_info_agent] Executing tool: {tool_name} with args: {arguments}")
+
+        if tool_name == "query_prices" and self.price_query_tool:
+            try:
+                result = await self.price_query_tool.get_services_by_query(
+                    query=arguments.get('query', state.get('message', '')),
+                    category=arguments.get('category'),
+                    limit=arguments.get('limit', 5)
+                )
+                # Store in context for process_node
+                state['context']['price_query'] = {
+                    'success': True,
+                    'results': result,
+                    'query': arguments.get('query', '')
+                }
+                return {'success': True, 'results': result}
+            except Exception as e:
+                logger.error(f"[dynamic_info_agent] Price query failed: {e}")
+                return {'success': False, 'error': str(e)}
+
+        logger.warning(f"[dynamic_info_agent] Unknown tool: {tool_name}")
+        return {'success': False, 'error': f'Unknown tool: {tool_name}'}
+
+    async def static_info_agent_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Fast-path for static FAQ queries.
+        Uses cached clinic profile, no LLM needed.
+
+        Handles: hours, location, phone, address, parking
+        Response is set directly from cached data.
+        """
+        logger.info(f"[static_info_agent] Fast-path processing - session: {state['session_id'][:8]}")
+
+        message = state.get('message', '').lower()
+        language = state.get('detected_language', 'en')
+        clinic = state.get('context', {}).get('clinic_profile', {})
+
+        response = None
+
+        # Check for hours query
+        if any(p in message for p in ['hours', 'open', 'close', 'when', 'horario', 'часы', 'работаете']):
+            hours = clinic.get('business_hours', clinic.get('hours', 'Please call for hours'))
+            templates = {
+                'en': f"Our hours are: {hours}",
+                'es': f"Nuestro horario es: {hours}",
+                'ru': f"Наши часы работы: {hours}",
+                'pt': f"Nosso horário é: {hours}",
+                'he': f"שעות הפעילות שלנו: {hours}",
+            }
+            response = templates.get(language, templates['en'])
+
+        # Check for location query
+        elif any(p in message for p in ['address', 'location', 'where', 'dirección', 'donde', 'адрес', 'где']):
+            address = clinic.get('address', clinic.get('location', 'Please call for address'))
+            templates = {
+                'en': f"We're located at: {address}",
+                'es': f"Estamos ubicados en: {address}",
+                'ru': f"Мы находимся по адресу: {address}",
+                'pt': f"Estamos localizados em: {address}",
+                'he': f"אנחנו נמצאים ב: {address}",
+            }
+            response = templates.get(language, templates['en'])
+
+        # Check for phone query
+        elif any(p in message for p in ['phone', 'call', 'number', 'teléfono', 'телефон', 'номер']):
+            phone = clinic.get('phone', clinic.get('phone_number', 'Please check our website'))
+            templates = {
+                'en': f"You can reach us at: {phone}",
+                'es': f"Puede contactarnos al: {phone}",
+                'ru': f"Наш телефон: {phone}",
+                'pt': f"Você pode nos ligar em: {phone}",
+                'he': f"ניתן ליצור קשר בטלפון: {phone}",
+            }
+            response = templates.get(language, templates['en'])
+
+        # Check for parking query
+        elif any(p in message for p in ['parking', 'park', 'estacionamiento', 'парковка']):
+            parking = clinic.get('parking_info', 'Free parking available on-site')
+            templates = {
+                'en': f"Parking information: {parking}",
+                'es': f"Información de estacionamiento: {parking}",
+                'ru': f"Информация о парковке: {parking}",
+            }
+            response = templates.get(language, templates['en'])
+
+        if response:
+            state['response'] = response
+            state['fast_path'] = True
+            state['lane'] = 'static_info'
+            logger.info(f"[static_info_agent] Fast-path response generated")
+        else:
+            # Fallback: try FAQ lookup
+            await self.faq_lookup_node(state)
+            faq_results = state.get('context', {}).get('faq_results', [])
+            if faq_results and faq_results[0].get('relevance_score', 0) > 0.5:
+                state['response'] = faq_results[0].get('answer', '')
+                state['fast_path'] = True
+                state['lane'] = 'static_info'
+            else:
+                # No cached answer found - should not happen if routing is correct
+                logger.warning(f"[static_info_agent] No static answer found for: {message[:50]}")
+                state['response'] = "I'm not sure about that. Would you like me to help you book an appointment instead?"
+
+        state['audit_trail'].append({
+            "node": "static_info_agent",
+            "timestamp": datetime.utcnow().isoformat(),
+            "fast_path": state.get('fast_path', False),
+        })
+
+        return state
+
     async def phi_redact_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
         """Redact PHI from response before sending"""
         logger.debug(f"PHI redaction - session: {state['session_id']}")
@@ -979,6 +1183,7 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
             return state
 
         # Few-shot supervisor prompt (reduces hallucination 10% -> <2%)
+        # Updated: 4-way routing to separate static FAQ from dynamic queries requiring tools
         supervisor_prompt = f"""You are a routing supervisor for a healthcare clinic assistant.
 
 Current state: {flow_state}
@@ -988,15 +1193,20 @@ CRITICAL RULE: If flow_state is "scheduling", user is in an active booking conve
 Short responses like "yes", "да", "ok", numbers, or times should STAY in scheduling.
 
 Route this message to the appropriate agent:
-- "scheduling" - Appointment booking, availability, rescheduling, cancellation, PAIN/SYMPTOMS (need to see doctor), OR any response while in scheduling flow
-- "info" - FAQ, pricing, hours, location, insurance, service details (only if NOT in scheduling flow and no symptoms)
+- "scheduling" - Appointment booking, rescheduling, cancellation, PAIN/SYMPTOMS (need to see doctor), OR any response while in scheduling flow
+- "dynamic_info" - Pricing queries, availability checks, "do you have X?", capacity questions (requires backend lookup)
+- "static_info" - Static FAQ: hours, location, phone, address, parking (cached clinic info)
 - "exit" - Explicit goodbyes like "bye", "до свидания", "thanks bye" (NOT simple "ok" or "да")
 
 EXAMPLES (follow these patterns):
-User: "How much is a filling?" -> info
-User: "What are your hours?" -> info
+User: "How much is a filling?" -> dynamic_info (needs price lookup)
+User: "What's the cost of a cleaning?" -> dynamic_info (needs price lookup)
+User: "Do you have availability tomorrow?" -> dynamic_info (needs availability check)
+User: "What are your hours?" -> static_info (cached in clinic profile)
+User: "Where are you located?" -> static_info (cached address)
+User: "What's your phone number?" -> static_info (cached phone)
 User: "I need to come in on Tuesday" -> scheduling
-User: "Do you have availability for a root canal next week?" -> scheduling (intent is booking)
+User: "I want to book an appointment" -> scheduling (intent is booking)
 User: "My tooth hurts" -> scheduling (pain = need to see doctor = booking)
 User: "У меня болит зуб" -> scheduling (Russian: my tooth hurts = needs appointment)
 User: "I'm in pain" -> scheduling (needs urgent appointment)
@@ -1005,16 +1215,16 @@ User: "Okay" (in scheduling flow) -> scheduling (continue current task)
 User: "Да" (in scheduling flow) -> scheduling (Russian "yes" - continue booking)
 User: "16" or "16:00" (in scheduling flow) -> scheduling (time selection)
 User: "Actually, never mind" -> exit
-User: "How much does a cleaning cost?" -> info
 User: "Can I book an appointment?" -> scheduling
-User: "What services do you offer?" -> info
+User: "What services do you offer?" -> dynamic_info (needs service list)
 User: "I want to cancel my appointment" -> scheduling
 User: "Да" or "Yes" (confirming offered slot) -> scheduling
 User: "острая боль" -> scheduling (acute pain = urgent appointment needed)
+User: "Сколько стоит?" -> dynamic_info (Russian: how much does it cost?)
 
 User message: {message}
 
-Respond with ONLY one word: scheduling, info, or exit"""
+Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
 
         if self.llm_factory:
             try:
@@ -1026,30 +1236,47 @@ Respond with ONLY one word: scheduling, info, or exit"""
                 )
 
                 decision = response.content.strip().lower()
-                # Clean up common variations
+                # Clean up common variations - order matters (check specific before general)
                 if "scheduling" in decision:
                     decision = "scheduling"
-                elif "info" in decision:
-                    decision = "info"
+                elif "dynamic_info" in decision or "dynamic" in decision:
+                    decision = "dynamic_info"
+                elif "static_info" in decision or "static" in decision:
+                    decision = "static_info"
                 elif "exit" in decision:
                     decision = "exit"
                 else:
-                    decision = "info"  # Safe fallback
+                    # Changed: default to dynamic_info (uses tools) instead of info (text-only)
+                    # This is safer for accuracy - better to call tools unnecessarily than miss data
+                    decision = "dynamic_info"
 
                 logger.info(f"[supervisor] Routing decision: {decision} for message: {message[:50]}...")
 
             except Exception as e:
-                logger.warning(f"Supervisor LLM call failed: {e}, defaulting to info")
-                decision = "info"
+                logger.warning(f"Supervisor LLM call failed: {e}, defaulting to dynamic_info")
+                decision = "dynamic_info"  # Changed: default to tool-using path
         else:
             # Fallback to keyword-based routing if no LLM factory
             message_lower = message.lower()
-            if any(word in message_lower for word in ['book', 'appointment', 'schedule', 'reschedule', 'cancel', 'availability', 'available']):
+
+            # Keywords for each routing decision
+            scheduling_keywords = ['book', 'appointment', 'schedule', 'reschedule', 'cancel', 'pain', 'hurts', 'болит']
+            price_keywords = ['price', 'cost', 'how much', 'cuanto', 'стоимость', 'сколько', 'fee', 'charge']
+            availability_keywords = ['available', 'availability', 'slot', 'opening', 'free', 'when can']
+            static_keywords = ['hours', 'location', 'address', 'phone', 'parking', 'где', 'адрес', 'часы']
+            exit_keywords = ['bye', 'goodbye', 'до свидания', 'thanks bye', 'adios']
+
+            if any(word in message_lower for word in scheduling_keywords):
                 decision = "scheduling"
-            elif any(word in message_lower for word in ['bye', 'thanks', 'thank you', 'goodbye', 'ok', 'okay']):
+            elif any(word in message_lower for word in price_keywords + availability_keywords):
+                decision = "dynamic_info"
+            elif any(word in message_lower for word in static_keywords):
+                decision = "static_info"
+            elif any(word in message_lower for word in exit_keywords):
                 decision = "exit"
             else:
-                decision = "info"
+                # Changed: default to dynamic_info (uses tools) for safety
+                decision = "dynamic_info"
             logger.info(f"[supervisor] Keyword-based routing: {decision}")
 
         state["next_agent"] = decision
@@ -1057,7 +1284,7 @@ Respond with ONLY one word: scheduling, info, or exit"""
         # Update flow_state based on decision
         if decision == "scheduling" and flow_state != FlowState.SCHEDULING.value:
             state["flow_state"] = FlowState.SCHEDULING.value
-        elif decision == "info" and flow_state not in [FlowState.SCHEDULING.value]:
+        elif decision in ["dynamic_info", "static_info"] and flow_state not in [FlowState.SCHEDULING.value]:
             state["flow_state"] = FlowState.INFO.value
 
         state['audit_trail'].append({
@@ -1071,7 +1298,8 @@ Respond with ONLY one word: scheduling, info, or exit"""
 
     def supervisor_router(self, state: HealthcareConversationState) -> str:
         """Route based on supervisor decision."""
-        return state.get("next_agent", "info")
+        # Default to dynamic_info (tool-using path) instead of info (text-only)
+        return state.get("next_agent", "dynamic_info")
 
     # ========================================================================
     # Phase 2: New Nodes - Guardrail, Language Detection, Session Init
