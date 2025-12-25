@@ -199,25 +199,6 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Failed to warm up WhatsApp cache: {e}")
         # Don't fail startup, will do DB lookups on first request
 
-    try:
-        from app.startup_warmup import warmup_mem0_vector_indices
-        mem0_timeout = float(os.getenv("MEM0_WARMUP_TIMEOUT_SECONDS", "6"))
-        summary = await asyncio.wait_for(
-            warmup_mem0_vector_indices(throttle_ms=75),
-            timeout=mem0_timeout
-        )
-        app.state.mem0_warmup_summary = summary
-        logger.info(
-            "✅ mem0 warmup scheduled %s/%s clinics (force=%s)",
-            summary.get("scheduled"),
-            summary.get("total"),
-            summary.get("force"),
-        )
-    except asyncio.TimeoutError:
-        logger.warning("mem0 warmup scheduling timed out after %.1fs; continuing startup", mem0_timeout)
-    except Exception as e:
-        logger.warning(f"Failed to warm up mem0 indices: {e}")
-
     yield
 
     # Shutdown
@@ -557,77 +538,6 @@ async def clear_doctor_cache(clinic_id: str):
         result = redis_client.delete(key)
         return {"success": True, "deleted": result, "key": key}
     return {"success": False, "error": "No Redis client"}
-
-@app.get("/debug/mem0")
-async def debug_mem0():
-    """Diagnostic endpoint for mem0 status"""
-    from app.memory.conversation_memory import get_memory_manager, ConversationMemoryManager
-    import os
-    import traceback
-
-    try:
-        mem_manager = get_memory_manager()
-
-        status = {
-            "mem0_available": mem_manager.mem0_available,
-            "memory_instance": str(type(mem_manager.memory)) if mem_manager.memory else None,
-            "openai_api_key_set": bool(os.environ.get('OPENAI_API_KEY')),
-            "qdrant_path": os.environ.get('QDRANT_PATH', '/app/qdrant_data'),
-        }
-
-        # Try to check if path exists
-        qdrant_path = os.environ.get('QDRANT_PATH', '/app/qdrant_data')
-        status["qdrant_path_exists"] = os.path.exists(qdrant_path)
-
-        if os.path.exists(qdrant_path):
-            status["qdrant_path_writable"] = os.access(qdrant_path, os.W_OK)
-            try:
-                status["qdrant_path_contents"] = os.listdir(qdrant_path)[:10]
-            except:
-                status["qdrant_path_contents"] = "ERROR: Cannot list"
-
-        # Try to initialize a fresh instance to see the actual error
-        if not mem_manager.mem0_available:
-            try:
-                # Try to initialize mem0 directly to capture the real error
-                from mem0 import Memory
-
-                mem0_config = {
-                    "llm": {
-                        "provider": "openai",
-                        "config": {
-                            "model": "gpt-4o-mini",
-                            "temperature": 0.1
-                        }
-                    },
-                    "embedder": {
-                        "provider": "openai",
-                        "config": {
-                            "model": "text-embedding-3-small"
-                        }
-                    },
-                    "vector_store": {
-                        "provider": "qdrant",
-                        "config": {
-                            "collection_name": "whatsapp_memories",
-                            # Use subdirectory to avoid mem0 trying to delete the volume mount point
-                            "path": os.path.join(os.environ.get('QDRANT_PATH', '/app/qdrant_data'), 'storage'),
-                            "embedding_model_dims": 1536
-                        }
-                    },
-                    "version": "v1.1"
-                }
-
-                test_memory = Memory.from_config(mem0_config)
-                status["test_init_error"] = "SUCCESS: mem0 initialized directly!"
-                status["test_memory_type"] = str(type(test_memory))
-            except Exception as init_e:
-                status["test_init_error"] = str(init_e)
-                status["test_init_traceback"] = traceback.format_exc()
-
-        return status
-    except Exception as e:
-        return {"error": str(e), "type": str(type(e)), "traceback": traceback.format_exc()}
 
 @app.get("/debug/memory")
 async def memory_stats():
@@ -1606,7 +1516,7 @@ async def process_message(request: Request):
         message_request = MessageRequest(**data)
         log_checkpoint("MODEL - Pydantic model created")
 
-        # Process message with AI (tools + mem0) - with timeout
+        # Process message with AI (tools) - with timeout
         logger.info("🤖 AI START - Calling handle_process_message")
         try:
             import asyncio
