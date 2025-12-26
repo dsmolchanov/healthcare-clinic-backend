@@ -30,6 +30,7 @@ async def run_evals():
     parser.add_argument("scenario_file", nargs="?", default="tests/evals/scenarios.yaml", help="Path to scenarios YAML file")
     parser.add_argument("--real-data", action="store_true", help="Run against real Supabase data (disable DB/Tool mocks)")
     parser.add_argument("--clinic-id", default="test-clinic", help="Clinic ID to test against (default: test-clinic)")
+    parser.add_argument("--trace", action="store_true", help="Enable Langfuse tracing (sends traces to Langfuse dashboard)")
     args = parser.parse_args()
 
     # Load scenarios
@@ -45,7 +46,7 @@ async def run_evals():
     # Initialize Judge
     judge = LLMJudge()
 
-    print(f"🔧 Initializing Agent (Real Data: {args.real_data})...")
+    print(f"🔧 Initializing Agent (Real Data: {args.real_data}, Tracing: {args.trace})...")
     
     with ExitStack() as stack:
         # --- ALWAYS MOCK THESE ---
@@ -114,8 +115,12 @@ async def run_evals():
         mock_formatter = MagicMock()
         mock_formatter.format_response.side_effect = lambda response, *args, **kwargs: response
         stack.enter_context(patch('app.services.state_echo_formatter.StateEchoFormatter', return_value=mock_formatter))
-        # Mock Langfuse (used in multiple places)
-        stack.enter_context(patch('langfuse.Langfuse', MagicMock()))
+
+        # Mock Langfuse unless --trace flag is set
+        if args.trace:
+            print("  - 📊 Langfuse tracing ENABLED (traces will be sent to dashboard)")
+        else:
+            stack.enter_context(patch('langfuse.Langfuse', MagicMock()))
 
         # Mock LLM Factory - We ALWAYS mock this to inject our capturing wrapper
         # This allows us to capture tool calls even when using real tools
