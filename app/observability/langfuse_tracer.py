@@ -1,5 +1,5 @@
 """
-Langfuse Integration for LLM Observability
+Langfuse Integration for LLM Observability (v3 SDK)
 Tracks: cost per booking, prompt effectiveness, RAG quality, slot extraction accuracy
 """
 
@@ -14,20 +14,19 @@ logger = logging.getLogger(__name__)
 # Initialize Langfuse client
 try:
     from langfuse import Langfuse, observe
-    # Note: langfuse_context was removed in newer SDK versions
-    langfuse_context = None  # For backwards compatibility
 
-    langfuse_client = Langfuse(
-        public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-        secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-        host=os.getenv("LANGFUSE_HOST", "https://us.cloud.langfuse.com")
-    )
-
+    # Check if credentials are available
     LANGFUSE_ENABLED = bool(os.getenv("LANGFUSE_PUBLIC_KEY"))
 
     if LANGFUSE_ENABLED:
+        langfuse_client = Langfuse(
+            public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+            secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+            host=os.getenv("LANGFUSE_HOST", "https://us.cloud.langfuse.com")
+        )
         logger.info("✅ Langfuse LLM observability enabled (v3 SDK)")
     else:
+        langfuse_client = None
         logger.info("Langfuse disabled (no LANGFUSE_PUBLIC_KEY set)")
 
 except ImportError as e:
@@ -39,8 +38,8 @@ except ImportError as e:
 
 class LLMObservability:
     """
-    Wraps all LLM calls with automatic tracing
-    Tracks cost, latency, and quality metrics for optimization
+    Wraps all LLM calls with automatic tracing using Langfuse v3 API.
+    Tracks cost, latency, and quality metrics for optimization.
     """
 
     def __init__(self):
@@ -56,20 +55,9 @@ class LLMObservability:
         llm_extractor: Any
     ) -> Dict:
         """
-        Wrap LLMSlotExtractor with Langfuse tracing
-
-        Args:
-            message: User message text
-            missing_slots: Slots to extract
-            clinic_id: Clinic ID for context
-            session_id: Session/conversation ID
-            fsm_state: Current FSM state
-            llm_extractor: Instance of LLMSlotExtractor
-
-        Returns:
-            Dictionary of extracted slots with confidence scores
+        Wrap LLMSlotExtractor with Langfuse tracing using v3 API.
         """
-        if not self.enabled:
+        if not self.enabled or not langfuse_client:
             # Fallback: call directly without tracing
             return await llm_extractor.extract_slots(
                 message=message,
@@ -77,74 +65,72 @@ class LLMObservability:
                 clinic_id=clinic_id
             )
 
-        # Create trace for this extraction
-        trace = langfuse_client.trace(
+        # Use v3 context manager API
+        with langfuse_client.start_as_current_span(
             name="slot-extraction",
-            session_id=session_id,
             metadata={
                 "clinic_id": clinic_id,
                 "fsm_state": fsm_state,
-                "missing_slots": missing_slots
-            }
-        )
-
-        # Create generation span
-        generation = trace.generation(
-            name="extract-slots",
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            input=message,
-            metadata={
                 "missing_slots": missing_slots,
-                "message_length": len(message)
+                "session_id": session_id
             }
-        )
-
-        try:
-            # Call actual LLM extraction
-            result = await llm_extractor.extract_slots(
-                message=message,
-                missing_slots=missing_slots,
-                clinic_id=clinic_id
-            )
-
-            # Extract metrics
-            slots_extracted = list(result.keys())
-            avg_confidence = (
-                sum(s.get('confidence', 0) for s in result.values()) / len(result)
-                if result else 0
-            )
-
-            # End generation with success metrics
-            generation.end(
-                output=result,
+        ) as span:
+            # Create generation observation
+            with langfuse_client.start_as_current_observation(
+                name="extract-slots",
+                as_type="generation",
                 metadata={
-                    "slots_extracted": slots_extracted,
-                    "extraction_count": len(slots_extracted),
-                    "avg_confidence": avg_confidence,
-                    "success": True
+                    "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                    "missing_slots": missing_slots,
+                    "message_length": len(message)
                 }
-            )
+            ) as generation:
+                generation.update(input=message)
 
-            # Score the extraction quality
-            trace.score(
-                name="extraction_confidence",
-                value=avg_confidence
-            )
+                try:
+                    # Call actual LLM extraction
+                    result = await llm_extractor.extract_slots(
+                        message=message,
+                        missing_slots=missing_slots,
+                        clinic_id=clinic_id
+                    )
 
-            return result
+                    # Extract metrics
+                    slots_extracted = list(result.keys())
+                    avg_confidence = (
+                        sum(s.get('confidence', 0) for s in result.values()) / len(result)
+                        if result else 0
+                    )
 
-        except Exception as e:
-            # Log error to Langfuse
-            generation.end(
-                output=None,
-                metadata={
-                    "error": str(e),
-                    "success": False
-                }
-            )
+                    # Update generation with output
+                    generation.update(
+                        output=result,
+                        metadata={
+                            "slots_extracted": slots_extracted,
+                            "extraction_count": len(slots_extracted),
+                            "avg_confidence": avg_confidence,
+                            "success": True
+                        }
+                    )
 
-            # Re-raise for normal error handling
-            raise
+                    # Score the extraction quality
+                    langfuse_client.score_current_trace(
+                        name="extraction_confidence",
+                        value=avg_confidence
+                    )
+
+                    return result
+
+                except Exception as e:
+                    # Log error to Langfuse
+                    generation.update(
+                        output=None,
+                        metadata={
+                            "error": str(e),
+                            "success": False
+                        }
+                    )
+                    raise
 
     def score_booking_outcome(
         self,
@@ -154,35 +140,20 @@ class LLMObservability:
         booking_id: Optional[str] = None
     ):
         """
-        Link booking outcome to all LLM traces in session
-
-        This allows us to track which LLM interactions led to successful bookings
-        vs failures/dropoffs.
-
-        Args:
-            session_id: Session/conversation ID
-            success: Whether booking succeeded
-            reason: Failure reason if applicable
-            booking_id: Created appointment ID if successful
+        Score booking outcome for the current trace.
         """
-        if not self.enabled:
+        if not self.enabled or not langfuse_client:
             return
 
         try:
-            # Update trace with booking outcome
-            langfuse_client.score(
+            langfuse_client.create_score(
                 name="booking_success",
                 value=1.0 if success else 0.0,
-                trace_id=session_id,
-                comment=reason or ("Booking successful" if success else "Booking failed")
+                comment=reason or ("Booking successful" if success else "Booking failed"),
+                trace_id=session_id  # Use session_id as trace reference
             )
 
-            if booking_id:
-                # Add booking ID to trace metadata
-                langfuse_client.trace(
-                    id=session_id,
-                    metadata={"booking_id": booking_id}
-                )
+            logger.debug(f"Scored booking outcome: success={success}, session={session_id}")
 
         except Exception as e:
             logger.warning(f"Failed to score booking outcome: {e}")
@@ -196,41 +167,34 @@ class LLMObservability:
         response_used_rag: bool
     ):
         """
-        Track RAG query performance and quality
-
-        Args:
-            session_id: Session/conversation ID
-            query: RAG query text
-            retrieved_docs: Documents retrieved from vector search
-            response_used_rag: Whether the response actually used RAG context
+        Track RAG query performance and quality using v3 API.
         """
-        if not self.enabled:
+        if not self.enabled or not langfuse_client:
             return
 
         try:
-            trace = langfuse_client.trace(
+            with langfuse_client.start_as_current_span(
                 name="rag-query",
-                session_id=session_id,
-                input=query,
-                output={
-                    "docs_retrieved": len(retrieved_docs),
-                    "used_in_response": response_used_rag
-                },
                 metadata={
+                    "session_id": session_id,
+                    "docs_retrieved": len(retrieved_docs),
+                    "used_in_response": response_used_rag,
                     "doc_sources": [doc.get("source") for doc in retrieved_docs[:3]],
                     "avg_score": (
                         sum(doc.get("score", 0) for doc in retrieved_docs) / len(retrieved_docs)
                         if retrieved_docs else 0
                     )
                 }
-            )
+            ) as span:
+                span.update(input=query)
 
-            # Score RAG quality
-            if retrieved_docs:
-                trace.score(
-                    name="rag_relevance",
-                    value=sum(doc.get("score", 0) for doc in retrieved_docs) / len(retrieved_docs)
-                )
+                # Score RAG quality
+                if retrieved_docs:
+                    avg_score = sum(doc.get("score", 0) for doc in retrieved_docs) / len(retrieved_docs)
+                    langfuse_client.score_current_span(
+                        name="rag_relevance",
+                        value=avg_score
+                    )
 
         except Exception as e:
             logger.warning(f"Failed to track RAG query: {e}")
@@ -245,7 +209,7 @@ def track_llm_call(
     model: Optional[str] = None
 ):
     """
-    Decorator to automatically track LLM calls with Langfuse
+    Decorator to automatically track LLM calls with Langfuse v3 API.
 
     Usage:
         @track_llm_call(name="intent-classification", model="gpt-4o-mini")
@@ -255,39 +219,39 @@ def track_llm_call(
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            if not LANGFUSE_ENABLED:
+            if not LANGFUSE_ENABLED or not langfuse_client:
                 # If Langfuse not enabled, just call function
                 return await func(*args, **kwargs)
 
-            # Create trace
-            generation = langfuse_client.generation(
+            # Use v3 context manager
+            with langfuse_client.start_as_current_observation(
                 name=name,
-                model=model or os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                as_type="generation",
                 metadata={
+                    "model": model or os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                     "function": func.__name__,
                     "args_count": len(args),
                     "kwargs_keys": list(kwargs.keys())
                 }
-            )
+            ) as generation:
+                try:
+                    result = await func(*args, **kwargs)
 
-            try:
-                result = await func(*args, **kwargs)
+                    # Update with success
+                    generation.update(
+                        output=result,
+                        metadata={"success": True}
+                    )
 
-                # End with success
-                generation.end(
-                    output=result,
-                    metadata={"success": True}
-                )
+                    return result
 
-                return result
-
-            except Exception as e:
-                # End with error
-                generation.end(
-                    output=None,
-                    metadata={"error": str(e), "success": False}
-                )
-                raise
+                except Exception as e:
+                    # Update with error
+                    generation.update(
+                        output=None,
+                        metadata={"error": str(e), "success": False}
+                    )
+                    raise
 
         return wrapper
     return decorator
@@ -296,7 +260,7 @@ def track_llm_call(
 # Utility function to flush Langfuse events on shutdown
 async def flush_langfuse():
     """
-    Flush all pending Langfuse events to ensure they're sent before shutdown
+    Flush all pending Langfuse events to ensure they're sent before shutdown.
     """
     if LANGFUSE_ENABLED and langfuse_client:
         try:
