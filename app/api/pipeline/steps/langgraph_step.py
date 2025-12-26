@@ -149,6 +149,14 @@ class LangGraphExecutionStep(PipelineStep):
                 ctx.response_metadata["orchestrator_audit"] = result.get("audit_trail", [])
                 ctx.response_metadata["langgraph_intent"] = result.get("intent")
 
+                # Phase 6: Expose internal tool tracking for eval harness
+                ctx.response_metadata["internal_tools_called"] = result.get("tools_actually_called", [])
+                ctx.response_metadata["internal_tools_failed"] = result.get("tools_failed", [])
+                ctx.response_metadata["executor_validation_errors"] = result.get("executor_validation_errors", [])
+                ctx.response_metadata["planner_validation_errors"] = result.get("planner_validation_errors", [])
+                ctx.response_metadata["hallucination_blocked"] = result.get("hallucination_blocked", False)
+                ctx.response_metadata["booking_blocked_no_availability"] = result.get("booking_blocked_no_availability_check", False)
+
                 # 8. Update state based on orchestrator result
                 await self._update_state_from_result(ctx, result)
 
@@ -300,9 +308,13 @@ class LangGraphExecutionStep(PipelineStep):
             from app.services.orchestrator.templates.healthcare_template import HealthcareLangGraph
 
             # Build agent config from context
+            # Model selection: TIER_TOOL_CALLING_MODEL > default
+            # Aligns with tier-based model abstraction system
+            import os
+            primary_model = os.environ.get("TIER_TOOL_CALLING_MODEL", "gpt-4o-mini")
             agent_config = {
                 "llm_settings": {
-                    "primary_model": "gpt-4o-mini",
+                    "primary_model": primary_model,
                     "temperature": 0.7,
                     "max_tokens": 1024,
                 },

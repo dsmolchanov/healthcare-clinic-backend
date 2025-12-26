@@ -8,27 +8,72 @@ class LLMJudge:
         self.client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
         self.model = model
 
-    def evaluate_response(self, 
-                          user_input: str, 
-                          agent_response: str, 
-                          expected_behavior: str, 
+    def evaluate_response(self,
+                          user_input: str,
+                          agent_response: str,
+                          expected_behavior: str,
                           criteria: List[str],
                           tool_calls: Optional[List[Dict[str, Any]]] = None,
-                          tool_outputs: Optional[List[Any]] = None) -> Dict[str, Any]:
+                          tool_outputs: Optional[List[Any]] = None,
+                          # Phase 6: Internal tool tracking
+                          internal_tools_called: Optional[List[str]] = None,
+                          internal_tools_failed: Optional[List[Dict[str, Any]]] = None,
+                          validation_errors: Optional[List[str]] = None,
+                          hallucination_blocked: bool = False,
+                          requires_availability_check: bool = False,
+                          requires_pricing_tool: bool = False) -> Dict[str, Any]:
         """
         Evaluates the agent's response against the expected behavior and criteria.
+
+        Phase 6: Now includes internal tool tracking validation.
         """
-        
+
         criteria_text = "\n".join([f"- {c}" for c in criteria])
-        
+
         tool_info = "No tools were called."
         if tool_calls:
             tool_info = "Tools Called:\n" + "\n".join([f"- {t.get('name')}: {t.get('arguments')}" for t in tool_calls])
-            
+
         tool_output_info = "No tool outputs."
         if tool_outputs:
             tool_output_info = "Tool Outputs:\n" + "\n".join([f"- {str(o)}" for o in tool_outputs])
+
+        # Phase 6: Internal tool tracking info
+        internal_tool_info = ""
+        if internal_tools_called:
+            internal_tool_info = f"\nInternal Tools Executed: {', '.join(internal_tools_called)}"
+        if internal_tools_failed:
+            internal_tool_info += f"\nInternal Tools FAILED: {internal_tools_failed}"
+        if validation_errors:
+            internal_tool_info += f"\nValidation Errors: {validation_errors}"
+        if hallucination_blocked:
+            internal_tool_info += "\n✓ Hallucination was BLOCKED by validator"
         
+        # Phase 6: Check for missing mandatory internal tools
+        internal_tool_issues = []
+        internal_tools_list = internal_tools_called or []
+
+        if requires_availability_check and 'check_availability' not in internal_tools_list:
+            internal_tool_issues.append("CRITICAL: Availability check was required but check_availability was NOT executed")
+
+        if requires_pricing_tool and 'query_prices' not in internal_tools_list:
+            internal_tool_issues.append("CRITICAL: Pricing query was required but query_prices was NOT executed")
+
+        # Check for hallucinated data patterns
+        import re
+        time_pattern = re.compile(r'\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?|\d{1,2}\s*(?:AM|PM|am|pm)')
+        price_pattern = re.compile(r'\$\d+(?:\.\d{2})?')
+
+        if time_pattern.search(agent_response) and 'check_availability' not in internal_tools_list:
+            internal_tool_issues.append("HALLUCINATION: Response contains specific times but check_availability was not called")
+
+        if price_pattern.search(agent_response) and 'query_prices' not in internal_tools_list:
+            internal_tool_issues.append("HALLUCINATION: Response contains prices but query_prices was not called")
+
+        internal_tool_issues_text = ""
+        if internal_tool_issues:
+            internal_tool_issues_text = "\n\n⚠️ INTERNAL TOOL ISSUES:\n" + "\n".join([f"- {i}" for i in internal_tool_issues])
+
         prompt = f"""
 You are a Senior Dental Office Manager and Technical Auditor evaluating an AI receptionist.
 
@@ -37,6 +82,8 @@ User Input: "{user_input}"
 Agent Response: "{agent_response}"
 {tool_info}
 {tool_output_info}
+{internal_tool_info}
+{internal_tool_issues_text}
 
 EXPECTED BEHAVIOR:
 {expected_behavior}

@@ -119,8 +119,8 @@ async def run_evals():
 
         # Mock LLM Factory - We ALWAYS mock this to inject our capturing wrapper
         # This allows us to capture tool calls even when using real tools
-        # Note: Pipeline uses get_llm_factory from multilingual_message_processor for backwards compat
-        mock_get_factory = stack.enter_context(patch('app.api.multilingual_message_processor.get_llm_factory'))
+        # Note: Pipeline uses get_llm_factory from app.services.llm.llm_factory
+        mock_get_factory = stack.enter_context(patch('app.services.llm.llm_factory.get_llm_factory'))
 
         # --- CONDITIONAL MOCKS ---
         if not args.real_data:
@@ -195,8 +195,8 @@ async def run_evals():
 
             # Supabase Client (used in multiple places)
             mock_supabase = MagicMock()
-            stack.enter_context(patch('app.api.multilingual_message_processor.get_supabase_client', return_value=mock_supabase))
-            stack.enter_context(patch('app.api.multilingual_message_processor.get_public_supabase_client', return_value=mock_supabase))
+            stack.enter_context(patch('app.database.get_healthcare_client', return_value=mock_supabase))
+            stack.enter_context(patch('app.database.get_main_client', return_value=mock_supabase))
             stack.enter_context(patch('app.database.create_supabase_client', return_value=mock_supabase))
             
             # Patch SummarySearchService instance in conversation_history_tools
@@ -308,7 +308,33 @@ async def run_evals():
             # Patch in both handlers
             stack.enter_context(patch('app.services.tools.availability_handler.ReservationTools', return_value=mock_reservation_tools))
             stack.enter_context(patch('app.services.tools.booking_handler.ReservationTools', return_value=mock_reservation_tools))
-            
+
+            # CRITICAL: Also mock AppointmentTools used by the LangGraph orchestrator
+            # The orchestrator imports: from ..tools.appointment_tools import AppointmentTools
+            mock_appointment_tools = MagicMock()
+            mock_appointment_tools.check_availability = AsyncMock(return_value={
+                'available': True,
+                'slots': [
+                    {'datetime': '2025-11-27T09:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
+                    {'datetime': '2025-11-27T10:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
+                    {'datetime': '2025-11-27T14:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
+                ],
+                'message': 'Found 3 available slots for tomorrow.'
+            })
+            mock_appointment_tools.book_appointment = AsyncMock(return_value={
+                'success': True,
+                'appointment_id': 'appt-123',
+                'confirmation': 'Appointment booked successfully for 9:00 AM with Dr. Smith'
+            })
+            mock_appointment_tools.cancel_appointment = AsyncMock(return_value={
+                'success': True,
+                'message': 'Appointment cancelled successfully'
+            })
+            # Patch AppointmentTools class in the orchestrator template
+            mock_appointment_tools_class = MagicMock(return_value=mock_appointment_tools)
+            stack.enter_context(patch('app.services.orchestrator.templates.healthcare_template.AppointmentTools', mock_appointment_tools_class))
+            stack.enter_context(patch('app.services.orchestrator.tools.appointment_tools.AppointmentTools', mock_appointment_tools_class))
+
         else:
             print("  - ⚠️ Using REAL Supabase Connection and Tools")
             # When using real data, we DON'T mock the tools or DB services.
@@ -363,13 +389,20 @@ async def run_evals():
             return llm_response
 
         mock_factory = MagicMock()
-        mock_factory.generate_with_tools = capturing_generate 
-        
+        mock_factory.generate_with_tools = capturing_generate
+
         async def capturing_generate_simple(*args, **kwargs):
             return await real_adapter.generate(*args, **kwargs)
         mock_factory.generate = capturing_generate_simple
-        
-        stack.enter_context(patch('app.api.multilingual_message_processor.get_llm_factory', new=AsyncMock(return_value=mock_factory)))
+
+        # Patch get_llm_factory for code that uses the function
+        stack.enter_context(patch('app.services.llm.llm_factory.get_llm_factory', new=AsyncMock(return_value=mock_factory)))
+
+        # CRITICAL: Also patch LLMFactory class for code that instantiates it directly
+        # The LangGraph orchestrator uses: from app.services.llm.llm_factory import LLMFactory
+        # Since it's a lazy import, patching the source module is sufficient
+        mock_factory_class = MagicMock(return_value=mock_factory)
+        stack.enter_context(patch('app.services.llm.llm_factory.LLMFactory', mock_factory_class))
 
         # Initialize Processor (using Pipeline architecture)
         processor = PipelineMessageProcessor()
@@ -476,89 +509,279 @@ async def run_evals():
             last_agent_response = None
             
             try:
-                # Iterate through messages
-                for i, msg in enumerate(scenario['messages']):
-                    if msg['role'] == 'user':
-                        print(f"  Turn {i+1}: User says '{msg['content']}'")
-                        
-                        # Update mock memory with current history (only if mocked)
-                        if not args.real_data:
-                            mock_mm.get_conversation_history = AsyncMock(return_value=conversation_history)
-                            
-                            # CRITICAL FIX: Also update the hydrator's return value to include history
-                            # The processor uses hydrator, not memory_manager directly for context
-                            current_context = mock_hydrator.hydrate.return_value
-                            # We need to copy the list to avoid reference issues if the mock reuses the object
-                            current_context['history'] = list(conversation_history) 
-                            mock_hydrator.hydrate = AsyncMock(return_value=current_context)
-                        
-                        req = MessageRequest(
-                            from_phone='+15551112222',
-                            to_phone='+15550000000',
-                            body=msg['content'],
-                            message_sid=f"msg-{datetime.now().timestamp()}",
-                            clinic_id=args.clinic_id,
-                            clinic_name='Test Dental Clinic'
-                        )
+                # Handle multiturn scenario format (turns) vs standard format (messages)
+                if 'turns' in scenario:
+                    # MULTITURN SCENARIO PROCESSING
+                    # Turns describe the expected tool chain across agent's internal processing.
+                    # Only turns with user messages trigger new agent invocations.
+                    # Continuation turns (no messages) describe expected internal tool calls.
 
-                        # Clear captured tool calls/outputs for this turn
-                        # captured_tool_calls.clear() # DON'T CLEAR - Accumulate for multi-turn eval
-                        # captured_tool_outputs.clear() # DON'T CLEAR - Accumulate for multi-turn eval
+                    # Collect all expected tools from all turns for validation
+                    all_expected_tools = []
+                    all_criteria = []
+                    last_expected_behavior = ''
 
-                        # Process Message
-                        response = await processor.process_message(req)
-                        agent_response_text = response.message
-                        last_agent_response = agent_response_text
-                        
-                        print(f"  Agent says: {agent_response_text}")
-                        if captured_tool_calls:
-                            print(f"  Tools called: {[t['name'] for t in captured_tool_calls]}")
-                        
-                        # Update history
-                        conversation_history.append({"role": "user", "content": msg['content']})
-                        
-                        # Append tool outputs as SYSTEM messages to preserve context without breaking validation
-                        if captured_tool_outputs:
-                            for tool_out in captured_tool_outputs:
-                                # Format the output clearly
-                                output_text = f"Tool '{tool_out['name']}' output: {tool_out['output']}"
-                                conversation_history.append({
-                                    "role": "system",
-                                    "content": output_text
-                                })
-                        
-                        conversation_history.append({"role": "assistant", "content": agent_response_text})
-                        
-                        # Check if this is the last message in the scenario
-                        if i == len(scenario['messages']) - 1:
-                            # Judge Response
-                            eval_result = judge.evaluate_response(
-                                user_input=msg['content'],
-                                agent_response=agent_response_text,
-                                expected_behavior=scenario['expected_behavior'],
-                                criteria=scenario['criteria'],
-                                tool_calls=captured_tool_calls,
-                                tool_outputs=captured_tool_outputs
-                            )
+                    # Extract only actual user messages (not continuation turns)
+                    user_turns = []
+                    for turn in scenario['turns']:
+                        turn_messages = turn.get('messages', [])
+                        expected_tools = turn.get('expected_tools', [])
 
-                            print(f"  Score: {eval_result['score']}/10")
-                            print(f"  Pass: {'✅' if eval_result['pass'] else '❌'}")
-                            print(f"  Reasoning: {eval_result['reasoning']}\n")
+                        # Collect expected tools from all turns
+                        for tool in expected_tools:
+                            tool_name = tool.get('name', tool) if isinstance(tool, dict) else tool
+                            all_expected_tools.append(tool_name)
 
-                            results.append({
-                                "scenario": scenario['name'],
-                                "result": eval_result,
-                                "transcript": conversation_history
+                        # Collect criteria and behavior from turns
+                        if turn.get('criteria'):
+                            all_criteria.extend(turn.get('criteria', []))
+                        if turn.get('expected_behavior'):
+                            last_expected_behavior = turn.get('expected_behavior', '')
+
+                        # Only process turns with actual user messages
+                        user_messages = [m for m in turn_messages if m.get('role') == 'user']
+                        if user_messages:
+                            user_turns.append({
+                                'turn_id': turn.get('turn_id', len(user_turns) + 1),
+                                'messages': turn_messages,
+                                'expected_tools': expected_tools,
+                                'expected_behavior': turn.get('expected_behavior', ''),
+                                'criteria': turn.get('criteria', [])
                             })
 
-                    elif msg['role'] == 'assistant':
-                        # If the scenario defines an assistant message, it overrides the actual agent response
-                        # This allows forcing the conversation down a specific path
-                        if conversation_history and conversation_history[-1]['role'] == 'assistant':
-                            print(f"  (Overriding Agent response with: '{msg['content']}')")
-                            conversation_history[-1] = msg
-                        else:
-                            conversation_history.append(msg)
+                    print(f"  Expected tool chain: {all_expected_tools}")
+
+                    # Process each user turn
+                    for turn_idx, turn in enumerate(user_turns):
+                        for msg in turn['messages']:
+                            if msg['role'] == 'user':
+                                print(f"  Turn {turn['turn_id']}: User says '{msg['content']}'")
+
+                                # Update mock memory with current history (only if mocked)
+                                if not args.real_data:
+                                    mock_mm.get_conversation_history = AsyncMock(return_value=conversation_history)
+                                    current_context = mock_hydrator.hydrate.return_value
+                                    current_context['history'] = list(conversation_history)
+                                    mock_hydrator.hydrate = AsyncMock(return_value=current_context)
+
+                                req = MessageRequest(
+                                    from_phone='+15551112222',
+                                    to_phone='+15550000000',
+                                    body=msg['content'],
+                                    message_sid=f"msg-{datetime.now().timestamp()}",
+                                    clinic_id=args.clinic_id,
+                                    clinic_name='Test Dental Clinic'
+                                )
+
+                                # Process Message - agent will execute its full tool chain internally
+                                response = await processor.process_message(req)
+                                agent_response_text = response.message
+                                last_agent_response = agent_response_text
+
+                                # Phase 6: Capture internal tool tracking from response metadata
+                                response_meta = getattr(response, 'metadata', {}) or {}
+                                internal_tools = response_meta.get('internal_tools_called', [])
+                                internal_tools_failed = response_meta.get('internal_tools_failed', [])
+                                validation_errors = response_meta.get('executor_validation_errors', [])
+                                hallucination_blocked = response_meta.get('hallucination_blocked', False)
+
+                                print(f"  Agent says: {agent_response_text}")
+                                if captured_tool_calls:
+                                    actual_tools = [t['name'] for t in captured_tool_calls]
+                                    print(f"  LLM Tools called: {actual_tools}")
+                                if internal_tools:
+                                    print(f"  Internal tools executed: {internal_tools}")
+                                if internal_tools_failed:
+                                    print(f"  ⚠️ Internal tools failed: {internal_tools_failed}")
+                                if hallucination_blocked:
+                                    print(f"  ✓ Hallucination blocked by validator")
+
+                                # Update history
+                                conversation_history.append({"role": "user", "content": msg['content']})
+
+                                # Append tool outputs as SYSTEM messages
+                                if captured_tool_outputs:
+                                    for tool_out in captured_tool_outputs:
+                                        output_text = f"Tool '{tool_out['name']}' output: {tool_out['output']}"
+                                        conversation_history.append({
+                                            "role": "system",
+                                            "content": output_text
+                                        })
+
+                                conversation_history.append({"role": "assistant", "content": agent_response_text})
+
+                            elif msg['role'] == 'assistant':
+                                if conversation_history and conversation_history[-1]['role'] == 'assistant':
+                                    print(f"  (Overriding Agent response with: '{msg['content']}')")
+                                    conversation_history[-1] = msg
+                                else:
+                                    conversation_history.append(msg)
+
+                    # After all user turns processed, evaluate the complete scenario
+                    # Use scenario-level or last turn's expected_behavior/criteria
+                    expected_behavior = scenario.get('expected_behavior', last_expected_behavior)
+                    criteria = scenario.get('criteria', all_criteria if all_criteria else [])
+
+                    # Get the last user message for context
+                    last_user_msg = ''
+                    for msg in reversed(conversation_history):
+                        if msg.get('role') == 'user':
+                            last_user_msg = msg.get('content', '')
+                            break
+
+                    # Validate tool chain - check if expected tools were called in order
+                    actual_tool_names = [t['name'] for t in captured_tool_calls]
+                    tool_chain_valid = True
+                    expected_idx = 0
+                    for actual_tool in actual_tool_names:
+                        if expected_idx < len(all_expected_tools) and actual_tool == all_expected_tools[expected_idx]:
+                            expected_idx += 1
+                    tool_chain_valid = expected_idx == len(all_expected_tools)
+
+                    if not tool_chain_valid:
+                        print(f"  ⚠️ Tool chain mismatch: expected {all_expected_tools}, got {actual_tool_names}")
+
+                    # Judge Response - Phase 6: Include internal tool tracking
+                    eval_result = judge.evaluate_response(
+                        user_input=last_user_msg,
+                        agent_response=last_agent_response or '',
+                        expected_behavior=expected_behavior,
+                        criteria=criteria,
+                        tool_calls=captured_tool_calls,
+                        tool_outputs=captured_tool_outputs,
+                        # Phase 6: Internal tool tracking
+                        internal_tools_called=internal_tools,
+                        internal_tools_failed=internal_tools_failed,
+                        validation_errors=validation_errors,
+                        hallucination_blocked=hallucination_blocked,
+                        requires_availability_check=scenario.get('requires_availability_check', False),
+                        requires_pricing_tool=scenario.get('requires_pricing_tool', False),
+                    )
+
+                    print(f"  Score: {eval_result['score']}/10")
+                    print(f"  Pass: {'✅' if eval_result['pass'] else '❌'}")
+                    print(f"  Reasoning: {eval_result['reasoning']}\n")
+
+                    # Phase 6: Include internal tool tracking in results
+                    results.append({
+                        "scenario": scenario['name'],
+                        "result": eval_result,
+                        "transcript": conversation_history,
+                        "expected_tool_chain": all_expected_tools,
+                        "actual_tool_chain": actual_tool_names,
+                        "tool_chain_valid": tool_chain_valid,
+                        # Phase 6: Internal tool tracking
+                        "internal_tools_called": internal_tools,
+                        "internal_tools_failed": internal_tools_failed,
+                        "validation_errors": validation_errors,
+                        "hallucination_blocked": hallucination_blocked,
+                    })
+
+                else:
+                    # STANDARD SINGLE-TURN SCENARIO PROCESSING
+                    scenario_messages = scenario.get('messages', [])
+
+                    # Iterate through messages
+                    for i, msg in enumerate(scenario_messages):
+                        if msg['role'] == 'user':
+                            print(f"  Turn {i+1}: User says '{msg['content']}'")
+
+                            # Update mock memory with current history (only if mocked)
+                            if not args.real_data:
+                                mock_mm.get_conversation_history = AsyncMock(return_value=conversation_history)
+                                current_context = mock_hydrator.hydrate.return_value
+                                current_context['history'] = list(conversation_history)
+                                mock_hydrator.hydrate = AsyncMock(return_value=current_context)
+
+                            req = MessageRequest(
+                                from_phone='+15551112222',
+                                to_phone='+15550000000',
+                                body=msg['content'],
+                                message_sid=f"msg-{datetime.now().timestamp()}",
+                                clinic_id=args.clinic_id,
+                                clinic_name='Test Dental Clinic'
+                            )
+
+                            # Process Message
+                            response = await processor.process_message(req)
+                            agent_response_text = response.message
+                            last_agent_response = agent_response_text
+
+                            # Phase 6: Capture internal tool tracking
+                            response_meta = getattr(response, 'metadata', {}) or {}
+                            internal_tools = response_meta.get('internal_tools_called', [])
+                            internal_tools_failed = response_meta.get('internal_tools_failed', [])
+                            validation_errors = response_meta.get('executor_validation_errors', [])
+                            hallucination_blocked = response_meta.get('hallucination_blocked', False)
+
+                            print(f"  Agent says: {agent_response_text}")
+                            if captured_tool_calls:
+                                print(f"  LLM Tools called: {[t['name'] for t in captured_tool_calls]}")
+                            if internal_tools:
+                                print(f"  Internal tools executed: {internal_tools}")
+                            if internal_tools_failed:
+                                print(f"  ⚠️ Internal tools failed: {internal_tools_failed}")
+                            if hallucination_blocked:
+                                print(f"  ✓ Hallucination blocked")
+
+                            # Update history
+                            conversation_history.append({"role": "user", "content": msg['content']})
+
+                            # Append tool outputs as SYSTEM messages
+                            if captured_tool_outputs:
+                                for tool_out in captured_tool_outputs:
+                                    output_text = f"Tool '{tool_out['name']}' output: {tool_out['output']}"
+                                    conversation_history.append({
+                                        "role": "system",
+                                        "content": output_text
+                                    })
+
+                            conversation_history.append({"role": "assistant", "content": agent_response_text})
+
+                            # Check if this is the last message in the scenario
+                            if i == len(scenario_messages) - 1:
+                                expected_behavior = scenario.get('expected_behavior', '')
+                                criteria = scenario.get('criteria', [])
+
+                                # Judge Response - Phase 6: Include internal tool tracking
+                                eval_result = judge.evaluate_response(
+                                    user_input=msg['content'],
+                                    agent_response=agent_response_text,
+                                    expected_behavior=expected_behavior,
+                                    criteria=criteria,
+                                    tool_calls=captured_tool_calls,
+                                    tool_outputs=captured_tool_outputs,
+                                    # Phase 6: Internal tool tracking
+                                    internal_tools_called=internal_tools,
+                                    internal_tools_failed=internal_tools_failed,
+                                    validation_errors=validation_errors,
+                                    hallucination_blocked=hallucination_blocked,
+                                    requires_availability_check=scenario.get('requires_availability_check', False),
+                                    requires_pricing_tool=scenario.get('requires_pricing_tool', False),
+                                )
+
+                                print(f"  Score: {eval_result['score']}/10")
+                                print(f"  Pass: {'✅' if eval_result['pass'] else '❌'}")
+                                print(f"  Reasoning: {eval_result['reasoning']}\n")
+
+                                # Phase 6: Include internal tool tracking
+                                results.append({
+                                    "scenario": scenario['name'],
+                                    "result": eval_result,
+                                    "transcript": conversation_history,
+                                    "internal_tools_called": internal_tools,
+                                    "internal_tools_failed": internal_tools_failed,
+                                    "validation_errors": validation_errors,
+                                    "hallucination_blocked": hallucination_blocked,
+                                })
+
+                        elif msg['role'] == 'assistant':
+                            # If the scenario defines an assistant message, it overrides the actual agent response
+                            if conversation_history and conversation_history[-1]['role'] == 'assistant':
+                                print(f"  (Overriding Agent response with: '{msg['content']}')")
+                                conversation_history[-1] = msg
+                            else:
+                                conversation_history.append(msg)
 
             except Exception as e:
                 print(f"❌ Error running scenario '{scenario['name']}': {e}\n")

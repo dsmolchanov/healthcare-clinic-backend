@@ -125,6 +125,15 @@ class HealthcareConversationState(BaseConversationState):
     clarification_count: Annotated[Optional[int], last_value]  # Track >2 → escalate
     needs_human_escalation: Annotated[Optional[bool], last_value]
 
+    # Phase 4: Executor debugging & silent failure prevention
+    tools_actually_called: Annotated[Optional[List[str]], last_value]  # Track internal tool execution
+    tools_failed: Annotated[Optional[List[Dict[str, Any]]], last_value]  # Track failed tool calls with details
+    executor_validation_errors: Annotated[Optional[List[str]], last_value]  # Track validation errors
+    planner_validation_errors: Annotated[Optional[List[str]], last_value]  # Track planner validation errors
+    booking_blocked_no_availability_check: Annotated[Optional[bool], last_value]  # Strict mode flag
+    booking_blocked_no_verification: Annotated[Optional[bool], last_value]  # Strict mode flag
+    preferred_date_iso: Annotated[Optional[str], last_value]  # Resolved ISO datetime from natural language
+
 
 class HealthcareLangGraph(BaseLangGraphOrchestrator):
     """
@@ -1002,11 +1011,29 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         Tools: query_prices (read-only)
 
         This replaces pure-text responses for queries that need live data.
+
+        Phase 5 Enhancement: Strict tool-mandatory enforcement for pricing queries.
+        The agent MUST call query_prices for any pricing question - no hallucination allowed.
         """
         logger.info(f"[dynamic_info_agent] Processing with tools - session: {state['session_id'][:8]}")
 
         message = state.get('message', '')
+        message_lower = message.lower()
         language = state.get('detected_language', 'en')
+
+        # =========================================================================
+        # Phase 5 (5.1): Detect pricing intent - MUST call query_prices
+        # =========================================================================
+        PRICING_KEYWORDS = [
+            'price', 'cost', 'how much', 'fee', 'charge', 'rate', 'expensive',
+            'precio', 'costo', 'cuánto', 'cuanto cuesta',
+            'цена', 'стоимость', 'сколько стоит', 'сколько',
+            'compare', 'comparison', 'vs', 'versus', 'cheaper', 'affordable',
+        ]
+        is_pricing_query = any(kw in message_lower for kw in PRICING_KEYWORDS)
+
+        if is_pricing_query:
+            logger.info("[dynamic_info_agent] PRICING QUERY DETECTED - tool call mandatory")
 
         # Build system prompt for tool selection
         system_prompt = f"""You are a healthcare clinic assistant. Answer the user's question using the available tools.
@@ -1054,17 +1081,78 @@ Clinic context:
                         state['context']['tool_results'] = state['context'].get('tool_results', {})
                         state['context']['tool_results'][tool_call.name] = result
 
+                        # =========================================================================
+                        # Phase 5: Track tool calls in tools_actually_called
+                        # =========================================================================
+                        tools_called = state.get('tools_actually_called', []) or []
+                        tools_called.append(tool_call.name)
+                        state['tools_actually_called'] = tools_called
+                        logger.info(f"[dynamic_info_agent] Tool {tool_call.name} executed, result: {str(result)[:100]}")
+
                     logger.info(f"[dynamic_info_agent] Executed {tool_calls_count} tool calls")
+                else:
+                    # =========================================================================
+                    # Phase 5: LLM didn't call tools despite tool_choice='required'
+                    # For pricing queries, force direct tool call as fallback
+                    # =========================================================================
+                    if is_pricing_query:
+                        logger.warning("[dynamic_info_agent] LLM skipped tool call for pricing - forcing direct call")
+                        services = self._extract_services_from_message(message_lower)
+                        if self.price_query_tool:
+                            try:
+                                result = await self.price_query_tool.get_services_by_query(
+                                    query=message,
+                                    limit=5
+                                )
+                                state['context']['price_query'] = {
+                                    'success': True,
+                                    'results': result,
+                                    'query': message,
+                                    'forced': True
+                                }
+                                tools_called = state.get('tools_actually_called', []) or []
+                                tools_called.append('query_prices')
+                                state['tools_actually_called'] = tools_called
+                                logger.info(f"[dynamic_info_agent] Forced query_prices result: {str(result)[:100]}")
+                            except Exception as e:
+                                logger.error(f"[dynamic_info_agent] Forced price query failed: {e}")
 
                 state['context']['dynamic_info_handled'] = True
 
             except Exception as e:
                 logger.error(f"[dynamic_info_agent] Tool calling failed: {e}")
-                # Fallback to legacy enrichment pattern
-                await self.info_agent_node(state)
+                # =========================================================================
+                # Phase 5: For pricing queries, try direct tool call even on LLM failure
+                # =========================================================================
+                if is_pricing_query and self.price_query_tool:
+                    logger.info("[dynamic_info_agent] LLM failed but pricing query - trying direct tool call")
+                    try:
+                        result = await self.price_query_tool.get_services_by_query(query=message, limit=5)
+                        state['context']['price_query'] = {'success': True, 'results': result, 'forced': True}
+                        tools_called = state.get('tools_actually_called', []) or []
+                        tools_called.append('query_prices')
+                        state['tools_actually_called'] = tools_called
+                    except Exception as e2:
+                        logger.error(f"[dynamic_info_agent] Direct price query also failed: {e2}")
+                        await self.info_agent_node(state)
+                else:
+                    # Fallback to legacy enrichment pattern
+                    await self.info_agent_node(state)
         else:
-            # No LLM factory - use legacy pattern
-            await self.info_agent_node(state)
+            # No LLM factory - use legacy pattern for non-pricing, direct call for pricing
+            if is_pricing_query and self.price_query_tool:
+                logger.info("[dynamic_info_agent] No LLM but pricing query - direct tool call")
+                try:
+                    result = await self.price_query_tool.get_services_by_query(query=message, limit=5)
+                    state['context']['price_query'] = {'success': True, 'results': result, 'forced': True}
+                    tools_called = state.get('tools_actually_called', []) or []
+                    tools_called.append('query_prices')
+                    state['tools_actually_called'] = tools_called
+                except Exception as e:
+                    logger.error(f"[dynamic_info_agent] Direct price query failed: {e}")
+                    await self.info_agent_node(state)
+            else:
+                await self.info_agent_node(state)
 
         state['audit_trail'].append({
             "node": "dynamic_info_agent",
@@ -1352,11 +1440,14 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
 
         if self.llm_factory:
             try:
-                response = await self.llm_factory.generate(
+                from app.services.llm.tiers import ModelTier
+                response = await self.llm_factory.generate_for_tier(
+                    tier=ModelTier.ROUTING,
                     messages=[{"role": "system", "content": supervisor_prompt}],
-                    model="gpt-4o-mini",  # Fast, cheap model for routing
                     temperature=0.1,
                     max_tokens=10,
+                    clinic_id=self.clinic_id,
+                    session_id=state.get('session_id'),
                 )
 
                 decision = response.content.strip().lower()
@@ -1816,6 +1907,9 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
         Routes to:
         - Exit (response generated) if simple answer found
         - Continue to supervisor if complex query
+
+        CRITICAL (Phase 4 fix): If message has scheduling intent, SKIP fast-path
+        to allow supervisor to route to scheduling flow.
         """
         logger.debug(f"Simple answer node - session: {state['session_id']}")
 
@@ -1823,7 +1917,23 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
         ctx = state.get('context', {})
         language = state.get('detected_language', 'en')
 
-        # FAQ patterns
+        # =========================================================================
+        # CRITICAL FIX: Check for scheduling intent FIRST
+        # If message has booking intent, skip FAQ fast-path entirely
+        # This fixes the bug where "phone 555-123-4567" triggers clinic phone response
+        # =========================================================================
+        if self._looks_like_scheduling(message) or self._is_contact_info_submission(message):
+            logger.info(f"[simple_answer] Scheduling intent detected, skipping fast-path")
+            state['fast_path'] = False
+            state['audit_trail'].append({
+                "node": "simple_answer",
+                "timestamp": datetime.utcnow().isoformat(),
+                "fast_path": False,
+                "reason": "scheduling_intent_detected",
+            })
+            return state
+
+        # FAQ patterns (only checked if NOT scheduling intent)
         hours_patterns = ['hours', 'open', 'close', 'when', 'horario', 'часы', 'работаете']
         location_patterns = ['address', 'location', 'where', 'dirección', 'donde', 'адрес', 'где']
         phone_patterns = ['phone', 'call', 'number', 'teléfono', 'телефон', 'номер']
@@ -1998,11 +2108,14 @@ Return valid JSON only, no markdown:
 
         if self.llm_factory:
             try:
-                response = await self.llm_factory.generate(
+                from app.services.llm.tiers import ModelTier
+                response = await self.llm_factory.generate_for_tier(
+                    tier=ModelTier.REASONING,
                     messages=[{"role": "system", "content": extraction_prompt}],
-                    model="gpt-4o-mini",
                     temperature=0.1,
                     max_tokens=200,
+                    clinic_id=self.clinic_id,
+                    session_id=state.get('session_id'),
                     response_format={"type": "json_object"},
                 )
 
@@ -2261,6 +2374,179 @@ Return valid JSON only, no markdown:
             return ' '.join(parts)
 
     # ========================================================================
+    # Phase 4: Executor Debugging & Silent Failure Prevention Helpers
+    # ========================================================================
+
+    async def _resolve_datetime_for_tool(self, natural_date: str, clinic_timezone: str) -> Optional[str]:
+        """
+        Convert natural language date to ISO format for tool arguments.
+
+        Handles: "tomorrow", "next Tuesday", "January 15th", etc.
+        Returns None if parsing fails (caller should ask for clarification).
+
+        Phase 4 (4.3): Semantic adapter error handling with dateparser.
+        """
+        if not natural_date:
+            return None
+
+        try:
+            from dateparser import parse as dateparser_parse
+        except ImportError:
+            logger.warning("[datetime_resolver] dateparser not installed, falling back to basic parsing")
+            dateparser_parse = None
+
+        try:
+            # Get timezone object
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(clinic_timezone)
+            except ImportError:
+                import pytz
+                tz = pytz.timezone(clinic_timezone)
+
+            now = datetime.now(tz)
+
+            if dateparser_parse:
+                # Parse the natural language date with dateparser
+                parsed = dateparser_parse(
+                    natural_date,
+                    settings={
+                        'PREFER_DATES_FROM': 'future',
+                        'RELATIVE_BASE': now.replace(tzinfo=None),  # dateparser expects naive datetime
+                        'TIMEZONE': clinic_timezone,
+                        'RETURN_AS_TIMEZONE_AWARE': True,
+                    }
+                )
+
+                if parsed:
+                    iso_str = parsed.isoformat()
+                    logger.info(f"[datetime_resolver] '{natural_date}' -> {iso_str}")
+                    return iso_str
+                else:
+                    logger.warning(f"[datetime_resolver] Could not parse: '{natural_date}'")
+                    return None
+            else:
+                # Basic fallback parsing without dateparser
+                # Handle common patterns
+                date_lower = natural_date.lower().strip()
+                if 'tomorrow' in date_lower:
+                    target = now + timedelta(days=1)
+                    return target.replace(hour=9, minute=0, second=0, microsecond=0).isoformat()
+                elif 'today' in date_lower:
+                    return now.replace(minute=0, second=0, microsecond=0).isoformat()
+                else:
+                    logger.warning(f"[datetime_resolver] No dateparser, cannot parse: '{natural_date}'")
+                    return None
+
+        except Exception as e:
+            logger.error(f"[datetime_resolver] Error parsing '{natural_date}': {e}")
+            return None
+
+    def _validate_tool_arguments(self, tool_name: str, arguments: dict) -> tuple:
+        """
+        Validate that arguments match the expected tool signature.
+
+        Returns (is_valid: bool, error_message: Optional[str]).
+
+        Phase 4 (4.4): Catch argument mismatches before silent failures.
+        """
+        TOOL_SCHEMAS = {
+            'check_availability': {
+                'required': ['date'],
+                'optional': ['doctor_id', 'appointment_type', 'duration_minutes'],
+            },
+            'book_appointment': {
+                'required': ['datetime_str', 'appointment_type'],
+                'optional': ['patient_identifier', 'patient_name', 'patient_phone', 'doctor_id', 'duration_minutes', 'patient_id'],
+            },
+            'query_prices': {
+                'required': [],
+                'optional': ['service_type', 'services'],
+            },
+            'cancel_appointment': {
+                'required': ['patient_id'],
+                'optional': ['appointment_id'],
+            },
+        }
+
+        schema = TOOL_SCHEMAS.get(tool_name)
+        if not schema:
+            return True, None  # Unknown tool, skip validation
+
+        missing = []
+        for field in schema['required']:
+            if not arguments.get(field):
+                missing.append(field)
+
+        if missing:
+            return False, f"Missing required fields for {tool_name}: {missing}"
+
+        return True, None
+
+    def _extract_services_from_message(self, message: str) -> list:
+        """
+        Extract service types mentioned in user message.
+
+        Phase 5 (5.1): Used for direct query_prices calls when LLM fails.
+        """
+        SERVICE_PATTERNS = {
+            'cleaning': ['cleaning', 'limpieza', 'чистка', 'clean'],
+            'whitening': ['whitening', 'blanqueamiento', 'отбеливание', 'whiten'],
+            'root_canal': ['root canal', 'endodoncia', 'удаление нерва', 'root-canal'],
+            'filling': ['filling', 'empaste', 'пломба', 'cavity'],
+            'checkup': ['checkup', 'exam', 'revisión', 'осмотр', 'check-up', 'examination'],
+            'extraction': ['extraction', 'extracción', 'удаление', 'remove', 'pull'],
+            'crown': ['crown', 'corona', 'коронка'],
+            'implant': ['implant', 'implante', 'имплант'],
+        }
+
+        found = []
+        msg_lower = message.lower()
+        for service, patterns in SERVICE_PATTERNS.items():
+            if any(p in msg_lower for p in patterns):
+                found.append(service)
+
+        return found if found else ['general']
+
+    def _validate_response_against_tools(self, state: HealthcareConversationState, proposed_response: str) -> str:
+        """
+        Validate that responses don't contain hallucinated data.
+
+        Phase 5 (5.3): Block responses with times/prices if tools weren't called.
+
+        Returns:
+            - Original response if valid
+            - Safe alternative response if hallucination detected
+        """
+        import re
+
+        tools_called = state.get('tools_actually_called', []) or []
+
+        # Check for time patterns (availability)
+        time_patterns = re.findall(
+            r'\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?|\d{1,2}\s*(?:AM|PM|am|pm)',
+            proposed_response
+        )
+
+        if time_patterns and 'check_availability' not in tools_called:
+            logger.error(f"[validate_response] BLOCKING hallucinated times: {time_patterns}")
+            logger.error(f"[validate_response] tools_called={tools_called}, but response has times")
+            return "Let me check what times are available for you. What date works best?"
+
+        # Check for price patterns
+        price_patterns = re.findall(
+            r'\$\d+(?:\.\d{2})?(?:\s*[-–]\s*\$\d+(?:\.\d{2})?)?',
+            proposed_response
+        )
+
+        if price_patterns and 'query_prices' not in tools_called:
+            logger.error(f"[validate_response] BLOCKING hallucinated prices: {price_patterns}")
+            logger.error(f"[validate_response] tools_called={tools_called}, but response has prices")
+            return "Let me look up the current pricing for you. Which service are you interested in?"
+
+        return proposed_response
+
+    # ========================================================================
     # Phase 2: Plan-then-Execute Nodes
     # ========================================================================
 
@@ -2517,12 +2803,22 @@ Return valid JSON only, no markdown:
         logger.info(f"[executor] Starting - session: {state.get('session_id', 'unknown')[:8]}")
         logger.info(f"[executor] State keys: {list(state.keys())}")
 
+        # =========================================================================
+        # Phase 4 (4.1): Initialize tool tracking variables
+        # =========================================================================
+        tools_called = state.get('tools_actually_called', []) or []
+        tools_failed = state.get('tools_failed', []) or []
+
         plan = state.get('action_plan')
         if not plan:
-            logger.warning(f"[executor] No plan to execute - state has action_plan: {state.get('action_plan')}")
+            logger.error("[executor] NO ACTION PLAN - this should not happen after planner")
+            state['executor_error'] = 'no_action_plan'
             # Generate a response explaining we need more context
             state['response'] = state.get('response', "I'll help you book an appointment. What service do you need?")
             return state
+
+        steps = plan.get('steps', [])
+        logger.info(f"[executor] Plan has {len(steps)} steps: {[s.get('tool_name', 'unknown') for s in steps]}")
 
         # Create SemanticAdapter for this execution context
         adapter = SemanticAdapter(
@@ -2700,10 +2996,14 @@ Return valid JSON only, no markdown:
             # Get the appropriate tool
             tool = self._get_tool_for_step(next_step)
 
-            if tool:
-                # Get raw arguments from plan
-                raw_arguments = next_step.get('arguments', {})
+            # =========================================================================
+            # Phase 4 (4.1): Enhanced logging - log tool call attempt
+            # =========================================================================
+            raw_arguments = next_step.get('arguments', {})
+            logger.info(f"[executor] Attempting tool call: {step_name}")
+            logger.info(f"[executor] Tool arguments: {raw_arguments}")
 
+            if tool:
                 # Step 1: Adapt arguments using SemanticAdapter
                 # This resolves: doctor names → UUIDs, natural dates → ISO, injects patient_id
                 adapted_arguments = await adapt_tool_arguments(
@@ -2720,14 +3020,27 @@ Return valid JSON only, no markdown:
                     validated_args = validated_input.model_dump(exclude_none=True)
                     logger.debug(f"[executor] Validated args: {validated_args}")
                 except ValidationError as ve:
-                    # Schema mismatch caught at validation, not runtime
-                    logger.error(f"[executor] Validation failed for {step_name}: {ve}")
+                    # =========================================================================
+                    # Phase 4 (4.1): Track validation errors
+                    # =========================================================================
+                    logger.error(f"[executor] VALIDATION ERROR for {step_name}: {ve}")
+                    tools_failed.append({'tool': step_name, 'error': 'validation_error', 'details': str(ve)})
+                    validation_errors = state.get('executor_validation_errors', []) or []
+                    validation_errors.append(str(ve))
+                    state['executor_validation_errors'] = validation_errors
                     state['plan_execution_error'] = f"Invalid arguments for {step_name}: {ve.error_count()} validation errors"
                     state['plan_failed_step'] = step_name
+                    state['tools_failed'] = tools_failed
                     return state
 
                 # Step 3: Execute tool with validated arguments
                 result = await tool(**validated_args)
+
+                # =========================================================================
+                # Phase 4 (4.1): Track successful tool calls
+                # =========================================================================
+                tools_called.append(step_name)
+                logger.info(f"[executor] Tool {step_name} SUCCESS: {str(result)[:200]}")
 
                 # Store result
                 if not state.get('plan_results'):
@@ -2740,17 +3053,31 @@ Return valid JSON only, no markdown:
 
                 logger.info(f"[executor] Step {step_name} completed successfully")
             else:
-                logger.warning(f"[executor] No tool found for {step_name}")
+                # =========================================================================
+                # Phase 4 (4.1): Track tool not found errors
+                # =========================================================================
+                logger.error(f"[executor] TOOL NOT FOUND: {step_name}")
+                tools_failed.append({'tool': step_name, 'error': 'tool_not_found'})
                 state['plan_execution_error'] = f"Tool not found: {step_name}"
 
         except ValidationError as ve:
-            # Catch any validation errors that slip through
+            # =========================================================================
+            # Phase 4 (4.1): Catch any validation errors that slip through
+            # =========================================================================
             logger.error(f"[executor] Validation error in {step_name}: {ve}")
+            tools_failed.append({'tool': step_name, 'error': 'validation_error', 'details': str(ve)})
+            validation_errors = state.get('executor_validation_errors', []) or []
+            validation_errors.append(str(ve))
+            state['executor_validation_errors'] = validation_errors
             state['plan_execution_error'] = f"Validation error: {ve}"
             state['plan_failed_step'] = step_name
 
         except Exception as e:
-            logger.error(f"[executor] Step {step_name} failed: {e}")
+            # =========================================================================
+            # Phase 4 (4.1): Track execution errors
+            # =========================================================================
+            logger.error(f"[executor] TOOL EXECUTION FAILED for {step_name}: {e}")
+            tools_failed.append({'tool': step_name, 'error': 'execution_error', 'details': str(e)})
             state['plan_execution_error'] = str(e)
             state['plan_failed_step'] = step_name
 
@@ -2758,10 +3085,47 @@ Return valid JSON only, no markdown:
             if next_step_idx < len(steps) - 1:
                 state['plan_needs_replanning'] = True
 
+        # =========================================================================
+        # Phase 4 (4.1): Store tool tracking in state and log execution summary
+        # =========================================================================
+        state['tools_actually_called'] = tools_called
+        state['tools_failed'] = tools_failed
+        logger.info(f"[executor] Execution complete. Called: {tools_called}, Failed: {tools_failed}")
+
+        # =========================================================================
+        # Phase 4 (4.2): STRICT MODE - No confirmations without tool verification
+        # =========================================================================
+        booking_intent = state.get('booking_intent')
+
+        if booking_intent in ('book', 'check_availability'):
+            if 'check_availability' not in tools_called:
+                logger.error("[executor] STRICT MODE VIOLATION: Booking without check_availability")
+
+                # Check why it failed
+                validation_errors = state.get('executor_validation_errors', [])
+
+                if validation_errors:
+                    logger.error(f"[executor] Validation errors prevented tool call: {validation_errors}")
+                    # Provide user-friendly message about what's missing
+                    state['response'] = "I need a bit more information to check availability. Could you tell me what date and time you're looking for?"
+                    state['awaiting_datetime'] = True
+                elif tools_failed:
+                    logger.error(f"[executor] Tool failures: {tools_failed}")
+                    state['response'] = "I'm having trouble checking our schedule right now. Let me try again - what date works for you?"
+                else:
+                    logger.error("[executor] Unknown reason for missing check_availability")
+                    state['response'] = "I couldn't verify the available times. Could you tell me when you'd like to come in?"
+
+                # DO NOT generate confirmation - force clarification
+                state['booking_blocked_no_availability_check'] = True
+
         state['audit_trail'].append({
             "node": "executor",
             "timestamp": datetime.utcnow().isoformat(),
             "step": step_name,
+            "tools_called": tools_called,
+            "tools_failed": tools_failed,
+            "validation_errors": state.get('executor_validation_errors', []),
             "completed": step_name in completed_steps,
             "error": state.get('plan_execution_error'),
         })
@@ -2806,6 +3170,33 @@ Return valid JSON only, no markdown:
             logger.info("[executor_router] Slot taken, replanning with different time")
             state['replan_reason'] = 'slot_taken'
             return 'replan'
+
+        # =========================================================================
+        # Phase 4 (4.2): Handle strict mode violations - exit without confirmation
+        # =========================================================================
+        if state.get('booking_blocked_no_availability_check') or state.get('booking_blocked_no_verification'):
+            logger.info("[executor_router] Strict mode violation - exiting for clarification")
+            return 'exit'  # Exit flow, clarification response already set
+
+        # =========================================================================
+        # Phase 5 (5.4): Availability-first enforcement - no booking without check
+        # =========================================================================
+        tools_called = state.get('tools_actually_called', []) or []
+        booking_intent = state.get('booking_intent')
+
+        # If user wants to book and we haven't checked availability, go back to planner
+        if booking_intent == 'book' and 'check_availability' not in tools_called:
+            # Only force replan if we're trying to complete the booking step
+            plan = state.get('action_plan', {})
+            completed_steps = state.get('plan_completed_steps', [])
+
+            # Check if we've attempted book_appointment without check_availability
+            if 'book_appointment' in [s.get('tool_name') for s in plan.get('steps', [])]:
+                if 'check_availability' not in completed_steps:
+                    logger.warning("[executor_router] AVAILABILITY-FIRST: Booking without availability check")
+                    state['force_availability_check'] = True
+                    state['replan_reason'] = 'missing_availability_check'
+                    return 'planner'  # Go back to planner to add availability step
 
         # =========================================================================
         # Existing routing logic
@@ -2977,6 +3368,13 @@ Return valid JSON only, no markdown:
                 'context': result.get('context', {}),
                 'should_escalate': result.get('should_end') and 'emergency' in str(result.get('response', '')).lower(),
                 'pending_action': result.get('metadata', {}).get('pending_action'),
+                # Phase 4-6: Internal tool tracking for eval harness
+                'tools_actually_called': result.get('tools_actually_called', []),
+                'tools_failed': result.get('tools_failed', []),
+                'executor_validation_errors': result.get('executor_validation_errors', []),
+                'planner_validation_errors': result.get('planner_validation_errors', []),
+                'hallucination_blocked': result.get('hallucination_blocked', False),
+                'booking_blocked_no_availability_check': result.get('booking_blocked_no_availability_check', False),
             }
 
         except Exception as e:
@@ -3216,6 +3614,16 @@ Instructions:
                     )
 
                     state['response'] = response.content
+
+                    # =========================================================================
+                    # Phase 5 (5.3): Validate response against tools - block hallucinated data
+                    # =========================================================================
+                    validated_response = self._validate_response_against_tools(state, response.content)
+                    if validated_response != response.content:
+                        logger.warning(f"[process_node] Response modified by hallucination validator")
+                        state['response'] = validated_response
+                        state['hallucination_blocked'] = True
+
                     state['metadata']['llm_provider'] = response.provider
                     state['metadata']['llm_model'] = response.model
                     state['metadata']['specialized_context_used'] = True
@@ -3225,7 +3633,8 @@ Instructions:
                         "timestamp": datetime.utcnow().isoformat(),
                         "llm_used": True,
                         "specialized_context": True,
-                        "context_types": list(pipeline_ctx.keys())
+                        "context_types": list(pipeline_ctx.keys()),
+                        "hallucination_blocked": state.get('hallucination_blocked', False)
                     })
 
                     return state

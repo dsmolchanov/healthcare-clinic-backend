@@ -1,0 +1,439 @@
+# Multiturn Evaluation Scenarios for LLM Pipeline Architecture
+# Tests multi-turn tool execution, provider fallback, and metadata preservation
+# Run with: python -m tests.evals.run_evals tests/evals/eval_multiturn.yaml --multiturn
+
+scenarios:
+  # =============================================================================
+  # PART A: Multi-Turn Tool Execution Scenarios
+  # =============================================================================
+
+  - name: "MT-001 - Booking Request Handling"
+    description: "Tests that booking requests are handled properly with appropriate information gathering"
+    type: "multiturn"
+    # Phase 6: Internal tool requirements
+    requires_availability_check: true
+    provider_config:
+      target_providers: ["openai", "gemini", "glm"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "Book me a cleaning appointment tomorrow at 10am. My name is John Smith, phone 555-123-4567."
+        # Note: check_availability and book_appointment are handled programmatically by orchestrator
+        # not as LLM tool calls - so we test agent behavior, not tool calls
+        expected_tools: []
+        expected_behavior: |
+          Agent acknowledges booking request and either:
+          1. Confirms checking availability
+          2. Confirms the booking with details
+          Should capture patient name and phone from message.
+          MUST call check_availability internally before any confirmation.
+        criteria:
+          - "Acknowledges the booking request"
+          - "Does NOT hallucinate confirmation without processing"
+          - "References the requested time or date"
+          - "Calls check_availability internally (Phase 6)"
+        evaluate: true
+
+    e2e_validation:
+      fail_on_any_turn_failure: true
+
+  - name: "MT-002 - Doctor-Specific Booking Request"
+    description: "Tests booking with specific doctor request"
+    type: "multiturn"
+    # Phase 6: Internal tool requirements
+    requires_availability_check: true
+    provider_config:
+      target_providers: ["openai", "gemini", "glm"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "I want to book a consultation with Dr. Shtern tomorrow morning. I'm Maria Garcia, 555-987-6543."
+        # Note: Doctor lookup and booking handled programmatically
+        expected_tools: []
+        expected_behavior: |
+          Agent acknowledges the doctor-specific booking request.
+          Should reference Dr. Shtern and the morning preference.
+          MUST call check_availability internally before any confirmation.
+        criteria:
+          - "Acknowledges the booking request"
+          - "References Dr. Shtern by name"
+          - "References the morning time preference"
+          - "Calls check_availability internally (Phase 6)"
+        evaluate: true
+
+    e2e_validation:
+      fail_on_any_turn_failure: true
+
+  - name: "MT-003 - Price Comparison Query (LLM Tool)"
+    description: "Tests query_prices LLM tool usage for price comparisons"
+    type: "multiturn"
+    # Phase 6: Internal tool requirements
+    requires_pricing_tool: true
+    provider_config:
+      target_providers: ["openai", "gemini", "glm"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "I need to compare prices for cleaning vs whitening."
+        expected_tools:
+          - name: "query_prices"
+        expected_behavior: |
+          LLM calls query_prices tool to get pricing info for both services.
+          Should provide price comparison in response.
+          MUST NOT hallucinate prices - must come from query_prices.
+        criteria:
+          - "Calls query_prices tool"
+          - "Provides pricing information for requested services"
+          - "Prices come from tool output, not hallucinated (Phase 6)"
+        evaluate: true
+
+    e2e_validation:
+      fail_on_any_turn_failure: true
+
+  # =============================================================================
+  # PART B: Context Preservation Scenarios
+  # =============================================================================
+
+  - name: "MT-004 - Context Preservation Across User Turns"
+    description: "Tests that prior context is preserved when user provides additional info"
+    type: "multiturn"
+    provider_config:
+      target_providers: ["openai", "gemini", "glm"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "Do you have any openings tomorrow for Dr. Shtern?"
+        expected_tools: []
+        expected_behavior: |
+          Agent acknowledges availability inquiry for Dr. Shtern.
+        criteria:
+          - "Mentions Dr. Shtern"
+          - "Acknowledges the availability question"
+        evaluate: true
+
+      - turn_id: 2
+        messages:
+          - role: user
+            content: "The 10am slot works. Book it please. I'm Ana Martinez, 555-111-2222."
+        expected_tools: []
+        expected_behavior: |
+          Agent processes booking request with context from turn 1.
+          Should reference the 10am slot and patient info.
+        criteria:
+          - "References the 10am slot"
+          - "Acknowledges booking request"
+          - "References patient name Ana Martinez"
+        evaluate: true
+
+    e2e_validation:
+      fail_on_any_turn_failure: true
+
+  - name: "MT-005 - Multi-Turn Booking with Constraints"
+    description: "Tests that constraints are persisted and used in subsequent turns"
+    type: "multiturn"
+    provider_config:
+      target_providers: ["openai", "gemini", "glm"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "Check availability for cleaning tomorrow with Dr. Smith"
+        expected_tools: []
+        expected_behavior: |
+          Agent acknowledges the availability check request with constraints.
+        criteria:
+          - "References cleaning service"
+          - "References Dr. Smith"
+        evaluate: true
+
+      - turn_id: 2
+        messages:
+          - role: user
+            content: "Book the 9am slot. I'm Test User, 555-000-0000."
+        expected_tools: []
+        expected_behavior: |
+          Agent processes booking while maintaining constraints from turn 1.
+        criteria:
+          - "References the 9am slot"
+          - "Acknowledges booking request"
+        evaluate: true
+
+    e2e_validation:
+      fail_on_any_turn_failure: true
+
+  # =============================================================================
+  # PART C: Provider Fallback Scenarios
+  # =============================================================================
+
+  - name: "MT-006 - Primary Provider Timeout Fallback"
+    description: "Tests fallback when primary provider times out"
+    type: "multiturn"
+    test_type: "mock_provider_failure"
+    mock_config:
+      primary_provider: "openai"
+      failure_mode: "timeout"
+      timeout_ms: 25000
+    provider_config:
+      target_providers: ["openai"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "What are your hours on Saturday?"
+        expected_tools: []
+        expected_behavior: |
+          Primary provider (OpenAI) times out after 20s.
+          System falls back to gemini-3-flash-preview or gpt-4o-mini.
+          Response is generated by fallback provider.
+        criteria:
+          - "Response is still valid and addresses the question"
+          - "No error message shown to user"
+        evaluate: true
+
+    e2e_validation:
+      verify_fallback:
+        fallback_triggered: true
+        expected_fallback_providers:
+          - "gemini-3-flash-preview"
+          - "gpt-4o-mini"
+      fail_on_any_turn_failure: true
+
+  - name: "MT-007 - Booking Request Handling"
+    description: "Tests booking request handling with fallback behavior"
+    type: "multiturn"
+    provider_config:
+      target_providers: ["openai"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "Book a cleaning for tomorrow at 2pm. I'm Test User, 555-999-8888."
+        expected_tools: []
+        expected_behavior: |
+          Agent acknowledges booking request and processes it.
+        criteria:
+          - "Acknowledges the booking request"
+          - "References the requested time"
+          - "References cleaning service"
+        evaluate: true
+
+    e2e_validation:
+      fail_on_any_turn_failure: true
+
+  # =============================================================================
+  # PART D: Gemini-Specific Scenarios (thought_signature)
+  # =============================================================================
+
+  - name: "MT-008 - Multi-Turn Availability Check and Booking"
+    description: "Tests multi-turn availability inquiry followed by booking"
+    type: "multiturn"
+    provider_config:
+      target_providers: ["openai", "gemini"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "Check what times are available for a cleaning tomorrow"
+        expected_tools: []
+        expected_behavior: |
+          Agent acknowledges the availability inquiry and processes it.
+        criteria:
+          - "Acknowledges checking availability"
+          - "References cleaning service"
+          - "References tomorrow"
+        evaluate: true
+
+      - turn_id: 2
+        messages:
+          - role: user
+            content: "Book the first available slot. I'm Test Gemini, 555-333-4444."
+        expected_tools: []
+        expected_behavior: |
+          Agent processes booking with context from turn 1.
+        criteria:
+          - "Acknowledges booking request"
+          - "References the patient name"
+        evaluate: true
+
+    e2e_validation:
+      fail_on_any_turn_failure: true
+
+  - name: "MT-009 - Multi-Turn Doctor-Specific Booking"
+    description: "Tests multi-turn booking with specific doctor"
+    type: "multiturn"
+    provider_config:
+      target_providers: ["openai", "gemini"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "Check availability for Dr. Shtern tomorrow"
+        expected_tools: []
+        expected_behavior: |
+          Agent acknowledges availability inquiry for specific doctor.
+        criteria:
+          - "References Dr. Shtern"
+          - "References tomorrow"
+        evaluate: true
+
+      - turn_id: 2
+        messages:
+          - role: user
+            content: "Book the first slot. I'm Raw Test, 555-444-5555."
+        expected_tools: []
+        expected_behavior: |
+          Agent processes booking with context from turn 1.
+        criteria:
+          - "Acknowledges booking request"
+          - "References patient name"
+        evaluate: true
+
+    e2e_validation:
+      fail_on_any_turn_failure: true
+
+  # =============================================================================
+  # PART E: Max Tool Turns Boundary Scenarios
+  # =============================================================================
+
+  - name: "MT-010 - Max Tool Turns Boundary"
+    description: "Tests behavior when max_tool_turns (5) is reached"
+    type: "multiturn"
+    test_type: "mock_continuous_tools"
+    mock_config:
+      force_continuous_tool_calls: true
+      tool_response_always_incomplete: true
+    provider_config:
+      target_providers: ["openai", "gemini", "glm"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "Keep checking different dates until you find availability for next month"
+        expected_behavior: |
+          LLM keeps requesting tool calls (simulated by mock).
+          After 5 turns, loop exits even if tool calls pending.
+          Warning is logged: "Max tool turns reached".
+          Response is generated from last LLM state.
+        criteria:
+          - "Exactly 5 tool turns executed"
+          - "Loop exits after turn 5"
+          - "Response is still generated (not error)"
+        evaluate: true
+
+    e2e_validation:
+      verify_boundary:
+        max_turns_reached: true
+        turns_executed: 5
+        graceful_exit: true
+      fail_on_any_turn_failure: true
+
+  - name: "MT-011 - Early Exit When No More Tool Calls"
+    description: "Tests that loop exits early when LLM stops requesting tools"
+    type: "multiturn"
+    provider_config:
+      target_providers: ["openai", "gemini", "glm"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "What time do you close on Fridays?"
+        expected_tools: []
+        expected_behavior: |
+          LLM may call get_clinic_info (or answer from context).
+          If tool is called, LLM provides answer without requesting more tools.
+          Loop exits before max_tool_turns (5).
+        criteria:
+          - "Response addresses Friday closing time"
+          - "Fewer than 5 tool turns executed"
+          - "Loop exits when no more tool calls needed"
+        evaluate: true
+
+    e2e_validation:
+      verify_boundary:
+        early_exit: true
+        max_turns_not_reached: true
+      fail_on_any_turn_failure: true
+
+  # =============================================================================
+  # PART F: Metadata Preservation Scenarios
+  # =============================================================================
+
+  - name: "MT-012 - Single Message Booking Request"
+    description: "Tests handling of a complete booking request in single message"
+    type: "multiturn"
+    # Phase 6: Internal tool requirements
+    requires_availability_check: true
+    provider_config:
+      target_providers: ["openai", "gemini", "glm"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "Check availability for cleaning tomorrow and book the first slot. I'm ID Test, 555-666-7777."
+        expected_tools: []
+        expected_behavior: |
+          Agent processes the combined availability check and booking request.
+          Should handle the complete flow in response.
+          MUST call check_availability internally - no hallucinated times.
+        criteria:
+          - "Acknowledges the availability check"
+          - "Acknowledges the booking intent"
+          - "References patient info"
+          - "Calls check_availability internally (Phase 6)"
+          - "Does NOT hallucinate specific times without tool verification"
+        evaluate: true
+
+    e2e_validation:
+      fail_on_any_turn_failure: true
+
+  - name: "MT-013 - Provider Metadata in LLMResponse"
+    description: "Tests that LLMResponse contains correct provider metadata"
+    type: "multiturn"
+    # Phase 6: Internal tool requirements
+    requires_pricing_tool: true
+    provider_config:
+      target_providers: ["openai", "gemini", "glm"]
+    turns:
+      - turn_id: 1
+        messages:
+          - role: user
+            content: "How much is a root canal?"
+        expected_tools:
+          - name: "query_prices"
+        response_metadata_validation:
+          - field: "provider"
+            expected_values: ["openai", "google", "glm"]
+          - field: "model"
+            expected_values: ["gpt-4o-mini", "gpt-4o", "gemini-3-flash-preview", "glm-4.5"]
+          - field: "usage"
+            required_keys: ["input_tokens", "output_tokens", "total_tokens"]
+          - field: "latency_ms"
+            type: "integer"
+            min_value: 0
+        expected_behavior: |
+          LLMResponse includes:
+          - provider: correct provider name
+          - model: correct model name
+          - usage: token counts (input, output, total)
+          - latency_ms: measured latency
+          MUST call query_prices - no hallucinated prices.
+        criteria:
+          - "provider field matches actual provider used"
+          - "model field matches actual model used"
+          - "usage contains all token counts"
+          - "latency_ms is positive integer"
+          - "Calls query_prices internally (Phase 6)"
+          - "Prices come from tool output, not hallucinated"
+        evaluate: true
+
+    e2e_validation:
+      verify_metadata:
+        provider_correct: true
+        model_correct: true
+        usage_complete: true
+        latency_recorded: true
+      fail_on_any_turn_failure: true
