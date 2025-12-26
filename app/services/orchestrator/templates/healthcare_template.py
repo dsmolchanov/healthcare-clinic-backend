@@ -242,7 +242,36 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
     def _looks_like_scheduling(self, message: str) -> bool:
         """Check if message has scheduling intent."""
         m = message.lower()
+        # If it's a pure pricing query, don't treat as scheduling
+        if self._looks_like_pricing(m):
+            return False
         return any(k in m for k in self.SCHEDULING_KEYWORDS)
+
+    # Pricing keywords for distinguishing pricing queries from booking
+    PRICING_KEYWORDS = [
+        # English
+        'price', 'prices', 'cost', 'costs', 'how much', 'fee', 'fees',
+        'charge', 'charges', 'rate', 'rates', 'expensive', 'cheap',
+        'affordable', 'compare', 'comparison', 'vs', 'versus',
+        # Spanish
+        'precio', 'precios', 'costo', 'costos', 'cuánto', 'cuanto cuesta',
+        'tarifa', 'tarifas', 'comparar',
+        # Russian
+        'цена', 'цены', 'стоимость', 'сколько стоит', 'сколько',
+        'тариф', 'сравнить',
+        # Portuguese
+        'preço', 'preços', 'custo', 'custos', 'quanto custa',
+    ]
+
+    def _looks_like_pricing(self, message: str) -> bool:
+        """
+        Check if message is a pricing query.
+
+        Used to distinguish "how much is a cleaning?" (pricing) from
+        "book me a cleaning" (scheduling).
+        """
+        m = message.lower()
+        return any(k in m for k in self.PRICING_KEYWORDS)
 
     def _is_contact_info_submission(self, message: str) -> bool:
         """
