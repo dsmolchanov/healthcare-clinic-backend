@@ -105,6 +105,26 @@ class HealthcareConversationState(BaseConversationState):
     proposal_verified: Annotated[bool, last_value]
     verification_error: Annotated[Optional[str], last_value]
 
+    # Phase 4: Routing control (booking flow fix)
+    static_info_skipped_due_to_scheduling: Annotated[Optional[bool], last_value]
+    force_reroute_to: Annotated[Optional[str], last_value]
+    supervisor_overrode_to_scheduling: Annotated[Optional[bool], last_value]
+    supervisor_forced_scheduling: Annotated[Optional[bool], last_value]
+
+    # Phase 4: Extraction fields (booking flow fix)
+    booking_intent: Annotated[Optional[str], last_value]
+    extracted_booking_info: Annotated[Optional[Dict[str, Any]], last_value]
+    preferred_date_raw: Annotated[Optional[str], last_value]
+    doctor_preference: Annotated[Optional[str], last_value]
+    is_urgent: Annotated[Optional[bool], last_value]
+    patient_phone: Annotated[Optional[str], last_value]
+
+    # Phase 4: Clarification flow (booking flow fix)
+    awaiting_patient_identification: Annotated[Optional[bool], last_value]
+    awaiting_datetime: Annotated[Optional[bool], last_value]
+    clarification_count: Annotated[Optional[int], last_value]  # Track >2 → escalate
+    needs_human_escalation: Annotated[Optional[bool], last_value]
+
 
 class HealthcareLangGraph(BaseLangGraphOrchestrator):
     """
@@ -185,6 +205,53 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
             logger.debug(f"[HealthcareLangGraph] Lazy-loaded FAQQueryTool for clinic {self.clinic_id}")
         return self._faq_tool
 
+    # ========================================================================
+    # Phase 4: Scheduling intent detection (booking flow fix)
+    # ENHANCED (Opinion 3): Expanded keywords with multilingual variants
+    # ========================================================================
+    SCHEDULING_KEYWORDS = [
+        # English - action verbs (Opinion 4: focus on action verbs)
+        'book', 'appointment', 'schedule', 'reschedule', 'cancel',
+        'reserve', 'visit', 'see doctor', 'see the doctor',
+        # Symptoms/urgency
+        'pain', 'hurts', 'ache', 'emergency', 'urgent',
+        # Services (Opinion 3: add service types)
+        'cleaning', 'checkup', 'exam', 'filling', 'root canal', 'whitening',
+        # Contact info submission patterns (Opinion 4: "my phone" not just "phone")
+        'my phone', 'my number', 'you can reach me', 'contact me at',
+        'my name is', 'i am', 'call me at',
+        # Spanish
+        'cita', 'reservar', 'programar', 'dolor', 'urgente',
+        'mi teléfono', 'mi nombre es', 'me llamo',
+        # Russian
+        'записаться', 'запись', 'записать', 'болит', 'боль', 'срочно',
+        'мой телефон', 'меня зовут', 'мой номер',
+        # Portuguese
+        'agendar', 'consulta', 'marcar', 'dor', 'urgente',
+    ]
+
+    def _looks_like_scheduling(self, message: str) -> bool:
+        """Check if message has scheduling intent."""
+        m = message.lower()
+        return any(k in m for k in self.SCHEDULING_KEYWORDS)
+
+    def _is_contact_info_submission(self, message: str) -> bool:
+        """
+        Check if user is providing their contact info (not asking for clinic's).
+
+        IMPORTANT (Opinion 4): Distinguish "my phone" from "your phone number".
+        "I need your help with my phone" should NOT trigger this - but we check
+        for scheduling intent first anyway.
+        """
+        m = message.lower()
+        patterns = [
+            'my phone', 'my number', 'you can reach me', 'my name is',
+            'mi teléfono', 'mi nombre', 'me llamo',
+            'мой телефон', 'меня зовут', 'мой номер',
+            'meu telefone', 'meu nome',
+        ]
+        return any(p in m for p in patterns)
+
     def _build_graph(self) -> StateGraph:
         """
         Build healthcare-specific workflow graph with supervisor routing.
@@ -226,6 +293,7 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         workflow.add_node("session_init", self.session_init_node)
         workflow.add_node("hydrate_context", self.hydrate_context_node)
         workflow.add_node("simple_answer", self.simple_answer_node)
+        workflow.add_node("booking_extractor", self.booking_info_extractor_node)  # Phase 4: Extract booking info before planning
         workflow.add_node("planner", self.planner_node)
         workflow.add_node("executor", self.executor_node)
 
@@ -296,16 +364,20 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
 
         # Supervisor routing (replaces intent_classify routing)
         # Updated: 4-way routing with static_info vs dynamic_info split
+        # Phase 4: scheduling now goes through booking_extractor first
         workflow.add_conditional_edges(
             "supervisor",
             self.supervisor_router,
             {
-                "scheduling": "planner",  # Phase 2: Plan-then-Execute for scheduling
+                "scheduling": "booking_extractor",  # Phase 4: Extract info before planning
                 "dynamic_info": "dynamic_info_agent",  # New: uses tools for price/availability
                 "static_info": "static_info_agent",  # New: fast-path for cached FAQ
                 "exit": "phi_redact",
             }
         )
+
+        # Phase 4: Add edge from booking_extractor to planner
+        workflow.add_edge("booking_extractor", "planner")
 
         # ==============================================
         # Phase 2: Plan-then-Execute for scheduling
@@ -330,8 +402,16 @@ class HealthcareLangGraph(BaseLangGraphOrchestrator):
         # ==============================================
         # Dynamic info agent uses tools, then goes to process for response generation
         workflow.add_edge("dynamic_info_agent", "process")
-        # Static info agent is fast-path, goes directly to phi_redact (response already set)
-        workflow.add_edge("static_info_agent", "phi_redact")
+        # Static info agent: may reroute to scheduling if booking intent detected
+        # Phase 4: Replaced fixed edge with conditional for force_reroute handling
+        workflow.add_conditional_edges(
+            "static_info_agent",
+            self.static_info_router,
+            {
+                "booking_extractor": "booking_extractor",  # Reroute to scheduling via extractor
+                "phi_redact": "phi_redact",  # Normal path
+            }
+        )
 
         # FIX: Insert phi_redact BETWEEN process and generate_response
         # This avoids conflicting edges from generate_response
@@ -1029,17 +1109,37 @@ Clinic context:
 
         Handles: hours, location, phone, address, parking
         Response is set directly from cached data.
+
+        PHASE 4 FIX: Short-circuits to scheduling if booking intent detected.
+        This prevents "Book me... phone 555-123" from returning clinic phone.
         """
         logger.info(f"[static_info_agent] Fast-path processing - session: {state['session_id'][:8]}")
 
-        message = state.get('message', '').lower()
+        message = state.get('message', '')
+        message_lower = message.lower()
+
+        # CRITICAL FIX (Phase 4): If message has scheduling intent, DO NOT handle here
+        # This prevents "Book me... phone 555-123" from returning clinic phone
+        if self._looks_like_scheduling(message_lower) or self._is_contact_info_submission(message_lower):
+            logger.info(f"[static_info_agent] Detected scheduling intent, forcing reroute to scheduling")
+            state["static_info_skipped_due_to_scheduling"] = True
+            state["force_reroute_to"] = "scheduling"
+
+            state['audit_trail'].append({
+                "node": "static_info_agent",
+                "timestamp": datetime.utcnow().isoformat(),
+                "action": "reroute_to_scheduling",
+                "reason": "scheduling_intent_detected"
+            })
+            return state
+
         language = state.get('detected_language', 'en')
         clinic = state.get('context', {}).get('clinic_profile', {})
 
         response = None
 
         # Check for hours query
-        if any(p in message for p in ['hours', 'open', 'close', 'when', 'horario', 'часы', 'работаете']):
+        if any(p in message_lower for p in ['hours', 'open', 'close', 'when', 'horario', 'часы', 'работаете']):
             hours = clinic.get('business_hours', clinic.get('hours', 'Please call for hours'))
             templates = {
                 'en': f"Our hours are: {hours}",
@@ -1051,7 +1151,7 @@ Clinic context:
             response = templates.get(language, templates['en'])
 
         # Check for location query
-        elif any(p in message for p in ['address', 'location', 'where', 'dirección', 'donde', 'адрес', 'где']):
+        elif any(p in message_lower for p in ['address', 'location', 'where', 'dirección', 'donde', 'адрес', 'где']):
             address = clinic.get('address', clinic.get('location', 'Please call for address'))
             templates = {
                 'en': f"We're located at: {address}",
@@ -1063,7 +1163,7 @@ Clinic context:
             response = templates.get(language, templates['en'])
 
         # Check for phone query
-        elif any(p in message for p in ['phone', 'call', 'number', 'teléfono', 'телефон', 'номер']):
+        elif any(p in message_lower for p in ['phone', 'call', 'number', 'teléfono', 'телефон', 'номер']):
             phone = clinic.get('phone', clinic.get('phone_number', 'Please check our website'))
             templates = {
                 'en': f"You can reach us at: {phone}",
@@ -1075,7 +1175,7 @@ Clinic context:
             response = templates.get(language, templates['en'])
 
         # Check for parking query
-        elif any(p in message for p in ['parking', 'park', 'estacionamiento', 'парковка']):
+        elif any(p in message_lower for p in ['parking', 'park', 'estacionamiento', 'парковка']):
             parking = clinic.get('parking_info', 'Free parking available on-site')
             templates = {
                 'en': f"Parking information: {parking}",
@@ -1162,6 +1262,25 @@ Clinic context:
         # Log incoming state for debugging
         logger.info(f"[supervisor] Input: flow_state={flow_state}, active_task={active_task}, message='{message[:50]}...'")
 
+        # =========================================================================
+        # CRITICAL (Opinions 1,2,3,4): STATE-AWARE ROUTING
+        # If we're awaiting a clarification response, BYPASS classification entirely
+        # and force routing back to scheduling/booking_extractor
+        # =========================================================================
+        if state.get("awaiting_patient_identification") or state.get("awaiting_datetime"):
+            logger.info(f"[supervisor] Awaiting slot filling, bypassing classification -> scheduling")
+            state["next_agent"] = "scheduling"
+            state["supervisor_forced_scheduling"] = True
+
+            state['audit_trail'].append({
+                "node": "supervisor",
+                "timestamp": datetime.utcnow().isoformat(),
+                "decision": "scheduling",
+                "reason": "awaiting_clarification_response",
+                "awaiting_patient": state.get("awaiting_patient_identification"),
+                "awaiting_datetime": state.get("awaiting_datetime"),
+            })
+            return state
 
         # CRITICAL FIX: If already in scheduling flow, short confirmations MUST stay in scheduling
         # This handles "Да", "Yes", "Ok", "Sí" when user is confirming a slot
@@ -1221,6 +1340,11 @@ User: "I want to cancel my appointment" -> scheduling
 User: "Да" or "Yes" (confirming offered slot) -> scheduling
 User: "острая боль" -> scheduling (acute pain = urgent appointment needed)
 User: "Сколько стоит?" -> dynamic_info (Russian: how much does it cost?)
+User: "Book me a cleaning tomorrow at 10am. My name is John Smith, phone 555-123-4567." -> scheduling (booking with contact info)
+User: "I'd like to schedule an appointment. You can reach me at 555-000-1234." -> scheduling (scheduling + providing phone)
+User: "Can I book for Tuesday? My phone is 555-987-6543." -> scheduling (booking + phone = STILL BOOKING)
+User: "Запишите меня на чистку. Мой телефон 555-111-2222." -> scheduling (Russian: book me + my phone)
+User: "Mi nombre es María, quiero una cita mañana." -> scheduling (Spanish: my name + want appointment)
 
 User message: {message}
 
@@ -1250,11 +1374,23 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
                     # This is safer for accuracy - better to call tools unnecessarily than miss data
                     decision = "dynamic_info"
 
-                logger.info(f"[supervisor] Routing decision: {decision} for message: {message[:50]}...")
+                logger.info(f"[supervisor] Initial routing decision: {decision} for message: {message[:50]}...")
+
+                # Phase 4: Post-hoc override - Scheduling intent takes priority over static_info/dynamic_info
+                if decision in ("static_info", "dynamic_info") and self._looks_like_scheduling(message):
+                    logger.info(f"[supervisor] OVERRIDE: {decision} -> scheduling (scheduling intent detected)")
+                    decision = "scheduling"
+                    state["supervisor_overrode_to_scheduling"] = True
 
             except Exception as e:
-                logger.warning(f"Supervisor LLM call failed: {e}, defaulting to dynamic_info")
-                decision = "dynamic_info"  # Changed: default to tool-using path
+                logger.warning(f"Supervisor LLM call failed: {e}")
+                # Phase 4: Smart fallback based on message content
+                if self._looks_like_scheduling(message):
+                    decision = "scheduling"
+                    logger.info("[supervisor] Fallback: scheduling keywords detected")
+                else:
+                    decision = "dynamic_info"
+                    logger.info("[supervisor] Fallback: defaulting to dynamic_info")
         else:
             # Fallback to keyword-based routing if no LLM factory
             message_lower = message.lower()
@@ -1763,6 +1899,367 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
             return 'exit'  # Response generated, skip to exit
         return 'continue'  # Continue to supervisor
 
+    def static_info_router(self, state: HealthcareConversationState) -> str:
+        """
+        Route from static_info - may reroute to scheduling if intent detected.
+
+        Phase 4: If static_info_agent detected scheduling intent, it sets
+        force_reroute_to='scheduling'. In this case, go to booking_extractor
+        (or planner if booking_extractor not yet added) instead of phi_redact.
+        """
+        if state.get("force_reroute_to") == "scheduling":
+            logger.info("[static_info_router] Force reroute to booking_extractor")
+            return "booking_extractor"  # Go to scheduling flow (via booking extractor)
+        return "phi_redact"  # Normal path
+
+    # ========================================================================
+    # Phase 4: Booking Info Extraction (booking flow fix)
+    # ========================================================================
+
+    async def booking_info_extractor_node(self, state: HealthcareConversationState) -> HealthcareConversationState:
+        """
+        Extract structured booking info from natural language message.
+
+        Per Opinion 1, Section 3.2:
+        "Instead of trying to parse 'tomorrow at 10am' and 'my name is John Smith, phone 555-123...'
+        inside the planner, introduce one dedicated node before planning."
+
+        ENHANCED (Opinion 4): Includes conversation history for multi-turn context.
+        ENHANCED (Opinion 2): Normalizes phone to digits only.
+        ENHANCED (Opinion 2): Keeps dates as natural language for semantic adapter.
+
+        Uses LLM with JSON response format for reliable extraction.
+        """
+        logger.info(f"[booking_extractor] Extracting booking info - session: {state['session_id'][:8]}")
+
+        # Handle clarification responses - clear flags first
+        if state.get('awaiting_patient_identification'):
+            logger.info("[booking_extractor] Processing patient identification response")
+            state['awaiting_patient_identification'] = False
+
+        if state.get('awaiting_datetime'):
+            logger.info("[booking_extractor] Processing datetime response")
+            state['awaiting_datetime'] = False
+
+        message = state.get('message', '')
+        clinic_timezone = state.get('metadata', {}).get('clinic_timezone', 'America/New_York')
+
+        # Get current date for context (but don't force LLM to calculate - Opinion 2)
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(clinic_timezone)
+        except ImportError:
+            import pytz
+            tz = pytz.timezone(clinic_timezone)
+        current_datetime = datetime.now(tz)
+
+        # =========================================================================
+        # CRITICAL (Opinion 4): Include conversation history for multi-turn context
+        # Without this, "Tomorrow at 10am, cleaning" after "I want to book" loses intent
+        # =========================================================================
+        messages = state.get('messages', [])
+        recent_turns = messages[-6:] if len(messages) > 6 else messages  # Last 3 exchanges
+        conversation_context = ""
+        if recent_turns and len(recent_turns) > 1:
+            conversation_context = "Recent conversation:\n"
+            for msg in recent_turns:
+                role = "User" if getattr(msg, 'role', 'user') == "user" else "Agent"
+                content = getattr(msg, 'content', str(msg))[:200]
+                conversation_context += f"{role}: {content}\n"
+            conversation_context += "\n"
+
+        # =========================================================================
+        # ENHANCED (Opinion 3): Add few-shot examples for ~15% accuracy boost
+        # =========================================================================
+        extraction_prompt = f"""Extract booking information from the user message.
+Current date/time: {current_datetime.strftime('%A, %B %d, %Y %I:%M %p')} ({clinic_timezone})
+
+{conversation_context}Current user message: "{message}"
+
+EXAMPLES:
+User: "Book me a cleaning tomorrow at 2pm. John Doe, 123-456-7890." -> {{"intent": "book", "service_type": "cleaning", "requested_date": "tomorrow", "requested_time": "2pm", "patient_name": "John Doe", "patient_phone": "1234567890", "doctor_preference": null, "urgency": "normal"}}
+User: "My tooth really hurts, I need to see someone today" -> {{"intent": "book", "service_type": null, "requested_date": "today", "requested_time": null, "patient_name": null, "patient_phone": null, "doctor_preference": null, "urgency": "urgent"}}
+User: "Tomorrow at 10am works for me" (after booking context) -> {{"intent": "book", "service_type": null, "requested_date": "tomorrow", "requested_time": "10am", "patient_name": null, "patient_phone": null, "doctor_preference": null, "urgency": "normal"}}
+
+Extract these fields if present (leave null if not mentioned):
+- intent: "book" | "reschedule" | "cancel" | "check_availability" (infer from conversation if not explicit)
+- service_type: The type of appointment (cleaning, checkup, exam, etc.)
+- requested_date: Natural language date ONLY (e.g., "tomorrow", "next Tuesday") - do NOT convert to ISO
+- requested_time: Natural language time ONLY (e.g., "10am", "morning") - do NOT calculate
+- patient_name: Patient's name if provided
+- patient_phone: Phone number if provided (digits only, remove formatting)
+- doctor_preference: Doctor name if mentioned (e.g., "Dr. Smith")
+- urgency: "urgent" if pain/emergency mentioned, "normal" otherwise
+
+Return valid JSON only, no markdown:
+{{"intent": "...", "service_type": "...", "requested_date": "...", "requested_time": "...", "patient_name": "...", "patient_phone": "...", "doctor_preference": "...", "urgency": "..."}}"""
+
+        extracted = {}
+
+        if self.llm_factory:
+            try:
+                response = await self.llm_factory.generate(
+                    messages=[{"role": "system", "content": extraction_prompt}],
+                    model="gpt-4o-mini",
+                    temperature=0.1,
+                    max_tokens=200,
+                    response_format={"type": "json_object"},
+                )
+
+                import json
+                extracted = json.loads(response.content)
+                logger.info(f"[booking_extractor] Extracted: {extracted}")
+
+            except Exception as e:
+                logger.warning(f"[booking_extractor] LLM extraction failed: {e}")
+                # Fallback to regex-based extraction
+                extracted = self._fallback_booking_extraction(message)
+        else:
+            extracted = self._fallback_booking_extraction(message)
+
+        # =========================================================================
+        # Map extracted info to state fields expected by planner
+        # ENHANCED (Opinion 2): Normalize phone to digits only for DB lookups
+        # =========================================================================
+        if extracted.get('intent'):
+            state['booking_intent'] = extracted['intent']
+
+        if extracted.get('service_type'):
+            # FIXED: Map extracted service types to valid enum values
+            # Schema expects: consultation, checkup, dental_cleaning, emergency, followup, procedure, general
+            service_mapping = {
+                'cleaning': 'dental_cleaning',
+                'teeth cleaning': 'dental_cleaning',
+                'dental cleaning': 'dental_cleaning',
+                'clean': 'dental_cleaning',
+                'checkup': 'checkup',
+                'check up': 'checkup',
+                'exam': 'checkup',
+                'examination': 'checkup',
+                'consultation': 'consultation',
+                'consult': 'consultation',
+                'emergency': 'emergency',
+                'urgent': 'emergency',
+                'follow up': 'followup',
+                'followup': 'followup',
+                'follow-up': 'followup',
+                'procedure': 'procedure',
+                'root canal': 'procedure',
+                'filling': 'procedure',
+                'extraction': 'procedure',
+                'whitening': 'procedure',
+            }
+            raw_service = extracted['service_type'].lower()
+            state['appointment_type'] = service_mapping.get(raw_service, 'general')
+
+        if extracted.get('requested_date') or extracted.get('requested_time'):
+            # Keep as natural language - semantic adapter will parse to ISO
+            # (Opinion 2: LLMs struggle with date math, let Python handle it)
+            # FIXED: Handle None values explicitly (not just missing keys)
+            req_date = extracted.get('requested_date') or ''
+            req_time = extracted.get('requested_time') or ''
+            date_str = f"{req_date} {req_time}".strip()
+            if date_str:
+                state['preferred_date'] = date_str
+                state['preferred_date_raw'] = date_str
+
+        if extracted.get('patient_name'):
+            state['patient_name'] = extracted['patient_name']
+
+        if extracted.get('patient_phone'):
+            # CRITICAL (Opinion 2): Normalize phone to digits only
+            # DB has "5551234567" but user says "555-123-4567" - mismatch breaks lookup
+            raw_phone = extracted['patient_phone']
+            normalized_phone = ''.join(filter(str.isdigit, str(raw_phone)))
+            state['patient_phone'] = normalized_phone
+            logger.info(f"[booking_extractor] Normalized phone: {raw_phone} -> {normalized_phone}")
+
+        if extracted.get('doctor_preference'):
+            # Store as doctor_preference (name), will be resolved to UUID in planner
+            state['doctor_preference'] = extracted['doctor_preference']
+
+        if extracted.get('urgency') == 'urgent':
+            state['is_urgent'] = True
+
+        state['extracted_booking_info'] = extracted
+
+        state['audit_trail'].append({
+            "node": "booking_extractor",
+            "timestamp": datetime.utcnow().isoformat(),
+            "extracted_fields": list(k for k, v in extracted.items() if v),
+        })
+
+        return state
+
+    def _fallback_booking_extraction(self, message: str) -> dict:
+        """Regex-based fallback for booking info extraction."""
+        extracted = {}
+        message_lower = message.lower()
+
+        # Intent detection
+        if any(w in message_lower for w in ['book', 'schedule', 'appointment', 'запис']):
+            extracted['intent'] = 'book'
+        elif any(w in message_lower for w in ['cancel', 'отмен']):
+            extracted['intent'] = 'cancel'
+        elif any(w in message_lower for w in ['reschedule', 'перенес']):
+            extracted['intent'] = 'reschedule'
+
+        # Service type
+        services = ['cleaning', 'checkup', 'exam', 'filling', 'root canal', 'whitening',
+                    'чистка', 'осмотр', 'пломба', 'limpieza', 'examen']
+        for service in services:
+            if service in message_lower:
+                extracted['service_type'] = service
+                break
+
+        # Phone number (any 10+ digit sequence)
+        phone_match = re.search(r'[\d\-\(\)\s]{10,}', message)
+        if phone_match:
+            extracted['patient_phone'] = re.sub(r'[^\d]', '', phone_match.group())
+
+        # Name after "my name is" or similar
+        name_patterns = [
+            r"my name is\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+            r"i'm\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+            r"меня зовут\s+([А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)?)",
+            r"mi nombre es\s+([A-Z][a-záéíóúñ]+(?:\s+[A-Z][a-záéíóúñ]+)?)",
+        ]
+        for pattern in name_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                extracted['patient_name'] = match.group(1)
+                break
+
+        # Time patterns
+        time_patterns = [
+            r'(\d{1,2}(?::\d{2})?\s*(?:am|pm))',
+            r'(\d{1,2}:\d{2})',
+            r'(morning|afternoon|evening)',
+        ]
+        for pattern in time_patterns:
+            match = re.search(pattern, message_lower)
+            if match:
+                extracted['requested_time'] = match.group(1)
+                break
+
+        # Date patterns
+        if 'tomorrow' in message_lower or 'завтра' in message_lower or 'mañana' in message_lower:
+            extracted['requested_date'] = 'tomorrow'
+        elif 'today' in message_lower or 'сегодня' in message_lower or 'hoy' in message_lower:
+            extracted['requested_date'] = 'today'
+
+        return extracted
+
+    async def _resolve_doctor_id(self, doctor_name: str, state: HealthcareConversationState) -> Optional[str]:
+        """
+        Resolve doctor name to UUID.
+
+        Per Opinion 4: "Dr. Smith" -> "doc-123-uuid"
+        If multiple matches (Dr. John Smith vs Dr. Jane Smith), returns None
+        and planner should ask user to clarify.
+        """
+        if not doctor_name:
+            return None
+
+        clinic_id = state.get('metadata', {}).get('clinic_id')
+        if not clinic_id:
+            return None
+
+        # Try to find doctor in clinic's staff
+        clinic_profile = state.get('context', {}).get('clinic_profile', {})
+        doctors = clinic_profile.get('doctors', [])
+
+        # Normalize search term
+        search_term = doctor_name.lower().replace('dr.', '').replace('dr', '').strip()
+
+        matches = []
+        for doc in doctors:
+            doc_name = doc.get('name', '').lower()
+            if search_term in doc_name or doc_name in search_term:
+                matches.append(doc)
+
+        if len(matches) == 1:
+            return matches[0].get('id')
+        elif len(matches) > 1:
+            # Multiple matches - ambiguous
+            logger.warning(f"[planner] Ambiguous doctor: '{doctor_name}' matches {[m.get('name') for m in matches]}")
+            # Could set state['needs_doctor_clarification'] = True and list options
+            return None
+        else:
+            # No matches - may be typo or doctor not at this clinic
+            logger.warning(f"[planner] No doctor match for: '{doctor_name}'")
+            return None
+
+    def _generate_booking_summary(
+        self,
+        adapted_args: dict,
+        state: HealthcareConversationState,
+        step_name: str,
+        language: str = 'en'
+    ) -> str:
+        """
+        Generate informative human_summary for ActionProposal.
+
+        FIXED (Phase 4): Instead of generic "Book the selected appointment",
+        include actual booking details: patient name, service type, date/time, doctor.
+
+        Example output:
+        - "Book dental cleaning for John Smith on Dec 27 at 10:00 AM"
+        - "Записать Марию на чистку зубов на 27 декабря в 10:00"
+        """
+        # Extract booking details from args and state
+        patient_name = adapted_args.get('patient_name') or state.get('patient_name') or 'patient'
+        service_type = adapted_args.get('appointment_type') or state.get('appointment_type') or 'appointment'
+        datetime_str = adapted_args.get('datetime_str') or state.get('preferred_date') or ''
+
+        # Get doctor name if available
+        doctor_id = adapted_args.get('doctor_id')
+        doctor_name = None
+        if doctor_id:
+            # Try to resolve doctor ID back to name for display
+            clinic_profile = state.get('context', {}).get('clinic_profile', {})
+            for doc in clinic_profile.get('doctors', []):
+                if doc.get('id') == doctor_id:
+                    doctor_name = doc.get('name')
+                    break
+        if not doctor_name:
+            doctor_name = state.get('doctor_preference')
+
+        # Build summary based on language
+        if language == 'ru':
+            parts = [f"Записать {patient_name}"]
+            if service_type and service_type != 'appointment':
+                service_ru = {
+                    'cleaning': 'на чистку зубов',
+                    'checkup': 'на осмотр',
+                    'exam': 'на обследование',
+                    'filling': 'на пломбирование',
+                    'root canal': 'на лечение корневого канала',
+                    'whitening': 'на отбеливание',
+                }.get(service_type.lower(), f'на {service_type}')
+                parts.append(service_ru)
+            if doctor_name:
+                parts.append(f"к {doctor_name}")
+            if datetime_str:
+                parts.append(f"на {datetime_str}")
+            return ' '.join(parts)
+
+        elif language == 'es':
+            parts = [f"Reservar {service_type} para {patient_name}"]
+            if doctor_name:
+                parts.append(f"con {doctor_name}")
+            if datetime_str:
+                parts.append(f"el {datetime_str}")
+            return ' '.join(parts)
+
+        else:  # English default
+            parts = [f"Book {service_type} for {patient_name}"]
+            if doctor_name:
+                parts.append(f"with {doctor_name}")
+            if datetime_str:
+                parts.append(f"on {datetime_str}")
+            return ' '.join(parts)
+
     # ========================================================================
     # Phase 2: Plan-then-Execute Nodes
     # ========================================================================
@@ -1785,27 +2282,64 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
         ctx = state.get('context', {})
         language = state.get('detected_language', 'en')
 
-        # Determine action type from message
-        action_type = 'book'  # Default
-        if any(w in message for w in ['cancel', 'cancelar', 'отменить']):
-            action_type = 'cancel'
-        elif any(w in message for w in ['reschedule', 'reprogramar', 'перенести']):
-            action_type = 'reschedule'
+        # =========================================================================
+        # Phase 4: Use extracted booking info with fallbacks
+        # =========================================================================
+        extracted = state.get('extracted_booking_info', {})
+
+        # Prefer extracted values, fall back to state, then defaults
+        doctor_preference = state.get('doctor_preference') or extracted.get('doctor_preference')
+        preferred_date = state.get('preferred_date') or extracted.get('requested_date')
+        appointment_type = state.get('appointment_type') or extracted.get('service_type') or 'general'
+        patient_name = state.get('patient_name') or extracted.get('patient_name')
+        patient_phone = state.get('patient_phone') or extracted.get('patient_phone')
+
+        # =========================================================================
+        # CRITICAL (Opinion 4): Resolve doctor name -> UUID
+        # "Dr. Smith" must become a real doctor_id before passing to tools
+        # =========================================================================
+        doctor_id = state.get('doctor_id')  # May already be resolved
+        if not doctor_id and doctor_preference:
+            doctor_id = await self._resolve_doctor_id(doctor_preference, state)
+            if doctor_id:
+                state['doctor_id'] = doctor_id
+                logger.info(f"[planner] Resolved doctor: {doctor_preference} -> {doctor_id}")
+            else:
+                # Could not resolve - may need to ask user to clarify
+                logger.warning(f"[planner] Could not resolve doctor: {doctor_preference}")
+                # Continue without doctor_id - may get any available doctor
+
+        # Build patient identifier for lookup (phone preferred, then name)
+        patient_identifier = None
+        if patient_phone:
+            patient_identifier = patient_phone
+        elif patient_name:
+            patient_identifier = patient_name
+
+        logger.info(f"[planner] Using: doctor={doctor_id}, date={preferred_date}, type={appointment_type}, patient_id={patient_identifier}")
+
+        # Determine action type from extracted intent or message keywords
+        action_type = state.get('booking_intent', 'book')  # Use extracted intent if available
+        if action_type not in ['book', 'cancel', 'reschedule', 'check_availability']:
+            action_type = 'book'  # Default to book
+            if any(w in message for w in ['cancel', 'cancelar', 'отменить']):
+                action_type = 'cancel'
+            elif any(w in message for w in ['reschedule', 'reprogramar', 'перенести']):
+                action_type = 'reschedule'
 
         # Build plan based on action type
         steps = []
 
         if action_type == 'book':
-            # Standard booking flow
-            # check_availability expects: doctor_id, date, appointment_type, duration_minutes
+            # Standard booking flow - now using extracted values
             steps = [
                 PlanStep(
                     action=ActionType.CHECK_AVAILABILITY,
                     tool_name="check_availability",
                     arguments={
-                        "doctor_id": state.get('doctor_id'),
-                        "date": state.get('preferred_date'),
-                        "appointment_type": state.get('appointment_type', 'general'),
+                        "doctor_id": doctor_id,  # Now a UUID, not a name
+                        "date": preferred_date,  # Semantic adapter will parse natural language
+                        "appointment_type": appointment_type,
                         "duration_minutes": 30,
                     },
                     requires_confirmation=False,
@@ -1815,10 +2349,12 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
                     action=ActionType.BOOK_APPOINTMENT,
                     tool_name="book_appointment",
                     arguments={
-                        "patient_id": state.get('patient_id') or "unknown",
-                        "doctor_id": state.get('doctor_id'),
-                        "datetime_str": state.get('preferred_date'),  # Will be set from available slots
-                        "appointment_type": state.get('appointment_type', 'general'),
+                        "patient_identifier": patient_identifier,  # Phone or name for lookup
+                        "patient_name": patient_name,
+                        "patient_phone": patient_phone,
+                        "doctor_id": doctor_id,
+                        "datetime_str": preferred_date,
+                        "appointment_type": appointment_type,
                         "duration_minutes": 30,
                     },
                     requires_confirmation=True,  # HITL for bookings
@@ -1847,9 +2383,9 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
                     action=ActionType.CHECK_AVAILABILITY,
                     tool_name="check_availability",
                     arguments={
-                        "doctor_id": state.get('doctor_id'),
-                        "date": state.get('preferred_date'),
-                        "appointment_type": state.get('appointment_type', 'general'),
+                        "doctor_id": doctor_id,  # Use Phase 4 resolved value
+                        "date": preferred_date,  # Use Phase 4 extracted value
+                        "appointment_type": appointment_type,
                         "duration_minutes": 30,
                     },
                     requires_confirmation=False,
@@ -1858,12 +2394,67 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
                 PlanStep(
                     action=ActionType.RESCHEDULE_APPOINTMENT,
                     tool_name="reschedule_appointment",
-                    arguments={"patient_id": state.get('patient_id')},
+                    arguments={
+                        "patient_identifier": patient_identifier,
+                        "patient_id": state.get('patient_id'),
+                    },
                     requires_confirmation=True,
                     description="Move appointment to new time"
                 ),
             ]
             goal = "Reschedule patient's appointment"
+
+        elif action_type == 'check_availability':
+            # User just wants to check availability, not book yet
+            steps = [
+                PlanStep(
+                    action=ActionType.CHECK_AVAILABILITY,
+                    tool_name="check_availability",
+                    arguments={
+                        "doctor_id": doctor_id,
+                        "date": preferred_date,
+                        "appointment_type": appointment_type,
+                        "duration_minutes": 30,
+                    },
+                    requires_confirmation=False,
+                    description="Check available appointment slots"
+                ),
+            ]
+            goal = "Check appointment availability"
+
+        else:
+            # Fallback: default to booking flow
+            logger.warning(f"[planner] Unknown action_type '{action_type}', defaulting to book")
+            steps = [
+                PlanStep(
+                    action=ActionType.CHECK_AVAILABILITY,
+                    tool_name="check_availability",
+                    arguments={
+                        "doctor_id": doctor_id,
+                        "date": preferred_date,
+                        "appointment_type": appointment_type,
+                        "duration_minutes": 30,
+                    },
+                    requires_confirmation=False,
+                    description="Check available appointment slots"
+                ),
+                PlanStep(
+                    action=ActionType.BOOK_APPOINTMENT,
+                    tool_name="book_appointment",
+                    arguments={
+                        "patient_identifier": patient_identifier,
+                        "patient_name": patient_name,
+                        "patient_phone": patient_phone,
+                        "doctor_id": doctor_id,
+                        "datetime_str": preferred_date,
+                        "appointment_type": appointment_type,
+                        "duration_minutes": 30,
+                    },
+                    requires_confirmation=True,
+                    description="Book the selected appointment"
+                ),
+            ]
+            goal = "Book appointment for patient"
 
         # Create typed plan
         plan = ActionPlan(
@@ -1956,6 +2547,81 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
 
         logger.info(f"[executor] Executing step {next_step_idx + 1}/{len(steps)}: {step_name}")
 
+        # =========================================================================
+        # Phase 4: Mandatory field validation (booking flow fix)
+        # For book_appointment, validate mandatory fields BEFORE proceeding
+        # =========================================================================
+        if step_name == "book_appointment":
+            args = next_step.get('arguments', {})
+            patient_identifier = args.get('patient_identifier') or args.get('patient_phone') or args.get('patient_name')
+
+            if not patient_identifier:
+                # Missing patient info - ask for clarification
+                logger.warning("[executor] Missing patient identifier for booking")
+
+                # ENHANCED (Opinion 3): Track clarification count, escalate after 2+
+                clarification_count = (state.get('clarification_count') or 0) + 1
+                state['clarification_count'] = clarification_count
+
+                if clarification_count > 2:
+                    # Too many clarifications - escalate to human
+                    logger.warning(f"[executor] Escalating after {clarification_count} clarification attempts")
+                    state['needs_human_escalation'] = True
+                    state['response'] = "I'm having trouble processing your booking. Let me connect you with our staff who can assist you directly."
+                    return state
+
+                state['awaiting_patient_identification'] = True
+
+                language = state.get('detected_language', 'en')
+                # ENHANCED (Opinion 3): Dynamic clarification with context
+                service_type = args.get('appointment_type', 'appointment')
+                clarification_messages = {
+                    'en': f"I'd be happy to book your {service_type} for you. Could you please provide your name and phone number so I can find your record?",
+                    'es': f"Con gusto le ayudo con su cita de {service_type}. ¿Podría proporcionarme su nombre y número de teléfono?",
+                    'ru': f"С удовольствием запишу вас на {service_type}. Не могли бы вы назвать ваше имя и номер телефона?",
+                }
+                state['response'] = clarification_messages.get(language, clarification_messages['en'])
+
+                state['audit_trail'].append({
+                    "node": "executor",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "action": "request_patient_info",
+                    "reason": "missing_patient_identifier",
+                    "clarification_count": clarification_count
+                })
+                return state
+
+            if not args.get('datetime_str'):
+                # Missing appointment time
+                logger.warning("[executor] Missing datetime for booking")
+
+                clarification_count = (state.get('clarification_count') or 0) + 1
+                state['clarification_count'] = clarification_count
+
+                if clarification_count > 2:
+                    state['needs_human_escalation'] = True
+                    state['response'] = "I'm having trouble processing your booking. Let me connect you with our staff."
+                    return state
+
+                state['awaiting_datetime'] = True
+
+                language = state.get('detected_language', 'en')
+                clarification_messages = {
+                    'en': "When would you like to schedule your appointment? You can say something like 'tomorrow at 2pm' or 'next Monday morning'.",
+                    'es': "¿Cuándo le gustaría programar su cita?",
+                    'ru': "Когда бы вы хотели записаться? Можете сказать, например, 'завтра в 14:00'.",
+                }
+                state['response'] = clarification_messages.get(language, clarification_messages['en'])
+
+                state['audit_trail'].append({
+                    "node": "executor",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "action": "request_datetime",
+                    "reason": "missing_datetime",
+                    "clarification_count": clarification_count
+                })
+                return state
+
         # Check if step requires confirmation
         if next_step.get('requires_confirmation'):
             # Check if user already confirmed
@@ -1979,12 +2645,31 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
                     adapted_args = raw_args
 
                 # Need confirmation - create proposal with adapted arguments
+                # FIXED (Phase 4): slot must be dict, not string
+                slot_value = adapted_args.get('datetime_str') or adapted_args.get('slot')
+                if isinstance(slot_value, str) and slot_value:
+                    # Convert datetime string to slot dict format
+                    slot_dict = {"datetime": slot_value}
+                elif isinstance(slot_value, dict):
+                    slot_dict = slot_value
+                else:
+                    slot_dict = None
+
+                # FIXED (Phase 4): Generate informative human_summary with actual booking details
+                # Instead of generic "Book the selected appointment", include patient name, time, etc.
+                human_summary = self._generate_booking_summary(
+                    adapted_args=adapted_args,
+                    state=state,
+                    step_name=step_name,
+                    language=state.get('detected_language', 'en')
+                )
+
                 proposal = ActionProposal(
                     type=ActionProposalType.BOOK_APPOINTMENT,  # Adjust based on step
-                    patient_id=adapted_args.get('patient_id', state.get('patient_id', '')),
+                    patient_id=adapted_args.get('patient_id', state.get('patient_id', '') or ''),
                     provider_id=adapted_args.get('doctor_id'),
-                    slot=adapted_args.get('datetime_str') or adapted_args.get('slot'),
-                    human_summary=next_step.get('description', 'Complete the action'),
+                    slot=slot_dict,
+                    human_summary=human_summary,
                     execution_params=adapted_args,  # Use adapted arguments
                     ttl_seconds=1800,  # 30 minute TTL
                 )
@@ -2101,6 +2786,30 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
     def executor_router(self, state: HealthcareConversationState) -> str:
         """Route based on executor result."""
         logger.info(f"[executor_router] awaiting_confirmation={state.get('awaiting_confirmation')}, action_plan={bool(state.get('action_plan'))}")
+
+        # =========================================================================
+        # Phase 4: Handle clarification and escalation flows (booking flow fix)
+        # =========================================================================
+
+        # ENHANCED: Human escalation - exit immediately
+        if state.get('needs_human_escalation'):
+            logger.info("[executor_router] Routing to exit for human escalation")
+            return 'exit'  # Exit flow, response already set
+
+        # Awaiting clarification - exit to get response to user
+        if state.get('awaiting_patient_identification') or state.get('awaiting_datetime'):
+            logger.info("[executor_router] Awaiting clarification, exiting to user")
+            return 'exit'  # Exit flow so user gets the clarification prompt
+
+        # ENHANCED (Opinion 4): Handle slot taken - trigger replan with different time
+        if state.get('slot_taken_error'):
+            logger.info("[executor_router] Slot taken, replanning with different time")
+            state['replan_reason'] = 'slot_taken'
+            return 'replan'
+
+        # =========================================================================
+        # Existing routing logic
+        # =========================================================================
 
         if state.get('awaiting_confirmation'):
             return 'exit'  # Wait for user response
@@ -2415,6 +3124,42 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
 
             specialized_context.append(insurance_info)
             logger.info(f"[process_node] Injecting insurance context: needs_info={needs_info}")
+
+        # PHASE 4: Include extracted booking info in response generation
+        # This ensures patient name, service type, etc. appear in responses
+        extracted_booking = state.get('extracted_booking_info', {})
+        if extracted_booking:
+            booking_parts = ["Current booking request details:"]
+
+            patient_name = extracted_booking.get('patient_name') or state.get('patient_name')
+            if patient_name:
+                booking_parts.append(f"- Patient: {patient_name}")
+
+            patient_phone = extracted_booking.get('patient_phone') or state.get('patient_phone')
+            if patient_phone:
+                booking_parts.append(f"- Phone: {patient_phone}")
+
+            service_type = extracted_booking.get('service_type') or state.get('appointment_type')
+            if service_type:
+                booking_parts.append(f"- Service: {service_type}")
+
+            requested_date = extracted_booking.get('requested_date') or state.get('preferred_date')
+            requested_time = extracted_booking.get('requested_time')
+            if requested_date or requested_time:
+                datetime_str = f"{requested_date or ''} {requested_time or ''}".strip()
+                booking_parts.append(f"- Requested time: {datetime_str}")
+
+            doctor_pref = extracted_booking.get('doctor_preference') or state.get('doctor_preference')
+            if doctor_pref:
+                booking_parts.append(f"- Doctor preference: {doctor_pref}")
+
+            if extracted_booking.get('urgency') == 'urgent' or state.get('is_urgent'):
+                booking_parts.append("- URGENT: Patient indicated pain or emergency")
+
+            booking_info = "\n".join(booking_parts)
+            booking_info += "\n\nIMPORTANT: Reference these details (especially patient name) in your response."
+            specialized_context.append(booking_info)
+            logger.info(f"[process_node] Injecting extracted booking info: {list(extracted_booking.keys())}")
 
         # If we have specialized context, create enhanced prompt
         if specialized_context:
