@@ -55,8 +55,8 @@ google-auth==2.45.0
 google-auth-httplib2==0.3.0
 
 # Microsoft Graph SDK for Outlook Calendar
-msgraph-sdk==1.15.0
-azure-identity==1.19.0
+msgraph-sdk>=1.50.0
+azure-identity>=1.19.0
 
 # Utilities
 psutil==5.9.6
