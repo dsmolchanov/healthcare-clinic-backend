@@ -5,8 +5,10 @@ from app.services.llm.capability_matrix import CapabilityMatrix
 from app.services.llm.adapters.glm_adapter import GLMAdapter
 from app.services.llm.adapters.gemini_adapter import GeminiAdapter
 from app.services.llm.adapters.openai_adapter import OpenAIAdapter
+from app.services.llm.tiers import ModelTier
 # from app.services.llm.adapters.cerebras_adapter import CerebrasAdapter  # Disabled due to httpx compatibility
 import logging
+import os
 import time
 
 logger = logging.getLogger(__name__)
@@ -198,10 +200,11 @@ class LLMFactory:
 
         # Route to model with tool support
         if not model:
-            # Default to gpt-4o-mini for tool calling (stable)
+            # Resolve from tier registry for tool calling (default)
             # Note: gemini-3-flash-preview has issues with truncated responses
-            model = "gpt-4o-mini"
-            logger.info(f"Using gpt-4o-mini for tool calling (default)")
+            from app.services.llm.tiers import ModelTier, DEFAULT_TIER_MODELS
+            model = os.environ.get("TIER_TOOL_CALLING_MODEL", DEFAULT_TIER_MODELS[ModelTier.TOOL_CALLING])
+            logger.info(f"Using {model} for tool calling (tier default)")
 
         # Get adapter
         adapter = await self.create_adapter(model)
@@ -231,6 +234,119 @@ class LLMFactory:
             return await self._fallback_generate_with_tools(
                 messages, tools, model, temperature, max_tokens, **kwargs
             )
+
+    @observe()
+    async def generate_for_tier(
+        self,
+        tier: ModelTier,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        clinic_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        **kwargs
+    ) -> LLMResponse:
+        """
+        Generate response using tier-based model selection.
+
+        This is the preferred method for new code. Instead of specifying
+        a model directly, specify the intent via tier.
+
+        Args:
+            tier: Semantic tier (e.g., ModelTier.ROUTING)
+            messages: Chat messages
+            temperature: Sampling temperature
+            max_tokens: Max output tokens
+            clinic_id: For clinic-specific model routing
+            session_id: For sticky A/B experiment assignment
+            **kwargs: Additional args passed to adapter
+
+        Returns:
+            LLMResponse with content and metadata
+        """
+        from app.services.llm.tier_registry import get_tier_registry
+
+        # Resolve tier to model
+        registry = await get_tier_registry()
+        resolution = await registry.resolve(tier, clinic_id, session_id)
+
+        logger.info(
+            f"Tier {tier.value} resolved to {resolution.model_name} "
+            f"(source={resolution.source}, experiment={resolution.experiment_id})"
+        )
+
+        # Delegate to existing generate method
+        response = await self.generate(
+            messages=messages,
+            model=resolution.model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs
+        )
+
+        # Enhance response with tier context
+        response.tier = tier.value
+        response.tier_source = resolution.source
+        response.experiment_id = resolution.experiment_id
+        response.variant = resolution.variant
+
+        return response
+
+    @observe()
+    async def generate_with_tools_for_tier(
+        self,
+        tier: ModelTier,
+        messages: List[Dict[str, str]],
+        tools: List[Dict[str, Any]],
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        clinic_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        **kwargs
+    ) -> LLMResponse:
+        """
+        Generate with tool calling using tier-based model selection.
+
+        Args:
+            tier: Semantic tier (typically ModelTier.TOOL_CALLING)
+            messages: Chat messages
+            tools: Tool definitions
+            temperature: Sampling temperature
+            max_tokens: Max output tokens
+            clinic_id: For clinic-specific routing
+            session_id: For A/B assignment
+            **kwargs: Additional args
+
+        Returns:
+            LLMResponse with tool_calls
+        """
+        from app.services.llm.tier_registry import get_tier_registry
+
+        # Resolve tier
+        registry = await get_tier_registry()
+        resolution = await registry.resolve(tier, clinic_id, session_id)
+
+        logger.info(
+            f"Tier {tier.value} (tools) resolved to {resolution.model_name} "
+            f"(source={resolution.source})"
+        )
+
+        # Delegate to existing method
+        response = await self.generate_with_tools(
+            messages=messages,
+            tools=tools,
+            model=resolution.model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs
+        )
+
+        response.tier = tier.value
+        response.tier_source = resolution.source
+        response.experiment_id = resolution.experiment_id
+        response.variant = resolution.variant
+
+        return response
 
     async def _fallback_generate(
         self,
@@ -282,9 +398,12 @@ class LLMFactory:
         max_tokens: Optional[int],
         **kwargs
     ) -> LLMResponse:
-        """Fallback to gemini-3-flash-preview for tool calling"""
+        """Fallback to alternate model for tool calling"""
+        from app.services.llm.tiers import ModelTier, DEFAULT_TIER_MODELS
         # Try gemini-3-flash-preview first (builtin, no DB dependency)
-        fallback_model = "gemini-3-flash-preview" if failed_model != "gemini-3-flash-preview" else "gpt-4o-mini"
+        # Use tier default as secondary fallback
+        tier_default = DEFAULT_TIER_MODELS[ModelTier.TOOL_CALLING]
+        fallback_model = "gemini-3-flash-preview" if failed_model != "gemini-3-flash-preview" else tier_default
         logger.warning(f"Tool calling failed, falling back to {fallback_model}")
         adapter = await self.create_adapter(fallback_model)
 
