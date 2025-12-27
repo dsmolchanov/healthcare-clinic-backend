@@ -81,6 +81,7 @@ class PromptComposer:
         self,
         ctx,  # PipelineContext
         include_booking_policy: bool = True,
+        tool_mode: bool = False,  # Whether this prompt will be used with generate_with_tools()
     ) -> str:
         """
         Compose system prompt with database template support.
@@ -91,6 +92,9 @@ class PromptComposer:
         Args:
             ctx: PipelineContext with all conversation data
             include_booking_policy: Whether to include booking flow instructions
+            tool_mode: Whether this prompt will be used with generate_with_tools().
+                       When False, strips tool-specific instructions to prevent
+                       the LLM from hallucinating tool calls.
 
         Returns:
             Complete system prompt string
@@ -143,7 +147,26 @@ class PromptComposer:
         if include_booking_policy:
             booking_policy = get_template('booking_policy')
             if booking_policy:
-                sections.append(booking_policy.format(**context))
+                formatted_policy = booking_policy.format(**context)
+
+                # If not in tool_mode, strip tool-specific instructions to prevent
+                # the LLM from hallucinating tool calls when tools aren't available
+                if not tool_mode:
+                    lines = formatted_policy.split('\n')
+                    filtered_lines = [
+                        line for line in lines
+                        if not any(kw in line for kw in [
+                            'MUST call query_service_prices',
+                            'MUST call check_availability',
+                            'MANDATORY TOOL CALLS',
+                            'YOU DO NOT know any prices',
+                            'YOU DO NOT know availability',
+                            'CALL THE TOOL FIRST',
+                        ])
+                    ]
+                    formatted_policy = '\n'.join(filtered_lines)
+
+                sections.append(formatted_policy)
 
         # 6. Patient profile (uses helper function, no DB override yet)
         profile_section = build_profile_section(ctx.profile, ctx.conversation_state)

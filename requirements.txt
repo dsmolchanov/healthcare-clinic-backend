@@ -76,10 +76,12 @@ babel==2.16.0
 # Stripe Payment Integration
 stripe==11.3.0
 
-# OpenTelemetry for Arize Cloud
-opentelemetry-exporter-otlp-proto-http==1.29.0
-openinference-instrumentation-google-genai==0.1.1
-openinference-instrumentation-langchain==0.1.35
+# OpenTelemetry for Arize Cloud (upgraded for langfuse>=3.10 compatibility)
+opentelemetry-api>=1.33.1
+opentelemetry-sdk>=1.33.1
+opentelemetry-exporter-otlp-proto-http>=1.33.1
+openinference-instrumentation-google-genai>=0.1.1
+openinference-instrumentation-langchain>=0.1.35
 
 # ============================================
 # REMOVED DEPENDENCIES (Phase 6 cleanup):

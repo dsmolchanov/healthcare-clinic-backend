@@ -469,7 +469,10 @@ class BaseLangGraphOrchestrator:
                                 'constraints': None,
                                 'narrowing_instruction': None,
                             })()
-                            system_prompt = await composer.compose_async(mock_ctx, include_booking_policy=True)
+                            # CRITICAL: process_node uses generate() without tools, so we must NOT include
+                            # booking_policy which contains "MUST call query_service_prices" instructions.
+                            # Tool-calling happens in domain agents (dynamic_info_agent, appointment_handler).
+                            system_prompt = await composer.compose_async(mock_ctx, include_booking_policy=False)
                             logger.debug(f"[LangGraph] Using DB-backed prompt composer for clinic {clinic_id}")
                         else:
                             raise ValueError("No clinic_id for prompt composer")
@@ -499,6 +502,15 @@ class BaseLangGraphOrchestrator:
 
                 # Add current message
                 messages.append({"role": "user", "content": state['message']})
+
+                # Debug assertion: catch prompt-tool mismatch early
+                if logger.isEnabledFor(logging.DEBUG):
+                    tool_keywords = ['query_service_prices', 'check_availability', 'book_appointment', 'MUST call']
+                    if any(kw in system_prompt for kw in tool_keywords):
+                        logger.warning(
+                            "[process_node] Prompt contains tool references but generate() has no tools! "
+                            "This will cause the LLM to hallucinate or refuse to answer."
+                        )
 
                 # Generate using factory
                 response = await self.llm_factory.generate(
