@@ -2190,6 +2190,14 @@ Return valid JSON only, no markdown:
 
         state['extracted_booking_info'] = extracted
 
+        # =========================================================================
+        # CRITICAL: Set booking_intent for planner to distinguish book/cancel/reschedule
+        # Without this, cancellation requests get routed to booking flow
+        # =========================================================================
+        if extracted.get('intent'):
+            state['booking_intent'] = extracted['intent']
+            logger.info(f"[booking_extractor] Set booking_intent: {extracted['intent']}")
+
         # Log final context state for debugging multi-turn issues
         logger.info(f"[booking_extractor] Final context: doctor={state.get('doctor_preference')}, "
                     f"service={state.get('appointment_type')}, date={state.get('preferred_date')}, "
@@ -3155,11 +3163,13 @@ Return valid JSON only, no markdown:
             state_transition = self._determine_state_transition(result)
 
             # Return enriched result for pipeline integration
+            # CRITICAL: Include flow_state for multi-turn state persistence
             return {
                 'response': result.get('response'),
                 'intent': result.get('intent'),
                 'audit_trail': result.get('audit_trail', []),
                 'state_transition': state_transition,
+                'flow_state': result.get('flow_state'),  # Persist across turns
                 'context': result.get('context', {}),
                 'should_escalate': result.get('should_end') and 'emergency' in str(result.get('response', '')).lower(),
                 'pending_action': result.get('metadata', {}).get('pending_action'),

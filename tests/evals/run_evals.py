@@ -30,7 +30,8 @@ async def run_evals():
     parser.add_argument("scenario_file", nargs="?", default="tests/evals/scenarios.yaml", help="Path to scenarios YAML file")
     parser.add_argument("--real-data", action="store_true", help="Run against real Supabase data (disable DB/Tool mocks)")
     parser.add_argument("--clinic-id", default="test-clinic", help="Clinic ID to test against (default: test-clinic)")
-    parser.add_argument("--trace", action="store_true", help="Enable Langfuse tracing (sends traces to Langfuse dashboard)")
+    parser.add_argument("--no-trace", action="store_true", help="Disable Langfuse tracing (enabled by default)")
+    parser.add_argument("--model", default=None, help="Model to use for evals (default: uses tier system default)")
     args = parser.parse_args()
 
     # Load scenarios
@@ -46,7 +47,13 @@ async def run_evals():
     # Initialize Judge
     judge = LLMJudge()
 
-    print(f"🔧 Initializing Agent (Real Data: {args.real_data}, Tracing: {args.trace})...")
+    # Resolve model from tier system if not specified
+    if args.model is None:
+        from app.services.llm.tiers import ModelTier, DEFAULT_TIER_MODELS
+        args.model = os.environ.get("TIER_TOOL_CALLING_MODEL", DEFAULT_TIER_MODELS[ModelTier.TOOL_CALLING])
+
+    trace_enabled = not args.no_trace
+    print(f"🔧 Initializing Agent (Real Data: {args.real_data}, Tracing: {trace_enabled}, Model: {args.model})...")
     
     with ExitStack() as stack:
         # --- ALWAYS MOCK THESE ---
@@ -116,8 +123,8 @@ async def run_evals():
         mock_formatter.format_response.side_effect = lambda response, *args, **kwargs: response
         stack.enter_context(patch('app.services.state_echo_formatter.StateEchoFormatter', return_value=mock_formatter))
 
-        # Mock Langfuse unless --trace flag is set
-        if args.trace:
+        # Mock Langfuse only if --no-trace flag is set
+        if trace_enabled:
             print("  - 📊 Langfuse tracing ENABLED (traces will be sent to dashboard)")
         else:
             stack.enter_context(patch('langfuse.Langfuse', MagicMock()))
@@ -238,14 +245,16 @@ async def run_evals():
             mock_cdc.get_services = AsyncMock(return_value=[{'name': 'Dental Cleaning'}, {'name': 'Root Canal'}])
             stack.enter_context(patch('app.services.tools.clinic_info_handler.ClinicDataCache', return_value=mock_cdc))
 
-            # PriceQueryTool (Patched in Handler)
+            # PriceQueryTool - patch where it's actually imported in healthcare_template.py
             mock_price_tool = MagicMock()
             mock_price_tool.get_services_by_query = AsyncMock(return_value=[
                 {'name': 'Dental Cleaning', 'price': 100.0, 'base_price': 100.0},
                 {'name': 'Root Canal', 'price': 500.0, 'base_price': 500.0},
                 {'name': 'Teeth Whitening', 'price': 300.0, 'base_price': 300.0}
             ])
+            # Patch BOTH locations - the original handler and where healthcare_template imports it
             stack.enter_context(patch('app.services.tools.price_handler.PriceQueryTool', return_value=mock_price_tool))
+            stack.enter_context(patch('app.tools.price_query_tool.PriceQueryTool', return_value=mock_price_tool))
 
             # ReservationTools (Patched in Handlers)
             mock_reservation_tools = MagicMock()
@@ -347,49 +356,114 @@ async def run_evals():
 
         # --- LLM FACTORY SETUP (Shared) ---
         from app.services.llm.adapters.openai_adapter import OpenAIAdapter
+        from app.services.llm.adapters.gemini_adapter import GeminiAdapter
         from app.services.llm.base_adapter import ModelCapability, LLMProvider
-        
-        real_adapter = OpenAIAdapter(ModelCapability(
-            provider=LLMProvider.OPENAI,
-            model_name="gpt-4o",
-            api_key=os.environ["OPENAI_API_KEY"],
-            display_name="GPT-4o",
-            input_price_per_1m=5.0,
-            output_price_per_1m=15.0,
-            max_input_tokens=128000,
-            max_output_tokens=4096,
-            supports_streaming=True,
-            supports_tool_calling=True,
-            tool_calling_success_rate=0.95,
-            supports_parallel_tools=True,
-            supports_json_mode=True,
-            supports_structured_output=True,
-            supports_thinking_mode=False,
-            api_endpoint="https://api.openai.com/v1",
-            requires_api_key_env_var="OPENAI_API_KEY",
-            base_url_override=None
-        ))
+        from app.services.llm.llm_factory import LLMFactory
+
+        # Get model capabilities from LLMFactory builtin models if available
+        builtin_models = LLMFactory._get_builtin_capabilities()
+
+        if args.model in builtin_models:
+            capability = builtin_models[args.model]
+            # API key is resolved from env var by the adapter at runtime
+            print(f"  - Using builtin model config for {args.model}")
+        else:
+            # Fallback to OpenAI-style config for unknown models
+            print(f"  - Using default OpenAI config for {args.model}")
+            capability = ModelCapability(
+                provider=LLMProvider.OPENAI,
+                model_name=args.model,
+                api_key=os.environ["OPENAI_API_KEY"],
+                display_name=args.model,
+                input_price_per_1m=0.15,
+                output_price_per_1m=0.60,
+                max_input_tokens=128000,
+                max_output_tokens=16384,
+                supports_streaming=True,
+                supports_tool_calling=True,
+                tool_calling_success_rate=0.98,
+                supports_parallel_tools=True,
+                supports_json_mode=True,
+                supports_structured_output=True,
+                supports_thinking_mode=False,
+                api_endpoint="https://api.openai.com/v1",
+                requires_api_key_env_var="OPENAI_API_KEY",
+                base_url_override=None
+            )
+
+        # Create provider-specific adapter
+        if capability.provider in (LLMProvider.GOOGLE, 'google'):
+            real_adapter = GeminiAdapter(capability)
+        else:
+            real_adapter = OpenAIAdapter(capability)
 
         # Wrap generate_with_tools to capture tool calls
         captured_tool_calls = []
         captured_tool_outputs = []
 
+        # --- LANGFUSE TRACING SETUP ---
+        eval_model_name = args.model  # Store for use in nested functions
+        langfuse_client = None
+        if trace_enabled:
+            try:
+                from langfuse import Langfuse
+                langfuse_client = Langfuse(
+                    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+                    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+                    host=os.getenv("LANGFUSE_HOST", "https://us.cloud.langfuse.com")
+                )
+                print(f"  - Langfuse client initialized (host: {os.getenv('LANGFUSE_HOST', 'https://us.cloud.langfuse.com')})")
+            except Exception as e:
+                print(f"  - ⚠️ Failed to initialize Langfuse: {e}")
+                langfuse_client = None
+
         # --- CAPTURE TOOL CALLS ---
         original_generate_with_tools = real_adapter.generate_with_tools
-        
+
         # We also need to capture tool OUTPUTS from the executor
         # Since ToolExecutor is initialized inside Processor, we need to patch the class method
         # or the instance on the processor.
         # The processor is initialized below. We can patch processor.tool_executor.execute
-        
+
         async def capturing_generate(*args, **kwargs):
+            generation = None
+
+            # Create Langfuse span if tracing enabled (v3 API)
+            if langfuse_client:
+                try:
+                    generation = langfuse_client.start_generation(
+                        name="generate-with-tools",
+                        model=capability.model_name,
+                        input=kwargs.get('messages', args[0] if args else []),
+                        metadata={"eval_run": True}
+                    )
+                except Exception as e:
+                    logger.debug(f"Langfuse generation tracking skipped: {e}")
+
             # OpenAIAdapter returns LLMResponse
             llm_response = await original_generate_with_tools(*args, **kwargs)
-            
+
             # Capture tools
             if llm_response.tool_calls:
                 captured_tool_calls.extend([t.model_dump() for t in llm_response.tool_calls])
-            
+
+            # Update Langfuse with output (v3 API)
+            if generation:
+                try:
+                    generation.end(
+                        output=llm_response.content,
+                        usage={
+                            "input": llm_response.usage.get('input_tokens', 0),
+                            "output": llm_response.usage.get('output_tokens', 0)
+                        },
+                        metadata={
+                            "tool_calls": len(llm_response.tool_calls) if llm_response.tool_calls else 0,
+                            "latency_ms": llm_response.latency_ms
+                        }
+                    )
+                except Exception:
+                    pass
+
             # Processor expects LLMResponse object
             return llm_response
 
@@ -397,8 +471,80 @@ async def run_evals():
         mock_factory.generate_with_tools = capturing_generate
 
         async def capturing_generate_simple(*args, **kwargs):
-            return await real_adapter.generate(*args, **kwargs)
+            generation = None
+
+            # Create Langfuse span if tracing enabled (v3 API)
+            if langfuse_client:
+                try:
+                    generation = langfuse_client.start_generation(
+                        name="generate",
+                        model=capability.model_name,
+                        input=kwargs.get('messages', args[0] if args else []),
+                        metadata={"eval_run": True}
+                    )
+                except Exception as e:
+                    logger.debug(f"Langfuse generation tracking skipped: {e}")
+
+            response = await real_adapter.generate(*args, **kwargs)
+
+            # Update Langfuse with output (v3 API)
+            if generation:
+                try:
+                    generation.end(
+                        output=response.content,
+                        usage={
+                            "input": response.usage.get('input_tokens', 0),
+                            "output": response.usage.get('output_tokens', 0)
+                        }
+                    )
+                except Exception:
+                    pass
+
+            return response
         mock_factory.generate = capturing_generate_simple
+
+        # Mock generate_for_tier (used by supervisor and booking_extractor)
+        async def capturing_generate_for_tier(*args, **kwargs):
+            """
+            Mock generate_for_tier that delegates to generate() with tier-appropriate settings.
+            This is used by supervisor (ROUTING tier) and booking_extractor (EXTRACTION tier).
+            """
+            tier = kwargs.get('tier', 'unknown')
+            generation = None
+
+            # Create Langfuse span if tracing enabled (v3 API)
+            if langfuse_client:
+                try:
+                    generation = langfuse_client.start_generation(
+                        name=f"tier-{tier}",
+                        model=capability.model_name,
+                        input=kwargs.get('messages', args[0] if args else []),
+                        metadata={"tier": str(tier), "eval_run": True}
+                    )
+                except Exception as e:
+                    logger.debug(f"Langfuse generation tracking skipped: {e}")
+
+            # Forward to real adapter's generate method
+            # Remove tier-specific args that generate() doesn't understand
+            generate_kwargs = {k: v for k, v in kwargs.items()
+                             if k not in ('tier', 'clinic_id', 'session_id')}
+            response = await real_adapter.generate(**generate_kwargs)
+
+            # Update Langfuse with output (v3 API)
+            if generation:
+                try:
+                    generation.end(
+                        output=response.content,
+                        usage={
+                            "input": response.usage.get('input_tokens', 0),
+                            "output": response.usage.get('output_tokens', 0)
+                        }
+                    )
+                except Exception:
+                    pass
+
+            return response
+        mock_factory.generate_for_tier = capturing_generate_for_tier
 
         # Patch get_llm_factory for code that uses the function
         stack.enter_context(patch('app.services.llm.llm_factory.get_llm_factory', new=AsyncMock(return_value=mock_factory)))
@@ -831,6 +977,14 @@ async def run_evals():
                 "errors": errors
             }, f, indent=2)
         print(f"Detailed results saved to {output_file}")
+
+        # Flush Langfuse traces before exit
+        if langfuse_client:
+            try:
+                langfuse_client.flush()
+                print("📊 Langfuse traces flushed successfully")
+            except Exception as e:
+                print(f"⚠️ Failed to flush Langfuse: {e}")
 
         # Exit Code
         if total_failed > 0:

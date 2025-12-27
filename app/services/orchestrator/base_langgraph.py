@@ -274,6 +274,25 @@ class BaseLangGraphOrchestrator:
         """
         workflow.add_edge("intent_classify", "memory_retrieve" if self.enable_memory else "process")
 
+    def _get_graceful_fallback_response(self, state: "BaseConversationState") -> str:
+        """
+        Generate a user-facing fallback response when LLM is unavailable or fails.
+
+        NEVER expose debug info like 'intent: None' to users.
+        Instead, provide a helpful clarifying question.
+        """
+        language = state.get('detected_language') or state.get('metadata', {}).get('language', 'en')
+
+        fallback_responses = {
+            'en': "I'm not sure I understood. Are you looking to book an appointment, ask about prices, or something else? I'm here to help with dental services.",
+            'es': "No estoy seguro de haber entendido. ¿Desea agendar una cita, preguntar sobre precios u otra cosa? Estoy aquí para ayudarle con servicios dentales.",
+            'ru': "Я не совсем понял. Вы хотите записаться на приём, узнать цены или что-то другое? Я здесь, чтобы помочь с услугами стоматологии.",
+            'pt': "Não tenho certeza se entendi. Você gostaria de agendar uma consulta, perguntar sobre preços ou outra coisa? Estou aqui para ajudar com serviços odontológicos.",
+            'he': "אני לא בטוח שהבנתי. האם תרצה לקבוע תור, לשאול על מחירים, או משהו אחר? אני כאן לעזור עם שירותי שיניים.",
+        }
+
+        return fallback_responses.get(language, fallback_responses['en'])
+
     # Core node implementations
 
     async def entry_node(self, state: BaseConversationState) -> BaseConversationState:
@@ -529,10 +548,12 @@ class BaseLangGraphOrchestrator:
 
             except Exception as e:
                 logger.warning(f"LLM processing failed: {e}, using fallback")
-                state['response'] = f"Processing message with intent: {state.get('intent', 'unknown')}"
+                # User-facing fallback - never expose debug/internal state
+                state['response'] = self._get_graceful_fallback_response(state)
         else:
-            # Base implementation - echo back
-            state['response'] = f"Processing message with intent: {state.get('intent', 'unknown')}"
+            # No LLM factory - use graceful fallback
+            logger.warning("[process_node] No LLM factory available, using fallback response")
+            state['response'] = self._get_graceful_fallback_response(state)
 
         state['audit_trail'].append({
             "node": "process",

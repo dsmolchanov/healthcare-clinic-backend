@@ -240,14 +240,19 @@ class LangGraphExecutionStep(PipelineStep):
         Update pipeline context and state manager from orchestrator result.
 
         Maps orchestrator state transitions to the two-layer state model.
+        CRITICAL: Persists flow_state to Redis for multi-turn conversations.
         """
         # Determine state transition from result
         state_transition = result.get("state_transition")
+        flow_state_from_result = result.get("flow_state")  # Direct from orchestrator
         intent = result.get("intent")
         appointment_booked = result.get("context", {}).get("appointment_booked", False)
 
-        # Update flow state on context
-        if state_transition:
+        # Update flow state on context - prefer explicit flow_state from orchestrator
+        if flow_state_from_result:
+            ctx.flow_state = flow_state_from_result
+            logger.info(f"[LangGraph] Flow state from orchestrator: {flow_state_from_result}")
+        elif state_transition:
             # Map orchestrator state transition string to FlowState enum
             try:
                 new_flow_state = FlowState(state_transition)
@@ -268,7 +273,18 @@ class LangGraphExecutionStep(PipelineStep):
             ctx.turn_status = TurnStatus.AGENT_ACTION_PENDING.value
             ctx.last_agent_action = result.get("pending_action")
 
-        # Optionally persist to state manager if available
+        # Persist flow_state to Redis for multi-turn continuity
+        if self.redis and ctx.session_id and ctx.flow_state:
+            try:
+                redis_key = f"session:{ctx.session_id}"
+                self.redis.hset(redis_key, 'conversation_state', ctx.flow_state)
+                # Set TTL to 30 minutes for conversation continuity
+                self.redis.expire(redis_key, 1800)
+                logger.debug(f"[LangGraph] Persisted flow_state={ctx.flow_state} to Redis")
+            except Exception as e:
+                logger.warning(f"[LangGraph] Failed to persist flow_state to Redis: {e}")
+
+        # Also persist via state manager if available
         if self.redis and ctx.session_id:
             try:
                 state_manager = get_state_manager(
@@ -283,6 +299,13 @@ class LangGraphExecutionStep(PipelineStep):
                     await state_manager.mark_escalated()
                 elif appointment_booked:
                     await state_manager.mark_resolved()
+                elif flow_state_from_result:
+                    # Persist explicit flow_state from orchestrator
+                    try:
+                        new_state = FlowState(flow_state_from_result)
+                        await state_manager.update_flow_state(new_state)
+                    except ValueError:
+                        pass
                 elif state_transition:
                     try:
                         new_state = FlowState(state_transition)
