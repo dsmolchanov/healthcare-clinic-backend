@@ -4,6 +4,7 @@ Prompts, tool specifications, and cost controls for the rule authoring assistant
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -115,20 +116,25 @@ def get_rule_authoring_tools() -> List[Dict[str, Any]]:
 
 @dataclass
 class RuleAuthoringLLMConfig:
-    """Cost and safety configuration for rule authoring conversations."""
+    """Cost and safety configuration for rule authoring conversations.
 
-    reasoning_model: str = "gpt-4o-mini"
-    summarizer_model: str = "gpt-4o-mini"
+    Model defaults align with tier-based model abstraction system.
+    Use TIER_REASONING_MODEL and TIER_SUMMARIZATION_MODEL env vars for overrides.
+    """
+
+    # Model selection: TIER_X_MODEL > default
+    reasoning_model: str = field(default_factory=lambda: os.environ.get("TIER_REASONING_MODEL", "gemini-3-flash-preview"))
+    summarizer_model: str = field(default_factory=lambda: os.environ.get("TIER_SUMMARIZATION_MODEL", "gpt-5-mini"))
     temperature: float = 0.2
     max_output_tokens: int = 2_000
     max_conversation_turns: int = 8
-    cheap_clarification_model: str = "gpt-4.1-mini"
-    high_accuracy_model: str = "gpt-4o"
+    cheap_clarification_model: str = field(default_factory=lambda: os.environ.get("TIER_ROUTING_MODEL", "gpt-5-mini"))
+    high_accuracy_model: str = field(default_factory=lambda: os.environ.get("TIER_REASONING_MODEL", "gemini-3-flash-preview"))
     budget_usd_per_session: float = 0.75
     audit_log_enabled: bool = True
     allow_tool_usage: bool = True
     max_tool_calls: int = 6
-    fallback_model: str = "gpt-4.1-mini"
+    fallback_model: str = "gpt-5-mini"
 
     def cost_guardrails(self) -> Dict[str, Any]:
         """Return guardrail configuration for runtime cost control."""

@@ -201,11 +201,18 @@ class ConversationMemoryManager:
                 # Fall back to local configuration
 
         # Default to local Qdrant-backed configuration
+        # Model selection: MEM0_LLM_MODEL > TIER_SUMMARIZATION_MODEL > default
+        # This aligns with the tier-based model abstraction system
+        mem0_model = (
+            os.environ.get('MEM0_LLM_MODEL') or
+            os.environ.get('TIER_SUMMARIZATION_MODEL') or
+            'gpt-5-mini'  # Default from DEFAULT_TIER_MODELS[SUMMARIZATION]
+        )
         mem0_config = {
             "llm": {
                 "provider": "openai",
                 "config": {
-                    "model": os.environ.get('MEM0_LLM_MODEL', 'gpt-4o-mini'),
+                    "model": mem0_model,
                     "temperature": 0.2
                 }
             },

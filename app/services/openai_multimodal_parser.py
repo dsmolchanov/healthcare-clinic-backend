@@ -81,7 +81,9 @@ class OpenAIMultimodalParser:
             raise ValueError("OPENAI_API_KEY is required for OpenAI parser")
 
         self.client = AsyncOpenAI(api_key=self.api_key)
-        self.model = "gpt-4o-mini"  # Using GPT-4 mini for cost efficiency
+        # Model selection: TIER_MULTIMODAL_MODEL > default
+        # Aligns with tier-based model abstraction system
+        self.model = os.getenv("TIER_MULTIMODAL_MODEL", "gemini-3-flash-preview")
 
     async def discover_entities(self,
                                file_content: bytes,

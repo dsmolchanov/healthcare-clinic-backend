@@ -378,8 +378,12 @@ Respond ONLY with JSON:
 """
 
         try:
+            import os
+            # Model selection: TIER_REASONING_MODEL > default
+            # Aligns with tier-based model abstraction system
+            model = os.environ.get("TIER_REASONING_MODEL", "gemini-3-flash-preview")
             response = await llm_client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=200

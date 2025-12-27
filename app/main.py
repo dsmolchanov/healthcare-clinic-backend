@@ -186,6 +186,15 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Failed to warm up Redis cache: {e}")
         # Don't fail startup, caching will happen on first request
 
+    # Warm up TierRegistry cache (Phase 2 - model tier abstraction)
+    try:
+        from app.services.llm.tier_registry import warmup_tier_registry
+        await warmup_tier_registry()
+        logger.info("✅ TierRegistry warmed up with model mappings")
+    except Exception as e:
+        logger.warning(f"Failed to warm up TierRegistry: {e}")
+        # Don't fail startup, will use code defaults on first request
+
     # OPTIMIZATION: Warm up WhatsApp→Clinic mapping cache (eliminates DB queries on hot path)
     try:
         from app.startup_warmup import warmup_whatsapp_instance_cache
@@ -468,6 +477,10 @@ app.include_router(billing_routes.webhooks_router)
 # Prompt Template Management (Phase 2B-2)
 from app.api import prompt_routes
 app.include_router(prompt_routes.router)
+
+# Model Tier Mappings API
+from app.api import tier_mappings_api
+app.include_router(tier_mappings_api.router)
 
 # ============================================================================
 # Health Check

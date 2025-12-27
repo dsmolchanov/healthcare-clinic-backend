@@ -91,6 +91,50 @@ class LLMFactory:
                     requires_api_key_env_var='OPENAI_API_KEY',
                     base_url_override=None
                 ),
+                'gpt-4.1-mini': ModelCapability(
+                    provider='openai',
+                    model_name='gpt-4.1-mini',
+                    display_name='GPT-4.1 Mini',
+                    input_price_per_1m=0.40,
+                    output_price_per_1m=1.60,
+                    max_input_tokens=1047576,
+                    max_output_tokens=32768,
+                    avg_output_speed_tokens_per_sec=120.0,
+                    avg_ttft_seconds=0.25,
+                    p95_latency_ms=1800,
+                    supports_streaming=True,
+                    supports_tool_calling=True,
+                    tool_calling_success_rate=0.99,
+                    supports_parallel_tools=True,
+                    supports_json_mode=True,
+                    supports_structured_output=True,
+                    supports_thinking_mode=False,
+                    api_endpoint='https://api.openai.com/v1/chat/completions',
+                    requires_api_key_env_var='OPENAI_API_KEY',
+                    base_url_override=None
+                ),
+                'gpt-5-mini': ModelCapability(
+                    provider='openai',
+                    model_name='gpt-5-mini',
+                    display_name='GPT-5 Mini',
+                    input_price_per_1m=0.30,
+                    output_price_per_1m=1.20,
+                    max_input_tokens=200000,
+                    max_output_tokens=32768,
+                    avg_output_speed_tokens_per_sec=130.0,
+                    avg_ttft_seconds=0.2,
+                    p95_latency_ms=1500,
+                    supports_streaming=True,
+                    supports_tool_calling=True,
+                    tool_calling_success_rate=0.99,
+                    supports_parallel_tools=True,
+                    supports_json_mode=True,
+                    supports_structured_output=True,
+                    supports_thinking_mode=False,
+                    api_endpoint='https://api.openai.com/v1/chat/completions',
+                    requires_api_key_env_var='OPENAI_API_KEY',
+                    base_url_override=None
+                ),
             }
         return cls.BUILTIN_MODELS
 
@@ -153,6 +197,17 @@ class LLMFactory:
         **kwargs
     ) -> LLMResponse:
         """Generate response with automatic model selection"""
+
+        # Observability guardrail: detect prompt-tool mismatch
+        system_msg = next((m for m in messages if m.get('role') == 'system'), {})
+        system_content = system_msg.get('content', '')
+        tool_keywords = ['query_service_prices', 'check_availability', 'MUST call', 'MANDATORY TOOL CALLS']
+
+        if any(kw in system_content for kw in tool_keywords):
+            logger.warning(
+                "[LLMFactory.generate] PROMPT-TOOL MISMATCH: System prompt contains tool references "
+                "but generate() was called without tools. Use generate_with_tools() instead."
+            )
 
         # Route to appropriate model if not specified
         if not model:

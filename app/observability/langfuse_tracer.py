@@ -80,7 +80,7 @@ class LLMObservability:
                 name="extract-slots",
                 as_type="generation",
                 metadata={
-                    "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                    "model": os.getenv("TIER_TOOL_CALLING_MODEL", "gpt-5-mini"),
                     "missing_slots": missing_slots,
                     "message_length": len(message)
                 }
@@ -212,7 +212,7 @@ def track_llm_call(
     Decorator to automatically track LLM calls with Langfuse v3 API.
 
     Usage:
-        @track_llm_call(name="intent-classification", model="gpt-4o-mini")
+        @track_llm_call(name="intent-classification", model="gpt-5-mini")
         async def classify_intent(message: str) -> str:
             # ... LLM call ...
     """
@@ -228,7 +228,7 @@ def track_llm_call(
                 name=name,
                 as_type="generation",
                 metadata={
-                    "model": model or os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                    "model": model or os.getenv("TIER_TOOL_CALLING_MODEL", "gpt-5-mini"),
                     "function": func.__name__,
                     "args_count": len(args),
                     "kwargs_keys": list(kwargs.keys())

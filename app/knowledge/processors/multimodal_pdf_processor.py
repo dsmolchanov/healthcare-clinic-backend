@@ -32,10 +32,13 @@ class MultimodalPDFProcessor:
             separators=["\n\n", "\n", ". ", " ", ""]
         )
         self.client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        
+
         # Model selection with fallback
-        self.primary_model = "gpt-5-mini"  # $0.4/1M tokens
-        self.fallback_model = "gpt-4o-mini"  # Fallback if gpt-5-mini not available
+        # Primary: TIER_MULTIMODAL_MODEL > gemini-3-flash-preview (default for vision)
+        # Fallback: gpt-5-mini (stable, supports vision)
+        # Aligns with tier-based model abstraction system
+        self.primary_model = os.environ.get("TIER_MULTIMODAL_MODEL", "gemini-3-flash-preview")
+        self.fallback_model = "gpt-5-mini"  # Stable fallback
         
     def can_process(self, mime_type: str) -> bool:
         """Check if this processor can handle the given mime type"""
@@ -228,7 +231,7 @@ class MultimodalPDFProcessor:
                 self._model_used = self.primary_model
             except Exception as e:
                 logger.info(f"Primary model {self.primary_model} not available, using fallback: {e}")
-                # Fallback to gpt-4o-mini
+                # Fallback to gpt-5-mini
                 response = self.client.chat.completions.create(
                     model=self.fallback_model,
                     messages=[

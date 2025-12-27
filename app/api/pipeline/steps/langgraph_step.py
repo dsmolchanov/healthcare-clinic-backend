@@ -311,7 +311,7 @@ class LangGraphExecutionStep(PipelineStep):
             # Model selection: TIER_TOOL_CALLING_MODEL > default
             # Aligns with tier-based model abstraction system
             import os
-            primary_model = os.environ.get("TIER_TOOL_CALLING_MODEL", "gpt-4o-mini")
+            primary_model = os.environ.get("TIER_TOOL_CALLING_MODEL", "gpt-5-mini")
             agent_config = {
                 "llm_settings": {
                     "primary_model": primary_model,
