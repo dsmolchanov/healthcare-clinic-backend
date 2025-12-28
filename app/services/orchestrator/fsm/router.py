@@ -275,9 +275,10 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
     # Pain keywords (multilingual)
     has_pain = any(kw in m for kw in ['pain', 'hurt', 'ache', 'болит', 'dolor', 'duele', 'больно'])
 
-    # FIX: Extract doctor name if mentioned
+    # FIX: Extract doctor name if mentioned (supports Latin and Cyrillic)
     doctor_name = None
-    doctor_match = re.search(r'(?:dr\.?|doctor)\s+([a-zA-Z]+)', m, re.IGNORECASE)
+    # Pattern matches: "dr.", "doctor", "доктор", "врач" followed by a name
+    doctor_match = re.search(r'(?:dr\.?|doctor|доктор|врач)\s+([a-zA-Zа-яА-ЯёЁ]+)', m, re.IGNORECASE)
     if doctor_match:
         doctor_name = doctor_match.group(1).title()  # Capitalize first letter
 
