@@ -205,13 +205,47 @@ async def run_evals():
             })
             stack.enter_context(patch('app.services.message_context_hydrator.MessageContextHydrator', return_value=mock_hydrator))
 
-            # Redis Client - mock to return empty values for state lookups
+            # Redis Client - mock with proper session state tracking for multi-turn conversations
             mock_redis = MagicMock()
-            mock_redis.get.return_value = None  # FSM state lookups return None
-            mock_redis.hget.return_value = None  # Session state lookups return None
-            mock_redis.set.return_value = True
-            mock_redis.hset.return_value = True
+
+            # In-memory storage for Redis mock to persist across turns
+            redis_storage = {}
+
+            def mock_get(key):
+                """Return stored value or None."""
+                return redis_storage.get(key)
+
+            def mock_set(key, value):
+                """Store value."""
+                redis_storage[key] = value
+                return True
+
+            def mock_hgetall(key):
+                """Return hash or empty dict for new session."""
+                return redis_storage.get(key, {})
+
+            def mock_hget(key, field):
+                """Return hash field or None."""
+                hash_data = redis_storage.get(key, {})
+                return hash_data.get(field) if isinstance(hash_data, dict) else None
+
+            def mock_hset(key, field_or_mapping, value=None):
+                """Set hash field(s)."""
+                if key not in redis_storage:
+                    redis_storage[key] = {}
+                if isinstance(field_or_mapping, dict):
+                    redis_storage[key].update(field_or_mapping)
+                else:
+                    redis_storage[key][field_or_mapping] = value
+                return True
+
+            mock_redis.get.side_effect = mock_get
+            mock_redis.set.side_effect = mock_set
+            mock_redis.hgetall.side_effect = mock_hgetall
+            mock_redis.hget.side_effect = mock_hget
+            mock_redis.hset.side_effect = mock_hset
             mock_redis.expire.return_value = True
+            mock_redis.delete.return_value = True
             stack.enter_context(patch('app.config.get_redis_client', return_value=mock_redis))
 
             # Supabase Client (used in multiple places)
@@ -339,7 +373,8 @@ async def run_evals():
             mock_appointment_tools = MagicMock()
 
             async def smart_check_availability(**kwargs):
-                """Smart mock that returns no slots for invalid times."""
+                """Smart mock that returns no slots for invalid times and dynamic dates."""
+                from datetime import datetime, timedelta
                 date_str = str(kwargs.get('date', '')).lower()
                 time_pref = str(kwargs.get('time_preference', '')).lower()
 
@@ -358,15 +393,39 @@ async def run_evals():
                         'message': 'No availability for the requested time. Our hours are Monday-Friday 9am-5pm.'
                     }
 
-                # Return slots for valid times (tomorrow = Nov 27)
+                # Calculate dynamic dates based on request
+                now = datetime.now()
+
+                # Determine the target date based on user request
+                if 'tomorrow' in date_str or 'mañana' in date_str or 'завтра' in date_str:
+                    target_date = now + timedelta(days=1)
+                elif 'tuesday' in date_str or 'martes' in date_str:
+                    # Find next Tuesday
+                    days_until_tuesday = (1 - now.weekday()) % 7  # 1 = Tuesday
+                    if days_until_tuesday == 0:
+                        days_until_tuesday = 7  # If today is Tuesday, get next week
+                    target_date = now + timedelta(days=days_until_tuesday)
+                elif 'next week' in date_str or 'próxima semana' in date_str:
+                    target_date = now + timedelta(days=7)
+                else:
+                    # Default: use tomorrow
+                    target_date = now + timedelta(days=1)
+
+                # Skip weekends
+                while target_date.weekday() >= 5:  # 5=Sat, 6=Sun
+                    target_date += timedelta(days=1)
+
+                date_iso = target_date.strftime('%Y-%m-%d')
+
+                # Return slots for the calculated date
                 return {
                     'success': True,
                     'available_slots': [
-                        {'datetime': '2025-11-27T09:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
-                        {'datetime': '2025-11-27T10:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
-                        {'datetime': '2025-11-27T14:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
+                        {'datetime': f'{date_iso}T09:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
+                        {'datetime': f'{date_iso}T10:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
+                        {'datetime': f'{date_iso}T14:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
                     ],
-                    'message': 'Found 3 available slots for tomorrow.'
+                    'message': f'Found 3 available slots for {date_iso}.'
                 }
 
             mock_appointment_tools.check_availability = smart_check_availability
@@ -697,6 +756,9 @@ async def run_evals():
             LangGraphExecutionStep._in_memory_state_store.clear()
             if hasattr(processor, '_known_clinic_ids'):
                 processor._known_clinic_ids.clear()
+
+            # Clear Redis storage between scenarios to reset session state
+            redis_storage.clear()
             
             conversation_history = []
             last_agent_response = None

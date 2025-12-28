@@ -1,4 +1,18 @@
-"""Intent classification for healthcare conversations."""
+"""
+Intent classification for healthcare conversations.
+
+⚠️ DEPRECATED: This module is deprecated as of Phase 6 (2025-12-28).
+The FSM orchestrator uses app.services.orchestrator.fsm.router for intent routing.
+This file is kept as a fallback for LangGraph orchestrator.
+"""
+
+import warnings
+warnings.warn(
+    "intent_classifier.py is deprecated. FSM uses fsm.router instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
+
 from typing import Literal, List
 from dataclasses import dataclass
 
@@ -7,6 +21,8 @@ SCHEDULING_KEYWORDS: List[str] = [
     # English - action verbs
     'book', 'appointment', 'schedule', 'reschedule', 'cancel',
     'reserve', 'visit', 'see doctor', 'see the doctor',
+    # FIX: Add "come in" patterns for scheduling
+    'come in', 'stop by', 'drop by', 'swing by',
     # Symptoms/urgency
     'pain', 'hurts', 'ache', 'emergency', 'urgent',
     # Services
@@ -17,11 +33,37 @@ SCHEDULING_KEYWORDS: List[str] = [
     # Spanish
     'cita', 'reservar', 'programar', 'dolor', 'urgente',
     'mi teléfono', 'mi nombre es', 'me llamo',
+    'puedo ir', 'puedo pasar', 'venir',  # FIX: Spanish "can I come"
     # Russian
     'записаться', 'запись', 'записать', 'болит', 'боль', 'срочно',
     'мой телефон', 'меня зовут', 'мой номер',
+    'прийти', 'зайти', 'приехать', 'могу прийти',  # FIX: Russian "come in"
     # Portuguese
     'agendar', 'consulta', 'marcar', 'dor', 'urgente',
+]
+
+# Day/time patterns that indicate scheduling intent
+# FIX: "Can I come in Sunday at 3 AM" should route to scheduling
+SCHEDULING_DAY_PATTERNS: List[str] = [
+    # English days
+    'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+    'tomorrow', 'today', 'next week', 'this week',
+    # Spanish days
+    'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo',
+    'mañana', 'hoy', 'próxima semana',
+    # Russian days
+    'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье',
+    'завтра', 'сегодня', 'на следующей неделе',
+]
+
+# Phrases that combined with day/time indicate scheduling
+SCHEDULING_INTENT_PHRASES: List[str] = [
+    'can i', 'could i', 'may i', 'do you have', 'is there', 'any slots',
+    'available', 'availability', 'free', 'open',
+    # Spanish
+    'puedo', 'podría', 'tienen', 'hay',
+    # Russian
+    'можно', 'могу', 'есть ли', 'свободно',
 ]
 
 PRICING_KEYWORDS: List[str] = [
@@ -122,7 +164,26 @@ def looks_like_scheduling(message: str) -> bool:
     # Pricing takes precedence
     if looks_like_pricing(m):
         return False
-    return any(k in m for k in SCHEDULING_KEYWORDS)
+
+    # Direct keyword match
+    if any(k in m for k in SCHEDULING_KEYWORDS):
+        return True
+
+    # FIX: Check for day/time + intent phrase combination
+    # e.g., "Can I come in Sunday at 3 AM?" has day pattern + intent phrase
+    has_day = any(day in m for day in SCHEDULING_DAY_PATTERNS)
+    has_intent_phrase = any(phrase in m for phrase in SCHEDULING_INTENT_PHRASES)
+
+    if has_day and has_intent_phrase:
+        return True
+
+    # FIX: Check for time patterns (AM/PM, o'clock) with intent phrases
+    import re
+    has_time = bool(re.search(r'\d{1,2}\s*(?:am|pm|o\'clock|:)', m, re.IGNORECASE))
+    if has_time and has_intent_phrase:
+        return True
+
+    return False
 
 
 def looks_like_pricing(message: str) -> bool:

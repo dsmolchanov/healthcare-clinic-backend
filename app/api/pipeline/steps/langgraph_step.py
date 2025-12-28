@@ -1,18 +1,19 @@
 """
-LangGraphExecutionStep - Route complex conversations through LangGraph orchestrator.
+LangGraphExecutionStep - Route complex conversations through LangGraph or FSM orchestrator.
 
 Phase 3B of the Agentic Flow Architecture Refactor.
 
-This step routes complex AI path conversations through the existing LangGraph
-orchestrator for multi-turn flows requiring state tracking and tool coordination.
+This step routes complex AI path conversations through either:
+- FSM orchestrator (USE_FSM_ORCHESTRATOR=true) - Pure Python state machine, fast and deterministic
+- LangGraph orchestrator (default) - Multi-node graph with LLM reasoning
 
 Usage:
-    - SCHEDULING/COMPLEX lanes are routed through LangGraph
-    - Feature flagged via ENABLE_LANGGRAPH + clinic whitelist
+    - SCHEDULING/COMPLEX lanes are routed through orchestrator
     - Falls through to LLMGenerationStep if skipped
 """
 
 import logging
+import os
 import time
 from typing import Dict, Tuple, Any, Optional
 
@@ -27,6 +28,11 @@ from app.services.orchestrator.thread_ids import make_thread_id, make_checkpoint
 
 logger = logging.getLogger(__name__)
 
+# Feature flag for FSM orchestrator
+# Phase 6: FSM is now the default orchestrator (87.5% eval pass rate achieved)
+# Set USE_FSM_ORCHESTRATOR=false to fall back to LangGraph if needed
+USE_FSM_ORCHESTRATOR = os.environ.get("USE_FSM_ORCHESTRATOR", "true").lower() == "true"
+
 
 class LangGraphExecutionStep(PipelineStep):
     """
@@ -39,6 +45,10 @@ class LangGraphExecutionStep(PipelineStep):
 
     Always enabled for SCHEDULING/COMPLEX lanes (feature flags removed in Phase 2).
     """
+
+    # In-memory state store for when Redis is unavailable (e.g., in evals)
+    # Key: session_id, Value: serialized FSM state dict
+    _in_memory_state_store: Dict[str, Any] = {}
 
     def __init__(
         self,
@@ -134,30 +144,55 @@ class LangGraphExecutionStep(PipelineStep):
             # 7. Build initial state from pipeline context
             initial_state = self._build_orchestrator_state(ctx)
 
-            # 8. Execute graph with thread_id for checkpointing
-            result = await orchestrator.process(
-                message=ctx.message,
-                session_id=session_id,
-                metadata=initial_state.get("metadata", {}),
-                context=initial_state.get("context", {}),
-            )
+            # 8. Execute orchestrator (FSM or LangGraph)
+            if USE_FSM_ORCHESTRATOR:
+                # FSM orchestrator - pass state for multi-turn persistence
+                fsm_state = self._load_fsm_state(ctx)
+                result = await orchestrator.process(
+                    message=ctx.message,
+                    session_id=session_id,
+                    state=fsm_state,
+                    language=ctx.detected_language or "en",
+                )
+            else:
+                # LangGraph orchestrator
+                result = await orchestrator.process(
+                    message=ctx.message,
+                    session_id=session_id,
+                    metadata=initial_state.get("metadata", {}),
+                    context=initial_state.get("context", {}),
+                )
 
-            # 7. Extract response
+            # 9. Extract response
             if result and result.get("response"):
                 ctx.response = result["response"]
-                ctx.response_metadata["langgraph"] = True
+                ctx.response_metadata["langgraph"] = not USE_FSM_ORCHESTRATOR
+                ctx.response_metadata["fsm"] = USE_FSM_ORCHESTRATOR
                 ctx.response_metadata["orchestrator_audit"] = result.get("audit_trail", [])
                 ctx.response_metadata["langgraph_intent"] = result.get("intent")
+                ctx.response_metadata["route"] = result.get("route")
 
                 # Phase 6: Expose internal tool tracking for eval harness
-                ctx.response_metadata["internal_tools_called"] = result.get("tools_actually_called", [])
+                # FSM uses "tools_called", LangGraph uses "tools_actually_called"
+                # FSM format: [{"name": "tool_name", "args": {...}}]
+                # LangGraph format: ["tool_name", ...]
+                # Normalize to list of tool names for eval harness
+                raw_tools = result.get("tools_called", result.get("tools_actually_called", []))
+                tools_called = []
+                for t in raw_tools:
+                    if isinstance(t, dict):
+                        tools_called.append(t.get("name", str(t)))
+                    else:
+                        tools_called.append(str(t))
+                ctx.response_metadata["internal_tools_called"] = tools_called
                 ctx.response_metadata["internal_tools_failed"] = result.get("tools_failed", [])
                 ctx.response_metadata["executor_validation_errors"] = result.get("executor_validation_errors", [])
                 ctx.response_metadata["planner_validation_errors"] = result.get("planner_validation_errors", [])
                 ctx.response_metadata["hallucination_blocked"] = result.get("hallucination_blocked", False)
                 ctx.response_metadata["booking_blocked_no_availability"] = result.get("booking_blocked_no_availability_check", False)
+                ctx.response_metadata["guardrail_triggered"] = result.get("guardrail_triggered", False)
 
-                # 8. Update state based on orchestrator result
+                # 10. Update state based on orchestrator result
                 await self._update_state_from_result(ctx, result)
 
                 duration_ms = (time.time() - start_time) * 1000
@@ -176,6 +211,37 @@ class LangGraphExecutionStep(PipelineStep):
             # On error, fall through to LLM step as safety net
             ctx.response_metadata["langgraph_error"] = str(e)
             return ctx, True
+
+    def _load_fsm_state(self, ctx: PipelineContext) -> Optional[Dict[str, Any]]:
+        """
+        Load FSM state from Redis or in-memory store for multi-turn conversations.
+
+        Falls back to in-memory store when Redis is unavailable (e.g., in evals).
+        Returns None for new conversations.
+        """
+        if not ctx.session_id:
+            return None
+
+        # Try Redis first if available
+        if self.redis:
+            try:
+                redis_key = f"fsm_state:{ctx.session_id}"
+                stored_state = self.redis.get(redis_key)
+                if stored_state:
+                    import json
+                    state_dict = json.loads(stored_state if isinstance(stored_state, str) else stored_state.decode('utf-8'))
+                    logger.debug(f"[FSM] Loaded state from Redis: stage={state_dict.get('stage')}")
+                    return state_dict
+            except Exception as e:
+                logger.warning(f"[FSM] Failed to load state from Redis: {e}")
+
+        # Fallback to in-memory store (for evals/testing without Redis)
+        if ctx.session_id in self._in_memory_state_store:
+            state_dict = self._in_memory_state_store[ctx.session_id]
+            logger.debug(f"[FSM] Loaded state from in-memory store: stage={state_dict.get('stage')}")
+            return state_dict
+
+        return None
 
     def _build_orchestrator_state(self, ctx: PipelineContext) -> Dict[str, Any]:
         """
@@ -273,7 +339,28 @@ class LangGraphExecutionStep(PipelineStep):
             ctx.turn_status = TurnStatus.AGENT_ACTION_PENDING.value
             ctx.last_agent_action = result.get("pending_action")
 
-        # Persist flow_state to Redis for multi-turn continuity
+        # Persist FSM state for multi-turn continuity
+        if USE_FSM_ORCHESTRATOR and ctx.session_id:
+            fsm_state = result.get("state")
+            if fsm_state:
+                # Try Redis first
+                if self.redis:
+                    try:
+                        import json
+                        redis_key = f"fsm_state:{ctx.session_id}"
+                        self.redis.set(redis_key, json.dumps(fsm_state))
+                        # Set TTL to 30 minutes for conversation continuity
+                        self.redis.expire(redis_key, 1800)
+                        logger.debug(f"[FSM] Persisted state to Redis: stage={fsm_state.get('stage')}")
+                    except Exception as e:
+                        logger.warning(f"[FSM] Failed to persist state to Redis: {e}")
+                        # Fall through to in-memory
+                else:
+                    # Fallback to in-memory store (for evals/testing without Redis)
+                    self._in_memory_state_store[ctx.session_id] = fsm_state
+                    logger.debug(f"[FSM] Persisted state to in-memory store: stage={fsm_state.get('stage')}")
+
+        # Persist flow_state to Redis for multi-turn continuity (LangGraph)
         if self.redis and ctx.session_id and ctx.flow_state:
             try:
                 redis_key = f"session:{ctx.session_id}"
@@ -320,45 +407,98 @@ class LangGraphExecutionStep(PipelineStep):
         Get or create orchestrator instance for clinic.
 
         Uses caching to avoid creating multiple instances per clinic.
+        Returns FSM orchestrator if USE_FSM_ORCHESTRATOR flag is set.
         """
         clinic_id = ctx.effective_clinic_id
 
-        if clinic_id in self._orchestrator_cache:
-            return self._orchestrator_cache[clinic_id]
+        # Check cache key includes orchestrator type
+        cache_key = f"{clinic_id}_{'fsm' if USE_FSM_ORCHESTRATOR else 'langgraph'}"
+        if cache_key in self._orchestrator_cache:
+            return self._orchestrator_cache[cache_key]
 
         try:
-            # Import orchestrator components
-            from app.services.orchestrator.templates.healthcare_template import HealthcareLangGraph
-
-            # Build agent config from context
-            # Model selection: TIER_TOOL_CALLING_MODEL > default
-            # Aligns with tier-based model abstraction system
-            import os
-            primary_model = os.environ.get("TIER_TOOL_CALLING_MODEL", "gpt-5-mini")
-            agent_config = {
-                "llm_settings": {
-                    "primary_model": primary_model,
-                    "temperature": 0.7,
-                    "max_tokens": 1024,
-                },
-                "capabilities": ["calendar_integration"] if ctx.clinic_profile else [],
-            }
-
-            # Create orchestrator
-            orchestrator = HealthcareLangGraph(
-                supabase_client=self.supabase,
-                clinic_id=clinic_id,
-                agent_config=agent_config,
-            )
-
-            self._orchestrator_cache[clinic_id] = orchestrator
-            logger.info(f"[LangGraph] Created orchestrator for clinic {clinic_id}, cache size: {len(self._orchestrator_cache)}/{self._orchestrator_cache.maxsize}")
-
-            return orchestrator
+            if USE_FSM_ORCHESTRATOR:
+                # Use FSM orchestrator - pure Python, fast and deterministic
+                return await self._create_fsm_orchestrator(ctx, cache_key)
+            else:
+                # Use LangGraph orchestrator - multi-node graph with LLM reasoning
+                return await self._create_langgraph_orchestrator(ctx, cache_key)
 
         except Exception as e:
-            logger.error(f"[LangGraph] Failed to create orchestrator: {e}", exc_info=True)
+            logger.error(f"[Orchestrator] Failed to create orchestrator: {e}", exc_info=True)
             return None
+
+    async def _create_fsm_orchestrator(self, ctx: PipelineContext, cache_key: str):
+        """Create FSM orchestrator instance."""
+        from app.services.orchestrator.fsm_orchestrator import FSMOrchestrator
+        from app.services.orchestrator.tools.appointment_tools import AppointmentTools
+        from app.tools.price_query_tool import PriceQueryTool
+        from app.services.llm import LLMFactory
+
+        clinic_id = ctx.effective_clinic_id
+
+        # Initialize LLM factory for router (requires supabase for capability matrix)
+        llm_factory = LLMFactory(supabase_client=self.supabase)
+
+        # Initialize tools
+        appointment_tools = AppointmentTools(
+            supabase_client=self.supabase,
+            clinic_id=clinic_id
+        ) if self.supabase else None
+
+        price_tool = None
+        try:
+            price_tool = PriceQueryTool(
+                clinic_id=clinic_id,
+                redis_client=self.redis
+            )
+        except Exception as e:
+            logger.warning(f"[FSM] Failed to create PriceQueryTool: {e}")
+
+        # Create FSM orchestrator
+        orchestrator = FSMOrchestrator(
+            clinic_id=clinic_id,
+            llm_factory=llm_factory,
+            supabase_client=self.supabase,
+            appointment_tools=appointment_tools,
+            price_tool=price_tool,
+            clinic_profile=ctx.clinic_profile or {},
+        )
+
+        self._orchestrator_cache[cache_key] = orchestrator
+        logger.info(f"[FSM] Created FSM orchestrator for clinic {clinic_id}")
+
+        return orchestrator
+
+    async def _create_langgraph_orchestrator(self, ctx: PipelineContext, cache_key: str):
+        """Create LangGraph orchestrator instance."""
+        from app.services.orchestrator.templates.healthcare_template import HealthcareLangGraph
+
+        clinic_id = ctx.effective_clinic_id
+
+        # Build agent config from context
+        # Model selection: TIER_TOOL_CALLING_MODEL > default
+        primary_model = os.environ.get("TIER_TOOL_CALLING_MODEL", "gpt-5-mini")
+        agent_config = {
+            "llm_settings": {
+                "primary_model": primary_model,
+                "temperature": 0.7,
+                "max_tokens": 1024,
+            },
+            "capabilities": ["calendar_integration"] if ctx.clinic_profile else [],
+        }
+
+        # Create orchestrator
+        orchestrator = HealthcareLangGraph(
+            supabase_client=self.supabase,
+            clinic_id=clinic_id,
+            agent_config=agent_config,
+        )
+
+        self._orchestrator_cache[cache_key] = orchestrator
+        logger.info(f"[LangGraph] Created orchestrator for clinic {clinic_id}, cache size: {len(self._orchestrator_cache)}/{self._orchestrator_cache.maxsize}")
+
+        return orchestrator
 
     def invalidate_cache(self, clinic_id: Optional[str] = None):
         """

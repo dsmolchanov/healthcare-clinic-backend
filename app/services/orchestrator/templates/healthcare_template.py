@@ -3,6 +3,11 @@ Healthcare LangGraph Template
 HIPAA-compliant orchestrator for healthcare/dental conversations
 Extends base orchestrator with PHI protection and appointment handling
 
+⚠️ DEPRECATED: This module is deprecated as of Phase 6 (2025-12-28).
+The FSM orchestrator (app.services.orchestrator.fsm_orchestrator) is now the default.
+This file is kept as a fallback - set USE_FSM_ORCHESTRATOR=false to use LangGraph.
+This file will be removed in a future release.
+
 Phase 2 Enhancements:
 - Guardrail node (runs BEFORE supervisor for security)
 - Language detection node (replaces RoutingStep language detection)
@@ -11,6 +16,14 @@ Phase 2 Enhancements:
 - Session-aware hydration with parallel fetch
 - Plan-then-Execute pattern for bookings
 """
+
+import warnings
+warnings.warn(
+    "healthcare_template.py is deprecated. FSM orchestrator is now the default. "
+    "Set USE_FSM_ORCHESTRATOR=false only if you need to fall back to LangGraph.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 import sys
 import os
@@ -1368,6 +1381,52 @@ Clinic context:
             })
             return state
 
+        # FIX: If awaiting slot selection, user response MUST go to scheduling
+        if state.get('awaiting_slot_selection'):
+            logger.info(f"[supervisor] Keeping in scheduling: awaiting slot selection, message='{message}'")
+            state["next_agent"] = "scheduling"
+            state['audit_trail'].append({
+                "node": "supervisor",
+                "timestamp": datetime.utcnow().isoformat(),
+                "decision": "scheduling",
+                "reason": "awaiting_slot_selection",
+                "flow_state": flow_state
+            })
+            return state
+
+        # =========================================================================
+        # FIX: Keyword overrides for patterns that LLM sometimes misclassifies
+        # Belt-and-suspenders: force scheduling for known scheduling patterns
+        # =========================================================================
+        message_lower = message.lower()
+
+        # Patterns that MUST route to scheduling (LLM sometimes misses these)
+        scheduling_override_patterns = [
+            # "next week/tuesday/etc" availability queries
+            'available next week', 'availability next week', 'anything next week',
+            'available next monday', 'available next tuesday', 'available next wednesday',
+            'available next thursday', 'available next friday',
+            'do you have anything', 'is there an opening', 'any openings',
+            # Doctor availability queries
+            'is dr.', 'is dr ', 'is doctor', 'dr. ', ' dr ',
+            # Explicit scheduling intent
+            'need an appointment', 'want an appointment', 'book an appointment',
+            'schedule an appointment', 'make an appointment',
+        ]
+
+        if any(pattern in message_lower for pattern in scheduling_override_patterns):
+            logger.info(f"[supervisor] Keyword override: forcing scheduling for '{message[:50]}...'")
+            state["next_agent"] = "scheduling"
+            state["flow_state"] = FlowState.SCHEDULING.value
+            state['audit_trail'].append({
+                "node": "supervisor",
+                "timestamp": datetime.utcnow().isoformat(),
+                "decision": "scheduling",
+                "reason": "keyword_override",
+                "pattern_matched": True
+            })
+            return state
+
         # Few-shot supervisor prompt (reduces hallucination 10% -> <2%)
         # Updated: 4-way routing to separate static FAQ from dynamic queries requiring tools
         supervisor_prompt = f"""You are a routing supervisor for a healthcare clinic assistant.
@@ -1393,6 +1452,10 @@ User: "Where are you located?" -> static_info (cached address)
 User: "What's your phone number?" -> static_info (cached phone)
 User: "I need to come in on Tuesday" -> scheduling
 User: "I want to book an appointment" -> scheduling (intent is booking)
+User: "Can I come in this Sunday at 3 AM?" -> scheduling (visit request + day/time = scheduling)
+User: "Can I stop by tomorrow?" -> scheduling (visit request = scheduling)
+User: "Do you have anything next Tuesday?" -> scheduling (availability + day = scheduling)
+User: "Is there an opening this week?" -> scheduling (availability request = scheduling)
 User: "My tooth hurts" -> scheduling (pain = need to see doctor = booking)
 User: "У меня болит зуб" -> scheduling (Russian: my tooth hurts = needs appointment)
 User: "I'm in pain" -> scheduling (needs urgent appointment)
@@ -1671,12 +1734,34 @@ Respond with ONLY one word: scheduling, dynamic_info, static_info, or exit"""
         state['pending_action_expired'] = proposal_expired
         state['user_confirmed'] = user_confirmed
 
+        # =========================================================================
+        # FIX: Handle slot selection after check_availability presents options
+        # =========================================================================
+        slot_selected = None
+        if state.get('awaiting_slot_selection'):
+            message = state.get('message', '').strip()
+            verified_slots = state.get('verified_slots', [])
+
+            if verified_slots:
+                slot_selected = self._parse_slot_selection(message, verified_slots)
+
+                if slot_selected:
+                    logger.info(f"[session_init] User selected slot: {slot_selected.get('datetime', slot_selected)}")
+                    state['user_selected_slot'] = slot_selected
+                    state['selected_slot_verified'] = slot_selected
+                    state['awaiting_slot_selection'] = False
+                else:
+                    # User didn't select a valid slot - keep asking
+                    logger.info(f"[session_init] Could not parse slot selection from: {message}")
+                    # Don't clear awaiting_slot_selection - will re-present options
+
         state['audit_trail'].append({
             "node": "session_init",
             "timestamp": datetime.utcnow().isoformat(),
             "awaiting_confirmation": awaiting_confirmation,
             "proposal_expired": proposal_expired,
             "user_confirmed": user_confirmed,
+            "slot_selected": bool(slot_selected),
         })
 
         return state
@@ -2274,6 +2359,145 @@ Return valid JSON only, no markdown:
             language=language,
         )
 
+    def _format_slots_for_user(self, slots: list, language: str = 'en') -> str:
+        """
+        Format available slots into a user-friendly message.
+
+        FIX: After check_availability succeeds, present slots to user before proceeding.
+        This ensures the user sees available options and can choose, rather than
+        auto-selecting and immediately asking for name/phone.
+        """
+        if not slots:
+            messages = {
+                'en': "I checked and unfortunately there are no available slots for that time. Would you like me to check a different date?",
+                'ru': "Я проверил(а), но, к сожалению, на это время нет свободных записей. Хотите, чтобы я проверил(а) другую дату?",
+                'es': "He verificado y lamentablemente no hay horarios disponibles para ese momento. ¿Le gustaría que revise otra fecha?",
+            }
+            return messages.get(language, messages['en'])
+
+        # Format up to 5 slots
+        display_slots = slots[:5]
+
+        # Build slot list
+        slot_lines = []
+        for i, slot in enumerate(display_slots, 1):
+            # Extract datetime from slot
+            slot_time = slot.get('datetime') or slot.get('start') or slot.get('time', '')
+            if slot_time:
+                # Try to format nicely
+                try:
+                    from datetime import datetime as dt
+                    if isinstance(slot_time, str) and 'T' in slot_time:
+                        parsed = dt.fromisoformat(slot_time.replace('Z', '+00:00'))
+                        if language == 'ru':
+                            formatted = parsed.strftime('%d.%m в %H:%M')
+                        elif language == 'es':
+                            formatted = parsed.strftime('%d/%m a las %H:%M')
+                        else:
+                            formatted = parsed.strftime('%b %d at %I:%M %p')
+                    else:
+                        formatted = str(slot_time)
+                except:
+                    formatted = str(slot_time)
+
+                # Add provider if available
+                provider = slot.get('provider_name') or slot.get('doctor_name')
+                if provider:
+                    slot_lines.append(f"{i}. {formatted} - {provider}")
+                else:
+                    slot_lines.append(f"{i}. {formatted}")
+
+        slots_text = '\n'.join(slot_lines)
+
+        messages = {
+            'en': f"I've checked availability and found these times:\n\n{slots_text}\n\nWhich time works best for you?",
+            'ru': f"Я проверил(а) расписание и нашёл(а) следующие свободные окна:\n\n{slots_text}\n\nКакое время вам подходит?",
+            'es': f"He verificado la disponibilidad y encontré estos horarios:\n\n{slots_text}\n\n¿Cuál le conviene mejor?",
+        }
+
+        return messages.get(language, messages['en'])
+
+    def _parse_slot_selection(self, message: str, verified_slots: list) -> Optional[dict]:
+        """
+        Parse user's slot selection from their message.
+
+        Handles:
+        - Number selection: "1", "2", "the first one", "option 2"
+        - Time mention: "10am", "the 9:30 one", "morning"
+        - Confirmation of first: "yes", "that works", "sounds good"
+
+        Returns the selected slot dict or None if not parseable.
+        """
+        import re
+
+        message_lower = message.lower().strip()
+
+        if not verified_slots:
+            return None
+
+        # Check for number selection (1, 2, 3, first, second, third)
+        number_patterns = [
+            (r'^(\d)$', lambda m: int(m.group(1))),  # Just "1", "2", "3"
+            (r'^#?(\d)$', lambda m: int(m.group(1))),  # "#1", "#2"
+            (r'option\s*(\d)', lambda m: int(m.group(1))),  # "option 1"
+            (r'number\s*(\d)', lambda m: int(m.group(1))),  # "number 2"
+            (r'the\s*(\d)(?:st|nd|rd|th)?', lambda m: int(m.group(1))),  # "the 1st", "the 2nd"
+        ]
+
+        # Ordinal words
+        ordinals = {
+            'first': 1, 'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
+            'primero': 1, 'segundo': 2, 'tercero': 3,  # Spanish
+            'первый': 1, 'второй': 2, 'третий': 3, 'четвёртый': 4, 'пятый': 5,  # Russian
+            'первое': 1, 'второе': 2, 'третье': 3,  # Russian neuter
+        }
+
+        # Check number patterns
+        for pattern, extractor in number_patterns:
+            match = re.search(pattern, message_lower)
+            if match:
+                idx = extractor(match) - 1  # Convert to 0-indexed
+                if 0 <= idx < len(verified_slots):
+                    return verified_slots[idx]
+
+        # Check ordinal words
+        for word, idx in ordinals.items():
+            if word in message_lower:
+                if 0 <= idx - 1 < len(verified_slots):
+                    return verified_slots[idx - 1]
+
+        # Check for time mentions in the message that match a slot
+        # Extract times from verified slots
+        for i, slot in enumerate(verified_slots):
+            slot_time = slot.get('datetime') or slot.get('start') or slot.get('time', '')
+            if slot_time:
+                try:
+                    from datetime import datetime as dt
+                    if isinstance(slot_time, str) and 'T' in slot_time:
+                        parsed = dt.fromisoformat(slot_time.replace('Z', '+00:00'))
+                        # Check various time formats
+                        time_formats = [
+                            parsed.strftime('%I:%M').lstrip('0'),  # "9:30"
+                            parsed.strftime('%I:%M %p').lower(),  # "9:30 am"
+                            parsed.strftime('%I%p').lower().lstrip('0'),  # "9am"
+                            parsed.strftime('%H:%M'),  # "09:30"
+                        ]
+                        for fmt in time_formats:
+                            if fmt in message_lower:
+                                return slot
+                except:
+                    pass
+
+        # Check for simple confirmation (assume first slot)
+        simple_confirms = ['yes', 'yeah', 'sure', 'ok', 'okay', 'that works', 'sounds good',
+                          'да', 'ок', 'хорошо', 'подходит',
+                          'sí', 'si', 'vale', 'bueno']
+        if any(confirm in message_lower for confirm in simple_confirms):
+            # If user just confirms without specifying, take first slot
+            return verified_slots[0]
+
+        return None
+
     # ========================================================================
     # Phase 4: Executor Debugging & Silent Failure Prevention Helpers
     # ========================================================================
@@ -2653,10 +2877,22 @@ Return valid JSON only, no markdown:
                 language = state.get('detected_language', 'en')
                 # ENHANCED (Opinion 3): Dynamic clarification with context
                 service_type = args.get('appointment_type', 'appointment')
+
+                # FIX: Add empathy prefix for pain/discomfort scenarios
+                empathy_prefix = ""
+                if state.get('empathy_prefix') or state.get('needs_empathy'):
+                    empathy_prefixes = {
+                        'en': "I'm sorry to hear you're in discomfort. ",
+                        'es': "Lamento que tenga molestias. ",
+                        'ru': "Мне жаль, что вам нехорошо. ",
+                    }
+                    empathy_prefix = empathy_prefixes.get(language, empathy_prefixes['en'])
+                    state['needs_empathy'] = False  # Clear flag
+
                 clarification_messages = {
-                    'en': f"I'd be happy to book your {service_type} for you. Could you please provide your name and phone number so I can find your record?",
-                    'es': f"Con gusto le ayudo con su cita de {service_type}. ¿Podría proporcionarme su nombre y número de teléfono?",
-                    'ru': f"С удовольствием запишу вас на {service_type}. Не могли бы вы назвать ваше имя и номер телефона?",
+                    'en': f"{empathy_prefix}I'd be happy to help you get an appointment as soon as possible. Could you please provide your name and phone number so I can find your record?",
+                    'es': f"{empathy_prefix}Con gusto le ayudo a conseguir una cita lo antes posible. ¿Podría proporcionarme su nombre y número de teléfono?",
+                    'ru': f"{empathy_prefix}С удовольствием помогу вам записаться как можно скорее. Не могли бы вы назвать ваше имя и номер телефона?",
                 }
                 state['response'] = clarification_messages.get(language, clarification_messages['en'])
 
@@ -2844,7 +3080,81 @@ Return valid JSON only, no markdown:
                         'doctor_id': validated_args.get('doctor_id'),
                         'timestamp': datetime.utcnow().isoformat(),
                     }
-                    # Pre-select first available slot for confirmation (user can change)
+
+                    # =========================================================================
+                    # FIX: Handle empty slots - tell user we're closed/unavailable
+                    # =========================================================================
+                    if not available_slots:
+                        language = state.get('detected_language', 'en')
+                        requested_date = state.get('preferred_date') or validated_args.get('date', '')
+
+                        # Generate "no availability" message
+                        # FIX: Handle case when requested_date is empty or None
+                        if requested_date:
+                            no_slots_messages = {
+                                'en': f"I checked and unfortunately we don't have availability for {requested_date}. Our clinic hours are Monday-Friday 9am-5pm. Would you like me to check a different date or time?",
+                                'ru': f"Я проверил(а), но, к сожалению, на {requested_date} нет свободных записей. Наши часы работы: Пн-Пт 9:00-17:00. Хотите, чтобы я проверил(а) другую дату?",
+                                'es': f"He verificado y lamentablemente no tenemos disponibilidad para {requested_date}. Nuestro horario es de lunes a viernes de 9am a 5pm. ¿Le gustaría que revise otra fecha?",
+                            }
+                        else:
+                            no_slots_messages = {
+                                'en': "I checked and unfortunately we don't have availability at that time. Our clinic hours are Monday-Friday 9am-5pm. Would you like me to check a specific date?",
+                                'ru': "Я проверил(а), но, к сожалению, на это время нет свободных записей. Наши часы работы: Пн-Пт 9:00-17:00. Хотите, чтобы я проверил(а) конкретную дату?",
+                                'es': "He verificado y lamentablemente no tenemos disponibilidad en ese horario. Nuestro horario es de lunes a viernes de 9am a 5pm. ¿Le gustaría que revise una fecha específica?",
+                            }
+                        state['response'] = no_slots_messages.get(language, no_slots_messages['en'])
+                        state['no_availability'] = True
+                        state['awaiting_new_date'] = True
+
+                        # Mark step as completed but don't proceed to booking
+                        completed_steps.append(step_name)
+                        state['plan_completed_steps'] = completed_steps
+                        state['tools_actually_called'] = tools_called
+
+                        logger.info(f"[executor] No slots available for {requested_date}, asking user for alternative")
+
+                        state['audit_trail'].append({
+                            "node": "executor",
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "step": step_name,
+                            "action": "no_availability",
+                            "requested_date": requested_date,
+                        })
+
+                        return state
+
+                    # =========================================================================
+                    # FIX: Present slots to user before proceeding to book_appointment
+                    # Instead of auto-selecting first slot and continuing, pause and let user choose
+                    # =========================================================================
+                    if available_slots and not state.get('user_selected_slot'):
+                        # Format slots for display
+                        language = state.get('detected_language', 'en')
+                        slots_message = self._format_slots_for_user(available_slots, language)
+
+                        # Store state for slot selection
+                        state['awaiting_slot_selection'] = True
+                        state['response'] = slots_message
+
+                        # Track that we presented slots
+                        state['slots_presented'] = True
+                        completed_steps.append(step_name)
+                        state['plan_completed_steps'] = completed_steps
+                        state['tools_actually_called'] = tools_called
+
+                        logger.info(f"[executor] Presenting {len(available_slots)} slots to user, awaiting selection")
+
+                        state['audit_trail'].append({
+                            "node": "executor",
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "step": step_name,
+                            "action": "slots_presented",
+                            "slot_count": len(available_slots),
+                        })
+
+                        return state
+
+                    # If user already selected a slot, store it
                     if available_slots:
                         first_slot = available_slots[0]
                         state['selected_slot_verified'] = first_slot
@@ -3004,6 +3314,11 @@ Return valid JSON only, no markdown:
         # =========================================================================
         # Existing routing logic
         # =========================================================================
+
+        # FIX: If awaiting slot selection, exit to show slots to user
+        if state.get('awaiting_slot_selection'):
+            logger.info("[executor_router] Awaiting slot selection, exiting to present options")
+            return 'exit'  # Wait for user to select a slot
 
         if state.get('awaiting_confirmation'):
             return 'exit'  # Wait for user response
