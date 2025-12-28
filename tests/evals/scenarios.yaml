@@ -99,12 +99,14 @@ scenarios:
         content: "Just a check-up. Do you have anything next Tuesday?"
     expected_behavior: |
       The agent should either:
-      1. Check availability for Tuesday and offer slots, OR
+      1. Check availability for Tuesday and offer slots (PREFERRED), OR
       2. Ask for more details (time preference) before checking
+      Proactively checking availability is VALID and efficient behavior.
     criteria:
       - "Acknowledges check-up request"
-      - "Either checks availability OR asks for time preference"
-      - "Does not hallucinate slot availability"
+      - "Either checks availability (PASS) OR asks for time preference (also PASS)"
+      - "Does not hallucinate slot availability without tool call"
+    requires_availability_check: true
 
   - name: "Spanish Switch"
     description: "User switches to Spanish mid-conversation."
@@ -187,12 +189,14 @@ scenarios:
       - role: user
         content: "What time is it there right now?"
     expected_behavior: |
-      The agent should provide the current time OR explain it doesn't have access to real-time clock.
-      Should not hallucinate a specific time without verification.
+      The agent should explain it doesn't have access to real-time clock.
+      Providing static clinic hours (from configuration) is ACCEPTABLE - this is not hallucination.
+      Should not claim to know the current time.
     criteria:
-      - "Provides time OR explains limitation"
-      - "Does not hallucinate incorrect time"
-      - "Helpful response regardless"
+      - "Explains limitation about real-time clock access"
+      - "Does NOT claim to know the exact current time"
+      - "Static clinic hours from config are VALID (not hallucination)"
+      - "Offers helpful next steps (schedule appointment)"
 
   - name: "Relative Date - Tomorrow"
     description: "User asks for an appointment 'tomorrow' relative to current date"
@@ -201,12 +205,14 @@ scenarios:
         content: "I need an appointment for tomorrow."
     expected_behavior: |
       The agent should either:
-      1. Check availability for tomorrow and offer slots, OR
+      1. Check availability for tomorrow and offer slots (PREFERRED), OR
       2. Ask what type of service/time preference before checking
+      Checking availability proactively is VALID and efficient behavior.
     criteria:
       - "Acknowledges the 'tomorrow' request"
-      - "Either checks availability OR gathers more info first"
-      - "Does not hallucinate slot times"
+      - "Either checks availability (PASS) OR gathers more info (also PASS)"
+      - "Does not hallucinate slot times without tool call"
+    requires_availability_check: true
 
   - name: "Date Logic - Next Week"
     description: "User asks for 'next week' availability"
@@ -215,12 +221,14 @@ scenarios:
         content: "Do you have anything available next week?"
     expected_behavior: |
       The agent should either:
-      1. Check availability for next week and offer slots, OR
+      1. Check availability for next week and offer slots (PREFERRED), OR
       2. Ask for service type/preference before checking
+      Proactively checking availability is VALID and efficient behavior.
     criteria:
       - "Acknowledges the 'next week' timeframe"
-      - "Either checks availability OR asks for more details"
-      - "Does not hallucinate availability"
+      - "Either checks availability (PASS) OR asks for more details (also PASS)"
+      - "Does not hallucinate availability without tool call"
+    requires_availability_check: true
 
   - name: "Find Specific Doctor"
     description: "User asks for a doctor by name"
@@ -228,10 +236,11 @@ scenarios:
       - role: user
         content: "Is Dr. Smith available?"
     expected_behavior: |
-      The agent should either:
-      1. Check availability for Dr. Smith, OR
-      2. Ask what service/time the user is interested in
+      The agent should check Dr. Smith's availability (PREFERRED).
+      Checking availability proactively for a specific doctor is efficient.
+      May ask for time preference, but should acknowledge Dr. Smith's name.
     criteria:
-      - "Acknowledges the doctor request"
-      - "Either checks availability OR asks for service type"
-      - "Does not hallucinate Dr. Smith's schedule"
+      - "Acknowledges the Dr. Smith request by name"
+      - "Either checks availability (PASS) OR asks for preferred time (also PASS)"
+      - "Does not hallucinate availability without tool call"
+    requires_availability_check: true

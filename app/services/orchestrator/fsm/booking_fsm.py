@@ -153,6 +153,22 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
     # ==========================================
     if state.stage == BookingStage.COLLECT_DATE:
         if not state.target_date:
+            # FIX: If user asked about a specific doctor, check their availability
+            # without requiring a specific date ("Is Dr. Smith available?")
+            if state.doctor_name:
+                # Check doctor's upcoming availability
+                state = replace(state, has_pain=False, target_date="this week")
+                state = replace(state, stage=BookingStage.CHECK_AVAILABILITY)
+                return state, [CallTool(
+                    name="check_availability",
+                    args={
+                        "service_type": state.service_type or "general",
+                        "date": "this week",
+                        "time_preference": state.time_of_day,
+                        "doctor_name": state.doctor_name,
+                    }
+                )]
+
             # Ask for date with empathy if pain was mentioned
             # Clear pain flag after using empathy
             state = replace(state, has_pain=False)

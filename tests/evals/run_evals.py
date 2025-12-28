@@ -334,16 +334,42 @@ async def run_evals():
 
             # CRITICAL: Also mock AppointmentTools used by the LangGraph orchestrator
             # The orchestrator imports: from ..tools.appointment_tools import AppointmentTools
+            # FIX: Use correct field names that FSM expects (available_slots, not slots)
+            # FIX: Make mock smart - return no slots for invalid times (weekends, outside hours)
             mock_appointment_tools = MagicMock()
-            mock_appointment_tools.check_availability = AsyncMock(return_value={
-                'available': True,
-                'slots': [
-                    {'datetime': '2025-11-27T09:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
-                    {'datetime': '2025-11-27T10:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
-                    {'datetime': '2025-11-27T14:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
-                ],
-                'message': 'Found 3 available slots for tomorrow.'
-            })
+
+            async def smart_check_availability(**kwargs):
+                """Smart mock that returns no slots for invalid times."""
+                date_str = str(kwargs.get('date', '')).lower()
+                time_pref = str(kwargs.get('time_preference', '')).lower()
+
+                # Return NO slots for:
+                # - Weekends (Sunday, Saturday)
+                # - Very early/late times (before 9am, after 5pm)
+                # - Explicitly mentioned invalid times like "3 AM"
+                # - Same-day requests (today/hoy) - simulating late in the day
+                invalid_patterns = ['sunday', 'saturday', '3 am', '3am', '2 am', '2am',
+                                   '11 pm', '11pm', '10 pm', '10pm', 'midnight',
+                                   'today', 'hoy', 'сегодня']  # Same-day = no availability
+                if any(p in date_str or p in time_pref for p in invalid_patterns):
+                    return {
+                        'success': True,
+                        'available_slots': [],
+                        'message': 'No availability for the requested time. Our hours are Monday-Friday 9am-5pm.'
+                    }
+
+                # Return slots for valid times (tomorrow = Nov 27)
+                return {
+                    'success': True,
+                    'available_slots': [
+                        {'datetime': '2025-11-27T09:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
+                        {'datetime': '2025-11-27T10:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
+                        {'datetime': '2025-11-27T14:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
+                    ],
+                    'message': 'Found 3 available slots for tomorrow.'
+                }
+
+            mock_appointment_tools.check_availability = smart_check_availability
             mock_appointment_tools.book_appointment = AsyncMock(return_value={
                 'success': True,
                 'appointment_id': 'appt-123',
