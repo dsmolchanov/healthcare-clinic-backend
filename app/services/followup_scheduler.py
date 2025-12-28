@@ -13,7 +13,8 @@ class FollowupScheduler:
 
     def __init__(self, llm_factory=None):
         self._llm_factory = llm_factory
-        self.model = os.environ.get('FOLLOWUP_SCHEDULER_MODEL', 'gpt-4o-mini')
+        # Note: Model is now resolved via tier system (ModelTier.REASONING)
+        # ENV override TIER_REASONING_MODEL can be used for emergency rollback
 
     async def _get_factory(self):
         """Get or create LLM factory instance"""
@@ -26,7 +27,8 @@ class FollowupScheduler:
         self,
         session_id: str,
         last_10_messages: List[Dict[str, Any]],
-        last_agent_action: str
+        last_agent_action: str,
+        clinic_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Analyze conversation and determine when to follow up
@@ -83,8 +85,10 @@ Urgency guidelines:
         try:
             logger.info(f"Analyzing conversation for follow-up scheduling...")
 
+            from app.services.llm.tiers import ModelTier
             factory = await self._get_factory()
-            response = await factory.generate(
+            response = await factory.generate_for_tier(
+                tier=ModelTier.REASONING,
                 messages=[
                     {
                         "role": "system",
@@ -95,8 +99,9 @@ Urgency guidelines:
                         "content": prompt
                     }
                 ],
-                model=self.model,
                 temperature=0.3,
+                clinic_id=clinic_id,
+                session_id=session_id,
                 response_format={"type": "json_object"}
             )
 
@@ -130,7 +135,9 @@ Urgency guidelines:
                 'urgency': analysis.get('urgency', 'medium'),
                 'context_summary': analysis.get('context_summary', ''),
                 'reasoning': analysis.get('reasoning', ''),
-                'analysis_model': self.model
+                'analysis_model': response.model,
+                'tier': response.tier,
+                'tier_source': response.tier_source
             }
 
         except Exception as e:

@@ -13,20 +13,21 @@ class SessionSummarizer:
 
     def __init__(self):
         self.supabase = get_healthcare_client()
-        self._llm = None  # Lazy-loaded
+        self._llm_factory = None  # Lazy-loaded
 
-    async def _get_llm(self):
-        """Lazy-load LLM to avoid blocking initialization"""
-        if self._llm is None:
+    async def _get_llm_factory(self):
+        """Lazy-load LLM factory to avoid blocking initialization"""
+        if self._llm_factory is None:
             from app.services.llm.llm_factory import get_llm_factory
-            llm_factory = await get_llm_factory()
-            self._llm = llm_factory.get_llm(provider="openai", model="gpt-4o-mini")
-        return self._llm
+            self._llm_factory = await get_llm_factory()
+        return self._llm_factory
 
     async def generate_summary(
         self,
         messages: List[Dict[str, any]],
-        session_metadata: Dict[str, any]
+        session_metadata: Dict[str, any],
+        clinic_id: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> str:
         """
         Generate session summary from conversation messages.
@@ -34,10 +35,13 @@ class SessionSummarizer:
         Args:
             messages: List of messages with role and content
             session_metadata: Session context (clinic_id, patient_name, etc.)
+            clinic_id: Optional clinic ID for tier-based model routing
+            session_id: Optional session ID for A/B experiment assignment
 
         Returns:
             Concise summary string
         """
+        from app.services.llm.tiers import ModelTier
 
         if not messages:
             return "Empty session - no messages exchanged"
@@ -66,23 +70,32 @@ Conversation:
 
 Generate summary:"""
 
-        # Call LLM with retries
+        # Call LLM using tier-based routing
         messages_array = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
 
+        # Use clinic_id from metadata if not provided
+        resolved_clinic_id = clinic_id or session_metadata.get('clinic_id')
+
         try:
-            llm = await self._get_llm()
-            response = await llm.generate(
+            llm_factory = await self._get_llm_factory()
+            response = await llm_factory.generate_for_tier(
+                tier=ModelTier.SUMMARIZATION,
                 messages=messages_array,
                 max_tokens=300,
-                temperature=0.3
+                temperature=0.3,
+                clinic_id=resolved_clinic_id,
+                session_id=session_id
             )
 
-            summary = response.get('content', '').strip()
+            summary = response.content.strip() if response.content else ''
 
-            logger.info(f"Generated summary: {len(summary)} chars, {len(messages)} messages")
+            logger.info(
+                f"Generated summary: {len(summary)} chars, {len(messages)} messages "
+                f"(tier={response.tier}, source={response.tier_source})"
+            )
 
             return summary
 
@@ -121,8 +134,13 @@ Generate summary:"""
             # Fetch session metadata
             session_metadata = await self._get_session_metadata(session_id)
 
-            # Generate summary
-            summary = await self.generate_summary(messages, session_metadata)
+            # Generate summary using tier-based routing
+            summary = await self.generate_summary(
+                messages,
+                session_metadata,
+                clinic_id=session_metadata.get('clinic_id'),
+                session_id=session_id
+            )
 
             # Store summary with status (healthcare schema)
             self.supabase.table('conversation_sessions').update({

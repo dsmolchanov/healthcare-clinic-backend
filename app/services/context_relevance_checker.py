@@ -22,7 +22,8 @@ class ContextRelevanceChecker:
 
     def __init__(self, llm_factory=None):
         self._llm_factory = llm_factory
-        self.model = os.environ.get('CONTEXT_CHECKER_MODEL', 'gpt-4o-mini')
+        # Note: Model is now resolved via tier system (ModelTier.ROUTING)
+        # ENV override TIER_ROUTING_MODEL can be used for emergency rollback
 
     async def _get_factory(self):
         """Get or create LLM factory instance"""
@@ -35,7 +36,9 @@ class ContextRelevanceChecker:
         self,
         current_message: str,
         pending_action: str,
-        conversation_history: list = None
+        conversation_history: list = None,
+        clinic_id: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> Tuple[bool, float, str]:
         """
         Check if pending action context is relevant to current message
@@ -100,8 +103,10 @@ Guidelines:
                 ])
                 prompt += f"\n\nRecent conversation:\n{history_text}"
 
+            from app.services.llm.tiers import ModelTier
             factory = await self._get_factory()
-            response = await factory.generate(
+            response = await factory.generate_for_tier(
+                tier=ModelTier.ROUTING,
                 messages=[
                     {
                         "role": "system",
@@ -112,8 +117,9 @@ Guidelines:
                         "content": prompt
                     }
                 ],
-                model=self.model,
                 temperature=0.1,
+                clinic_id=clinic_id,
+                session_id=session_id,
                 response_format={"type": "json_object"}
             )
 
@@ -138,7 +144,9 @@ Guidelines:
     async def extract_current_intent(
         self,
         message: str,
-        language: str = 'en'
+        language: str = 'en',
+        clinic_id: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Extract the user's current intent from their message
@@ -170,8 +178,10 @@ Return ONLY a JSON object:
 }}
 """
 
+            from app.services.llm.tiers import ModelTier
             factory = await self._get_factory()
-            response = await factory.generate(
+            response = await factory.generate_for_tier(
+                tier=ModelTier.ROUTING,
                 messages=[
                     {
                         "role": "system",
@@ -182,8 +192,9 @@ Return ONLY a JSON object:
                         "content": prompt
                     }
                 ],
-                model=self.model,
                 temperature=0.1,
+                clinic_id=clinic_id,
+                session_id=session_id,
                 response_format={"type": "json_object"}
             )
 

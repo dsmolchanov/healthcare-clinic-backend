@@ -33,7 +33,7 @@ class OpenAIAdapter(LLMAdapter):
 
         params = self.sanitize_parameters(kwargs)
 
-        # GPT-5-nano only supports temperature=1 (default)
+        # GPT-5-nano and gpt-5-mini only support temperature=1 (default)
         # Remove temperature param to use default
         api_params = {
             "model": self.model,
@@ -42,8 +42,9 @@ class OpenAIAdapter(LLMAdapter):
             **params
         }
 
-        # Only add temperature if not gpt-5-nano
-        if 'gpt-5-nano' not in self.model.lower():
+        # Only add temperature if not gpt-5-nano or gpt-5-mini
+        model_lower = self.model.lower()
+        if 'gpt-5-nano' not in model_lower and 'gpt-5-mini' not in model_lower:
             api_params["temperature"] = temperature
 
         try:
@@ -81,7 +82,7 @@ class OpenAIAdapter(LLMAdapter):
 
         params = self.sanitize_parameters(kwargs)
 
-        # GPT-5-nano only supports temperature=1 (default)
+        # GPT-5-nano and gpt-5-mini only support temperature=1 (default)
         # Remove temperature param to use default
         # Get tool_choice - default to 'auto' but allow override
         tool_choice = params.pop('tool_choice', 'auto')
@@ -96,8 +97,9 @@ class OpenAIAdapter(LLMAdapter):
             **params
         }
 
-        # Only add temperature if not gpt-5-nano
-        if 'gpt-5-nano' not in self.model.lower():
+        # Only add temperature if not gpt-5-nano or gpt-5-mini
+        model_lower = self.model.lower()
+        if 'gpt-5-nano' not in model_lower and 'gpt-5-mini' not in model_lower:
             api_params["temperature"] = temperature
 
         try:

@@ -30,6 +30,11 @@ class LLMResponse(BaseModel):
     latency_ms: int
     ttft_ms: Optional[int] = None
     raw_response: Optional[Any] = None  # Raw provider response for preserving context (e.g., Gemini thought_signature)
+    # Tier context for metrics (Phase 2 - tier abstraction)
+    tier: Optional[str] = None
+    tier_source: Optional[str] = None  # 'experiment', 'clinic', 'global', 'env', 'default'
+    experiment_id: Optional[str] = None
+    variant: Optional[str] = None
 
     class Config:
         arbitrary_types_allowed = True
