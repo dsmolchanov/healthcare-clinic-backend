@@ -108,20 +108,26 @@ class BookingState:
     def merge_router_output(self, router: 'RouterOutput') -> 'BookingState':
         """Merge new info from router without overwriting existing values.
 
+        IMPORTANT: Existing values are preserved. This prevents accidental
+        overwrites when the router extracts partial info. For intentional
+        changes (like backtracking), use explicit replace() in the FSM logic.
+
         Args:
             router: RouterOutput with newly extracted entities
 
         Returns:
-            New BookingState with merged values
+            New BookingState with merged values (existing preserved, gaps filled)
         """
         return replace(
             self,
+            # Prioritize Self (existing) -> Fallback to Router (new)
             service_type=self.service_type or router.service_type,
             target_date=self.target_date or router.target_date,
             time_of_day=self.time_of_day or router.time_of_day,
             doctor_name=self.doctor_name or router.doctor_name,
             patient_name=self.patient_name or router.patient_name,
             patient_phone=self.patient_phone or router.patient_phone,
+            # Pain is additive - once mentioned, stays true
             has_pain=router.has_pain or self.has_pain,
         )
 

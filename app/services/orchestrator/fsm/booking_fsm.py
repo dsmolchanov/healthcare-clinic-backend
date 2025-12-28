@@ -41,9 +41,14 @@ MESSAGES = {
         'es': "He verificado y lamentablemente no tenemos disponibilidad en ese horario. Nuestro horario es de lunes a viernes de 9am a 5pm. Le gustaría probar otro horario?",
     },
     'empathy_prefix': {
-        'en': "I'm sorry you're in discomfort. ",
+        'en': "I'm sorry to hear you're in discomfort. ",
         'ru': "Мне жаль, что вам нехорошо. ",
         'es': "Lamento que tenga molestias. ",
+    },
+    'pain_urgent': {
+        'en': "I'm sorry to hear you're in pain. Let me check for the earliest available appointment right away.",
+        'ru': "Мне жаль, что вам больно. Позвольте проверить ближайшее доступное время.",
+        'es': "Lamento que tenga dolor. Déjeme verificar la cita disponible más temprana de inmediato.",
     },
     'escalate': {
         'en': "I'm having trouble understanding your request. Let me connect you with our staff who can help directly.",
@@ -96,14 +101,18 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
     # Handle user messages
     assert isinstance(event, UserEvent)
 
-    # Merge any new info from router
+    # Save original values BEFORE merge for backtracking detection
+    original_target_date = state.target_date
+    original_doctor_name = state.doctor_name
+
+    # Merge any new info from router (fills gaps, doesn't overwrite)
     state = state.merge_router_output(event.router)
     state = replace(state, language=event.language)
     lang = event.language
 
-    # Build empathy prefix if needed
+    # Build empathy prefix if needed (don't clear pain flag yet - need it for logic below)
     empathy = get_msg('empathy_prefix', lang) if state.has_pain else ""
-    state = replace(state, has_pain=False)  # Clear after use
+    is_pain_scenario = state.has_pain
 
     # ==========================================
     # Stage: INTENT - Just got booking intent
@@ -117,6 +126,9 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
     # ==========================================
     if state.stage == BookingStage.COLLECT_SERVICE:
         if not state.service_type:
+            # Ask for service type with empathy if pain was mentioned
+            # Clear pain flag after using empathy
+            state = replace(state, has_pain=False)
             return state, [AskUser(
                 text=empathy + get_msg('ask_service', lang),
                 field_awaiting='service_type'
@@ -128,12 +140,20 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
     # ==========================================
     if state.stage == BookingStage.COLLECT_DATE:
         if not state.target_date:
+            # Ask for date with empathy if pain was mentioned
+            # Clear pain flag after using empathy
+            state = replace(state, has_pain=False)
             return state, [AskUser(
-                text=get_msg('ask_date', lang),
+                text=empathy + get_msg('ask_date', lang),
                 field_awaiting='target_date'
             )]
+
+        # Clear pain flag before tool call - we've acknowledged it
+        state = replace(state, has_pain=False)
+
         # Have enough info to check availability
         state = replace(state, stage=BookingStage.CHECK_AVAILABILITY)
+
         return state, [CallTool(
             name="check_availability",
             args={
@@ -219,7 +239,8 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
         else:
             # BACKTRACKING DETECTION: User provided new info instead of confirming
             # Check if they're changing their mind (e.g., "Actually, make it next week")
-            if event.router.target_date and event.router.target_date != state.target_date:
+            # Compare with ORIGINAL values (before merge) to detect actual changes
+            if event.router.target_date and event.router.target_date != original_target_date:
                 # New date detected - reset to date collection
                 state = replace(
                     state,
@@ -228,7 +249,7 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
                     selected_slot=None,
                     available_slots=[]
                 )
-                # Fall through to COLLECT_DATE handling which will call check_availability
+                # Call check_availability with new date
                 return state, [CallTool(
                     name="check_availability",
                     args={
@@ -238,7 +259,7 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
                         "doctor_name": state.doctor_name,
                     }
                 )]
-            elif event.router.doctor_name and event.router.doctor_name != state.doctor_name:
+            elif event.router.doctor_name and event.router.doctor_name != original_doctor_name:
                 # Different doctor requested - re-check availability
                 state = replace(
                     state,

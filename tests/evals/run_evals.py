@@ -205,6 +205,15 @@ async def run_evals():
             })
             stack.enter_context(patch('app.services.message_context_hydrator.MessageContextHydrator', return_value=mock_hydrator))
 
+            # Redis Client - mock to return empty values for state lookups
+            mock_redis = MagicMock()
+            mock_redis.get.return_value = None  # FSM state lookups return None
+            mock_redis.hget.return_value = None  # Session state lookups return None
+            mock_redis.set.return_value = True
+            mock_redis.hset.return_value = True
+            mock_redis.expire.return_value = True
+            stack.enter_context(patch('app.config.get_redis_client', return_value=mock_redis))
+
             # Supabase Client (used in multiple places)
             mock_supabase = MagicMock()
             stack.enter_context(patch('app.database.get_healthcare_client', return_value=mock_supabase))
@@ -551,9 +560,11 @@ async def run_evals():
 
         # CRITICAL: Also patch LLMFactory class for code that instantiates it directly
         # The LangGraph orchestrator uses: from app.services.llm.llm_factory import LLMFactory
-        # Since it's a lazy import, patching the source module is sufficient
+        # The FSM orchestrator uses: from app.services.llm import LLMFactory
+        # Must patch BOTH locations for complete coverage
         mock_factory_class = MagicMock(return_value=mock_factory)
         stack.enter_context(patch('app.services.llm.llm_factory.LLMFactory', mock_factory_class))
+        stack.enter_context(patch('app.services.llm.LLMFactory', mock_factory_class))
 
         # Initialize Processor (using Pipeline architecture)
         processor = PipelineMessageProcessor()
@@ -653,6 +664,11 @@ async def run_evals():
             # Clear processor cache to prevent context leakage (e.g. doctor IDs)
             if hasattr(processor, '_clinic_profile_cache'):
                 processor._clinic_profile_cache.clear()
+
+            # CRITICAL: Clear FSM state store to prevent state leakage between scenarios
+            # The FSM uses LangGraphExecutionStep._in_memory_state_store for state persistence
+            from app.api.pipeline.steps.langgraph_step import LangGraphExecutionStep
+            LangGraphExecutionStep._in_memory_state_store.clear()
             if hasattr(processor, '_known_clinic_ids'):
                 processor._known_clinic_ids.clear()
             
