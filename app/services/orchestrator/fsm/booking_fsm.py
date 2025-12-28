@@ -126,13 +126,26 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
     # ==========================================
     if state.stage == BookingStage.COLLECT_SERVICE:
         if not state.service_type:
-            # Ask for service type with empathy if pain was mentioned
-            # Clear pain flag after using empathy
-            state = replace(state, has_pain=False)
-            return state, [AskUser(
-                text=empathy + get_msg('ask_service', lang),
-                field_awaiting='service_type'
-            )]
+            # FIX: If user provided a date/time, skip to availability check
+            # with a default service type. This handles cases like:
+            # "Can I come in Sunday at 3 AM?" - user wants availability, not to specify service
+            if state.target_date:
+                # Use "general" as default service type when checking availability
+                state = replace(state, service_type="general", stage=BookingStage.COLLECT_DATE)
+                # Fall through to COLLECT_DATE which will trigger CHECK_AVAILABILITY
+            elif state.doctor_name:
+                # User asked about a specific doctor - also proceed with general type
+                state = replace(state, service_type="general", stage=BookingStage.COLLECT_DATE)
+                # Fall through to COLLECT_DATE
+            else:
+                # No date/time provided - need to ask for service type
+                # Ask for service type with empathy if pain was mentioned
+                # Clear pain flag after using empathy
+                state = replace(state, has_pain=False)
+                return state, [AskUser(
+                    text=empathy + get_msg('ask_service', lang),
+                    field_awaiting='service_type'
+                )]
         state = replace(state, stage=BookingStage.COLLECT_DATE)
 
     # ==========================================

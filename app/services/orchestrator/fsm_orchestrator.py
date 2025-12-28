@@ -233,7 +233,15 @@ class FSMOrchestrator:
         if router_output.route == "pricing":
             return await self._handle_pricing(message, router_output, language)
 
-        # Default: scheduling (booking or cancel)
+        if router_output.route == "cancel":
+            # Pass serialized state for appointment_id lookup
+            serialized_state = self._serialize_state(fsm_state) if fsm_state else None
+            return await self._handle_cancel(message, language, serialized_state)
+
+        if router_output.route == "irrelevant":
+            return await self._handle_irrelevant(message, language)
+
+        # Default: scheduling (booking)
         return await self._handle_scheduling(
             message, router_output, fsm_state, language, tools_called
         )
@@ -385,10 +393,37 @@ class FSMOrchestrator:
         message: str,
         language: str,
     ) -> Dict[str, Any]:
-        """Handle info queries (hours, location, etc.)."""
+        """Handle info queries (hours, location, time, etc.)."""
         # Use clinic profile for info
         info = self.clinic_profile
+        msg_lower = message.lower()
 
+        # Check if this is a time/timezone query
+        time_keywords = ['what time', 'current time', 'time is it', 'timezone',
+                        'который час', 'que hora', 'qué hora']
+        is_time_query = any(kw in msg_lower for kw in time_keywords)
+
+        if is_time_query:
+            time_responses = {
+                'en': "I don't have access to real-time clock information. "
+                      "Our clinic is open Monday-Friday 9am-5pm. "
+                      "Would you like to schedule an appointment?",
+                'ru': "У меня нет доступа к информации о текущем времени. "
+                      "Наша клиника работает с понедельника по пятницу с 9:00 до 17:00. "
+                      "Хотите записаться на приём?",
+                'es': "No tengo acceso a la hora actual. "
+                      "Nuestra clínica está abierta de lunes a viernes de 9am a 5pm. "
+                      "¿Le gustaría programar una cita?",
+            }
+            return {
+                "response": time_responses.get(language, time_responses['en']),
+                "state": None,
+                "tools_called": [],
+                "route": "info",
+                "guardrail_triggered": False,
+            }
+
+        # Standard info response
         responses = {
             'en': f"Our clinic is open Monday-Friday 9am-5pm. "
                   f"You can reach us at {info.get('phone', 'our front desk')}. "
@@ -406,6 +441,98 @@ class FSMOrchestrator:
             "state": None,
             "tools_called": [],
             "route": "info",
+            "guardrail_triggered": False,
+        }
+
+    async def _handle_cancel(
+        self,
+        message: str,
+        language: str,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Handle cancellation requests.
+
+        Attempts to call cancel_appointment tool if we have an appointment_id.
+        Falls back to asking for confirmation.
+
+        Args:
+            message: User message
+            language: Language code
+            state: FSM state with potential appointment_id
+        """
+        tools_called: list = []
+
+        # Check if we have a recent appointment_id from a booking
+        appointment_id = None
+        if state:
+            appointment_id = state.get('appointment_id')
+
+        # If we have cancel_appointment tool and an appointment_id, attempt cancellation
+        if "cancel_appointment" in self.tool_registry and appointment_id:
+            handler = self.tool_registry["cancel_appointment"]
+            try:
+                result = await handler(
+                    appointment_id=appointment_id,
+                    reason="User requested cancellation"
+                )
+                tools_called.append({"name": "cancel_appointment", "args": {"appointment_id": appointment_id}})
+
+                if result.get("success"):
+                    # Successful cancellation
+                    responses = {
+                        'en': "I've cancelled your appointment. Is there anything else I can help with?",
+                        'ru': "Я отменил(а) вашу запись. Могу ли я помочь вам с чем-то ещё?",
+                        'es': "He cancelado su cita. ¿Hay algo más en lo que pueda ayudarle?",
+                    }
+                    return {
+                        "response": responses.get(language, responses['en']),
+                        "state": None,  # Clear state after cancellation
+                        "tools_called": tools_called,
+                        "route": "cancel",
+                        "guardrail_triggered": False,
+                    }
+            except Exception as e:
+                logger.error(f"Cancel appointment failed: {e}")
+
+        # No appointment to cancel or cancellation failed - ask for confirmation
+        # Check if user is asking to cancel a recent appointment
+        confirm_responses = {
+            'en': "I understand you want to cancel your appointment. Could you confirm the date and time of the appointment you'd like to cancel?",
+            'ru': "Понятно, вы хотите отменить запись. Не могли бы вы подтвердить дату и время записи, которую хотите отменить?",
+            'es': "Entiendo que desea cancelar su cita. ¿Podría confirmar la fecha y hora de la cita que desea cancelar?",
+        }
+
+        return {
+            "response": confirm_responses.get(language, confirm_responses['en']),
+            "state": state,  # Preserve state for follow-up
+            "tools_called": tools_called,
+            "route": "cancel",
+            "guardrail_triggered": False,
+        }
+
+    async def _handle_irrelevant(
+        self,
+        message: str,
+        language: str,
+    ) -> Dict[str, Any]:
+        """Handle out-of-scope/irrelevant queries.
+
+        Politely redirects user back to dental/clinic topics.
+        """
+        responses = {
+            'en': "I can only help with dental appointments and clinic-related questions. "
+                  "Would you like to schedule an appointment or ask about our services?",
+            'ru': "Я могу помочь только с вопросами о стоматологических приёмах и услугах клиники. "
+                  "Хотите записаться на приём или узнать о наших услугах?",
+            'es': "Solo puedo ayudar con citas dentales y preguntas relacionadas con la clínica. "
+                  "¿Le gustaría programar una cita o preguntar sobre nuestros servicios?",
+        }
+
+        return {
+            "response": responses.get(language, responses['en']),
+            "state": None,
+            "tools_called": [],
+            "route": "irrelevant",
             "guardrail_triggered": False,
         }
 

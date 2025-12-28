@@ -11,6 +11,7 @@ Key principles:
 
 import json
 import logging
+import re
 from typing import Any
 
 from .types import RouterOutput
@@ -22,11 +23,16 @@ logger = logging.getLogger(__name__)
 ROUTER_SYSTEM_PROMPT = """You are a medical clinic receptionist assistant router. Parse user messages and extract structured information.
 
 ROUTING RULES:
-- "scheduling": Booking, rescheduling, visiting, "come in", any day/time + availability request, pain/symptoms
+- "scheduling": Booking, rescheduling, visiting, "come in", availability requests, pain/symptoms
 - "pricing": Cost, price, how much, fee questions
 - "cancel": Cancel, void, remove appointment
-- "info": Hours, location, address, phone, parking
+- "info": Hours, location, address, phone, parking, current time questions, timezone questions, "what time is it"
 - "exit": Goodbye, thanks bye, done
+- "irrelevant": General knowledge (history, geography, math), politics, jokes, non-clinic topics, anything NOT about dental/medical appointments
+
+IMPORTANT:
+- Questions about current time ("what time is it", "what's the time there") are INFO queries, NOT scheduling.
+- Questions like "What is the capital of France?" are IRRELEVANT - do NOT route to scheduling or info.
 
 CRITICAL - DATE/TIME EXTRACTION:
 Return the EXACT STRING the user said for dates and times. DO NOT calculate ISO dates.
@@ -56,6 +62,15 @@ User: "I need to cancel my appointment"
 
 User: "What are your hours?"
 → {"route": "info"}
+
+User: "What time is it there right now?"
+→ {"route": "info"}
+
+User: "What is the capital of France?"
+→ {"route": "irrelevant"}
+
+User: "Tell me a joke"
+→ {"route": "irrelevant"}
 
 Respond with JSON only. Include all fields you can extract."""
 
@@ -143,17 +158,35 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
     if any(kw in m for kw in ['cancel', 'отменить', 'cancelar', 'отмена']):
         return RouterOutput(route='cancel', cancel_intent=True, language=language)
 
-    # Info keywords (multilingual)
+    # Info keywords (multilingual) - includes time/timezone queries
     if any(kw in m for kw in ['hours', 'address', 'location', 'located', 'phone', 'parking',
-                               'адрес', 'часы', 'horario', 'direccion', 'где', 'ubicación']):
+                               'what time', 'current time', 'time is it', 'timezone',
+                               'адрес', 'часы', 'horario', 'direccion', 'где', 'ubicación',
+                               'который час', 'que hora', 'qué hora']):
         return RouterOutput(route='info', language=language)
 
     # Exit keywords (multilingual)
     if any(kw in m for kw in ['bye', 'goodbye', 'thanks bye', 'до свидания', 'adios', 'chao', 'пока']):
         return RouterOutput(route='exit', language=language)
 
+    # Irrelevant/out-of-scope detection
+    # Check for general knowledge question patterns
+    irrelevant_patterns = [
+        'capital of', 'president of', 'who is', 'what year', 'how old is',
+        'tell me a joke', 'sing a song', 'write a poem', 'столица', 'президент',
+        'quien es', 'cuál es la capital', 'dime un chiste'
+    ]
+    if any(kw in m for kw in irrelevant_patterns):
+        return RouterOutput(route='irrelevant', language=language)
+
     # Pain keywords (multilingual)
     has_pain = any(kw in m for kw in ['pain', 'hurt', 'ache', 'болит', 'dolor', 'duele', 'больно'])
+
+    # FIX: Extract doctor name if mentioned
+    doctor_name = None
+    doctor_match = re.search(r'(?:dr\.?|doctor)\s+([a-zA-Z]+)', m, re.IGNORECASE)
+    if doctor_match:
+        doctor_name = doctor_match.group(1).title()  # Capitalize first letter
 
     # Try to extract service type from common keywords
     service_type = None
@@ -174,19 +207,52 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
     target_date = None
     date_keywords = {
         'tomorrow': ['tomorrow', 'завтра', 'mañana'],
-        'today': ['today', 'сегодня', 'hoy'],
+        'today': ['today', 'сегодня', 'hoy', 'para hoy'],  # FIX: Add "para hoy"
         'next week': ['next week', 'на следующей неделе', 'próxima semana'],
+        # FIX: Add specific day patterns
+        'next monday': ['next monday', 'следующий понедельник', 'el próximo lunes'],
+        'next tuesday': ['next tuesday', 'следующий вторник', 'el próximo martes'],
+        'next wednesday': ['next wednesday', 'следующая среда', 'el próximo miércoles'],
+        'next thursday': ['next thursday', 'следующий четверг', 'el próximo jueves'],
+        'next friday': ['next friday', 'следующая пятница', 'el próximo viernes'],
+        # "This Sunday", "this Monday", etc.
+        'this sunday': ['this sunday', 'в это воскресенье', 'este domingo'],
+        'this saturday': ['this saturday', 'в эту субботу', 'este sábado'],
     }
     for date_str, keywords in date_keywords.items():
         if any(kw in m for kw in keywords):
             target_date = date_str
             break
 
+    # FIX: If still no date found, try to extract day names with "next" prefix
+    if not target_date:
+        day_match = re.search(r'next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)', m)
+        if day_match:
+            target_date = f"next {day_match.group(1)}"
+
+    # FIX: Check for "this <day>" pattern
+    if not target_date:
+        this_day_match = re.search(r'this\s+(sunday|saturday|monday|tuesday|wednesday|thursday|friday)', m)
+        if this_day_match:
+            target_date = f"this {this_day_match.group(1)}"
+
+    # FIX: Check for time patterns like "at 3 AM" which imply scheduling
+    if not target_date:
+        time_match = re.search(r'(?:at\s+)?(\d{1,2})\s*(am|pm|AM|PM)', m)
+        if time_match:
+            # If there's a day mentioned anywhere, use it
+            for day in ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
+                       'воскресенье', 'понедельник', 'domingo', 'lunes']:
+                if day in m:
+                    target_date = f"this {day}" if 'this' in m or 'this' not in m else day
+                    break
+
     # Default to scheduling
     return RouterOutput(
         route='scheduling',
         service_type=service_type,
         target_date=target_date,
+        doctor_name=doctor_name,
         has_pain=has_pain,
         language=language
     )
