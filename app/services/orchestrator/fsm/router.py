@@ -18,6 +18,66 @@ from .types import RouterOutput
 
 logger = logging.getLogger(__name__)
 
+# Service keyword mappings (multilingual)
+SERVICE_KEYWORDS = {
+    'cleaning': ['cleaning', 'clean', 'чистк', 'чистку', 'limpieza'],
+    'checkup': ['checkup', 'check-up', 'exam', 'осмотр', 'revisión'],
+    'consultation': ['consultation', 'consult', 'консультаци', 'consulta'],
+    'filling': ['filling', 'cavity', 'пломб', 'relleno', 'кариес'],
+    'extraction': ['extraction', 'pull', 'remove tooth', 'удален', 'extracción'],
+    'whitening': ['whitening', 'bleach', 'отбеливан', 'blanqueamiento'],
+    'veneers': ['veneers', 'veneer', 'виниры', 'винир', 'carillas', 'carilla'],
+    'implants': ['implants', 'implant', 'импланты', 'имплант', 'implantes'],
+    'crown': ['crown', 'crowns', 'коронка', 'коронку', 'corona', 'coronas'],
+    'root canal': ['root canal', 'endodontic', 'канал', 'эндодонт', 'endodoncia'],
+}
+
+# Reverse mapping: keyword → service name
+KEYWORD_TO_SERVICE = {}
+for service, keywords in SERVICE_KEYWORDS.items():
+    for kw in keywords:
+        KEYWORD_TO_SERVICE[kw.lower()] = service
+
+
+def _extract_service_from_keyword(word: str) -> str | None:
+    """Extract service type from a single keyword.
+
+    Args:
+        word: Single word to match
+
+    Returns:
+        Service name or the original word if no match
+    """
+    word_lower = word.lower()
+
+    # Direct lookup
+    if word_lower in KEYWORD_TO_SERVICE:
+        return KEYWORD_TO_SERVICE[word_lower]
+
+    # Partial match for Russian suffixes (чистк → cleaning)
+    for kw, service in KEYWORD_TO_SERVICE.items():
+        if kw in word_lower or word_lower in kw:
+            return service
+
+    # Return original word if no match
+    return word
+
+
+def _extract_service_from_message(message: str) -> str | None:
+    """Extract service type from message using keyword matching.
+
+    Args:
+        message: Full message text (lowercase)
+
+    Returns:
+        Service type or None
+    """
+    for service, keywords in SERVICE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in message:
+                return service
+    return None
+
 
 # System prompt - kept separate from user message for proper role handling
 ROUTER_SYSTEM_PROMPT = """You are a medical clinic receptionist assistant router. Parse user messages and extract structured information.
@@ -71,6 +131,15 @@ User: "What is the capital of France?"
 
 User: "Tell me a joke"
 → {"route": "irrelevant"}
+
+User: "сколько стоят виниры"
+→ {"route": "pricing", "service_type": "veneers"}
+
+User: "Это на импланты, а я спрашивал про виниры"
+→ {"route": "pricing", "service_type": "veneers"}
+
+User: "No, I meant cleaning, not whitening"
+→ {"route": "pricing", "service_type": "cleaning"}
 
 Respond with JSON only. Include all fields you can extract."""
 
@@ -150,9 +219,33 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
     """
     m = message.lower()
 
-    # Pricing keywords (multilingual)
-    if any(kw in m for kw in ['price', 'cost', 'how much', 'fee', 'сколько стоит', 'precio', 'cuanto', 'цена']):
-        return RouterOutput(route='pricing', language=language)
+    # First check for correction patterns - these ALWAYS go to pricing
+    # Pattern: "это на X, а я спрашивал про Y" → route to pricing with Y as service
+    correction_match = re.search(r'(?:спрашивал|asked|meant)\s+(?:про|о|об|about|for)\s+(\w+)', m)
+    if correction_match:
+        extracted_service = _extract_service_from_keyword(correction_match.group(1))
+        logger.info(f"Correction pattern detected: routing to pricing with service '{extracted_service}'")
+        return RouterOutput(route='pricing', service_type=extracted_service, language=language)
+
+    # Pattern: "No, I meant X" or "Нет, я хотел X"
+    meant_match = re.search(r'(?:meant|хотел|имел\s+в\s+виду)\s+(\w+)', m)
+    if meant_match:
+        extracted_service = _extract_service_from_keyword(meant_match.group(1))
+        logger.info(f"'Meant' pattern detected: routing to pricing with service '{extracted_service}'")
+        return RouterOutput(route='pricing', service_type=extracted_service, language=language)
+
+    # Pricing keywords (multilingual) - expanded Russian list
+    pricing_keywords = [
+        'price', 'cost', 'how much', 'fee',
+        'сколько стоит', 'сколько стоят', 'сколько',  # how much (various forms)
+        'цена', 'цены', 'цену',  # price (various cases)
+        'стоимость',  # cost
+        'precio', 'cuanto', 'cuesta', 'cuestan',  # Spanish
+    ]
+    if any(kw in m for kw in pricing_keywords):
+        # Try to extract service type for pricing
+        service_type = _extract_service_from_message(m)
+        return RouterOutput(route='pricing', service_type=service_type, language=language)
 
     # Cancel keywords (multilingual)
     if any(kw in m for kw in ['cancel', 'отменить', 'cancelar', 'отмена']):
@@ -189,19 +282,7 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
         doctor_name = doctor_match.group(1).title()  # Capitalize first letter
 
     # Try to extract service type from common keywords
-    service_type = None
-    service_keywords = {
-        'cleaning': ['cleaning', 'clean', 'чистк', 'limpieza'],  # чистк catches чистка, чистку, etc.
-        'checkup': ['checkup', 'check-up', 'exam', 'осмотр', 'revisión'],
-        'consultation': ['consultation', 'consult', 'консультаци', 'consulta'],  # catches all cases
-        'filling': ['filling', 'cavity', 'пломб', 'relleno', 'кариес'],  # catches all cases
-        'extraction': ['extraction', 'pull', 'remove tooth', 'удален', 'extracción'],  # catches all cases
-        'whitening': ['whitening', 'bleach', 'отбеливан', 'blanqueamiento'],  # catches all cases
-    }
-    for svc, keywords in service_keywords.items():
-        if any(kw in m for kw in keywords):
-            service_type = svc
-            break
+    service_type = _extract_service_from_message(m)
 
     # Try to extract simple date references
     target_date = None

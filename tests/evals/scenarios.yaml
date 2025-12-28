@@ -244,3 +244,43 @@ scenarios:
       - "Either checks availability (PASS) OR asks for preferred time (also PASS)"
       - "Does not hallucinate availability without tool call"
     requires_availability_check: true
+
+  - name: "Pricing - Veneers in Russian"
+    description: "User asks about veneer pricing in Russian"
+    messages:
+      - role: user
+        content: "Привет, сколько стоят виниры?"
+    expected_behavior: |
+      The agent should either:
+      1. Return veneer pricing if available in the database, OR
+      2. Acknowledge it couldn't find veneer pricing and offer a consultation
+      CRITICAL: The agent should NOT return implant prices when asked about veneers.
+    criteria:
+      - "Calls query_service_prices tool with 'veneers' or 'виниры'"
+      - "Response is about veneers, NOT implants"
+      - "Does NOT mention 'all-on-4', 'all-on-6', or 'denture' unless explicitly relevant"
+      - "If no veneer price found, offers consultation instead of showing unrelated services"
+      - "Responds in Russian"
+
+  - name: "Pricing - Correction Pattern"
+    description: "User corrects agent after receiving wrong service pricing"
+    messages:
+      - role: user
+        content: "Сколько стоят виниры?"
+      - role: assistant
+        content: "Вот наши цены:\n• 4 all one Hybrid denture: 9900 USD"
+        evaluate: false
+      - role: user
+        content: "Это на импланты, а я спрашивал про виниры"
+    expected_behavior: |
+      The agent should recognize this as a CORRECTION and:
+      1. Acknowledge the mistake
+      2. Search specifically for veneers (not implants)
+      3. If veneers not found, explain and offer consultation
+      CRITICAL: Should NOT repeat the same implant list.
+    criteria:
+      - "Acknowledges the user's correction"
+      - "Does NOT repeat implant prices"
+      - "Either finds veneer prices OR explains veneers not in system"
+      - "Offers consultation as alternative if no exact price"
+      - "Maintains professional, apologetic tone"
