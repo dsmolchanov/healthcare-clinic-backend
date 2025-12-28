@@ -141,6 +141,18 @@ User: "Это на импланты, а я спрашивал про винир�
 User: "No, I meant cleaning, not whitening"
 → {"route": "pricing", "service_type": "cleaning"}
 
+User: "No, I meant Monday, not Tuesday"
+→ {"route": "scheduling", "target_date": "Monday"}
+
+User: "I meant at Monday or Tuesday and doctor Mark"
+→ {"route": "scheduling", "target_date": "Monday or Tuesday", "doctor_name": "Dr. Mark"}
+
+User: "I meant Dr. Mark, not Dr. Marie"
+→ {"route": "scheduling", "doctor_name": "Dr. Mark"}
+
+User: "а сегодня работает доктор Марк?"
+→ {"route": "scheduling", "doctor_name": "доктор Марк", "target_date": "сегодня"}
+
 Respond with JSON only. Include all fields you can extract."""
 
 
@@ -219,20 +231,66 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
     """
     m = message.lower()
 
-    # First check for correction patterns - these ALWAYS go to pricing
-    # Pattern: "это на X, а я спрашивал про Y" → route to pricing with Y as service
-    correction_match = re.search(r'(?:спрашивал|asked|meant)\s+(?:про|о|об|about|for)\s+(\w+)', m)
-    if correction_match:
-        extracted_service = _extract_service_from_keyword(correction_match.group(1))
-        logger.info(f"Correction pattern detected: routing to pricing with service '{extracted_service}'")
-        return RouterOutput(route='pricing', service_type=extracted_service, language=language)
+    # Scheduling-related keywords that indicate a scheduling correction, not pricing
+    scheduling_indicators = [
+        'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+        'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье',
+        'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo',
+        'doctor', 'dr.', 'dr ', 'доктор', 'врач',
+        'tomorrow', 'today', 'next week', 'завтра', 'сегодня', 'mañana', 'hoy',
+    ]
 
-    # Pattern: "No, I meant X" or "Нет, я хотел X"
-    meant_match = re.search(r'(?:meant|хотел|имел\s+в\s+виду)\s+(\w+)', m)
-    if meant_match:
-        extracted_service = _extract_service_from_keyword(meant_match.group(1))
-        logger.info(f"'Meant' pattern detected: routing to pricing with service '{extracted_service}'")
-        return RouterOutput(route='pricing', service_type=extracted_service, language=language)
+    # Check for correction patterns
+    is_correction = bool(re.search(r'(?:meant|спрашивал|asked|хотел|имел\s+в\s+виду)', m))
+
+    if is_correction:
+        # Determine if this is a scheduling or pricing correction
+        has_scheduling_context = any(kw in m for kw in scheduling_indicators)
+
+        if has_scheduling_context:
+            # This is a scheduling correction - extract doctor and date
+            logger.info(f"Scheduling correction detected: '{m[:50]}...'")
+            # Extract doctor name if present
+            doctor_name = None
+            doctor_match = re.search(r'(?:dr\.?|doctor|доктор|врач)\s+([a-zA-Zа-яА-ЯёЁ]+)', m, re.IGNORECASE)
+            if doctor_match:
+                doctor_name = doctor_match.group(1).title()
+
+            # Extract date/day
+            target_date = None
+            for day in ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']:
+                if day in m:
+                    target_date = day
+                    break
+            if not target_date:
+                for day_ru in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье']:
+                    if day_ru in m:
+                        target_date = day_ru
+                        break
+
+            return RouterOutput(
+                route='scheduling',
+                doctor_name=doctor_name,
+                target_date=target_date,
+                language=language
+            )
+        else:
+            # Pricing correction - extract service
+            correction_match = re.search(r'(?:спрашивал|asked|meant)\s+(?:про|о|об|about|for)\s+(\w+)', m)
+            if correction_match:
+                extracted_service = _extract_service_from_keyword(correction_match.group(1))
+                logger.info(f"Pricing correction detected: routing to pricing with service '{extracted_service}'")
+                return RouterOutput(route='pricing', service_type=extracted_service, language=language)
+
+            # Pattern: "No, I meant X" for services - check if X is a known service
+            meant_match = re.search(r'(?:meant|хотел|имел\s+в\s+виду)\s+(\w+)', m)
+            if meant_match:
+                word = meant_match.group(1).lower()
+                # Check if word is a known service (exists in KEYWORD_TO_SERVICE)
+                if word in KEYWORD_TO_SERVICE or any(kw in word for kw in KEYWORD_TO_SERVICE.keys()):
+                    extracted_service = _extract_service_from_keyword(word)
+                    logger.info(f"'Meant' pattern detected: routing to pricing with service '{extracted_service}'")
+                    return RouterOutput(route='pricing', service_type=extracted_service, language=language)
 
     # Pricing keywords (multilingual) - expanded Russian list
     pricing_keywords = [
