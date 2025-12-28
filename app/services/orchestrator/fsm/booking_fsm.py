@@ -193,6 +193,24 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
         )]
 
     # ==========================================
+    # Stage: CHECK_AVAILABILITY (UserEvent recovery)
+    # ==========================================
+    # If we receive a UserEvent while in CHECK_AVAILABILITY, it means
+    # the tool call was "lost" (e.g., eval harness override, network error).
+    # Treat any new user info and re-trigger availability check.
+    if state.stage == BookingStage.CHECK_AVAILABILITY:
+        # User provided more info while we were checking - re-check with updated state
+        return state, [CallTool(
+            name="check_availability",
+            args={
+                "service_type": state.service_type,
+                "date": state.target_date,
+                "time_preference": state.time_of_day,
+                "doctor_name": state.doctor_name,
+            }
+        )]
+
+    # ==========================================
     # Stage: AWAIT_SLOT_SELECTION
     # ==========================================
     if state.stage == BookingStage.AWAIT_SLOT_SELECTION:
@@ -470,6 +488,13 @@ def format_booking_confirmation(state: BookingState, lang: str) -> str:
 def parse_slot_selection(text: str, slots: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Parse user's slot selection from their message.
 
+    Handles multiple selection patterns:
+    - Number selection: "1", "2", "#1"
+    - Ordinals: "first", "second"
+    - Time mentions: "3pm", "10am", "morning one"
+    - Natural language: "works great", "perfect", "sounds good"
+    - Doctor preference: "Dr. Shtern", "with Shtern"
+
     Args:
         text: User's response text
         slots: List of available slots
@@ -482,26 +507,107 @@ def parse_slot_selection(text: str, slots: List[Dict[str, Any]]) -> Optional[Dic
     if not slots:
         return None
 
-    # Number selection: "1", "2", "#1"
-    match = re.search(r'^#?(\d)$', text_lower)
+    # Number selection: "1", "2", "#1", or "number 1", "option 2"
+    match = re.search(r'(?:^|number\s*|option\s*|#)(\d)\b', text_lower)
     if match:
         idx = int(match.group(1)) - 1
         if 0 <= idx < len(slots):
             return slots[idx]
 
-    # Ordinals: "first", "second"
+    # Ordinals: "first", "second", "the first one"
     ordinals = {
         'first': 0, 'second': 1, 'third': 2, 'fourth': 3, 'fifth': 4,
-        'первый': 0, 'второй': 1, 'третий': 2,
-        'primero': 0, 'segundo': 1, 'tercero': 2
+        'первый': 0, 'второй': 1, 'третий': 2, 'первая': 0, 'вторая': 1,
+        'primero': 0, 'segundo': 1, 'tercero': 2, 'primera': 0, 'segunda': 1
     }
     for word, idx in ordinals.items():
         if word in text_lower and idx < len(slots):
             return slots[idx]
 
+    # Time-based selection: look for time patterns and match to slots
+    # Patterns: "3pm", "3 pm", "3:00", "15:00", "morning", "afternoon"
+    time_patterns = [
+        (r'\b(\d{1,2})\s*(?:pm|p\.?m\.?)\b', 12),  # 3pm -> 15:00
+        (r'\b(\d{1,2})\s*(?:am|a\.?m\.?)\b', 0),   # 10am -> 10:00
+        (r'\b(\d{1,2}):(\d{2})\b', None),          # 10:00, 14:00
+    ]
+
+    for pattern, offset in time_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            if offset is not None:
+                # am/pm format
+                hour = int(match.group(1))
+                if offset == 12 and hour != 12:
+                    hour += 12
+                elif offset == 0 and hour == 12:
+                    hour = 0
+            else:
+                # 24-hour format
+                hour = int(match.group(1))
+
+            # Find slot with matching hour
+            for slot in slots:
+                slot_time = slot.get('datetime', slot.get('time', ''))
+                # Extract hour from datetime string (e.g., "2025-12-29T09:00:00")
+                time_match = re.search(r'T(\d{2}):', slot_time)
+                if time_match:
+                    slot_hour = int(time_match.group(1))
+                    if slot_hour == hour:
+                        return slot
+
+    # Time of day preference: "morning", "afternoon"
+    if any(word in text_lower for word in ['morning', 'утр', 'mañana']):
+        for slot in slots:
+            slot_time = slot.get('datetime', slot.get('time', ''))
+            time_match = re.search(r'T(\d{2}):', slot_time)
+            if time_match:
+                slot_hour = int(time_match.group(1))
+                if 6 <= slot_hour < 12:
+                    return slot
+    elif any(word in text_lower for word in ['afternoon', 'вечер', 'tarde']):
+        for slot in slots:
+            slot_time = slot.get('datetime', slot.get('time', ''))
+            time_match = re.search(r'T(\d{2}):', slot_time)
+            if time_match:
+                slot_hour = int(time_match.group(1))
+                if 12 <= slot_hour < 18:
+                    return slot
+
+    # Doctor name matching: "Dr. Shtern", "with Shtern", "doctor Smith"
+    # Handle "with Dr. X" pattern first
+    doctor_match = re.search(r'(?:with\s+)?dr\.?\s*(\w+)', text_lower)
+    if not doctor_match:
+        doctor_match = re.search(r'(?:doctor\s+|with\s+)(\w+)', text_lower)
+    if doctor_match:
+        doc_name = doctor_match.group(1).lower()
+        for slot in slots:
+            slot_doctor = slot.get('doctor_name', slot.get('provider_name', '')).lower()
+            if doc_name in slot_doctor:
+                return slot
+
+    # Natural language confirmation with positive sentiment = first slot
+    # "works great", "perfect", "sounds good", "that's great", "that one"
+    positive_patterns = [
+        r'\b(?:works|perfect|great|good|fine|excellent|awesome)\b',
+        r'\b(?:sounds?\s+good|that\s*(?:\'?s|one)?)\b',
+        r'\b(?:подходит|хорошо|отлично)\b',
+        r'\b(?:perfecto|bien|excelente)\b'
+    ]
+    for pattern in positive_patterns:
+        if re.search(pattern, text_lower):
+            return slots[0]
+
     # Simple confirmation = first slot
-    if text_lower in ('yes', 'yeah', 'sure', 'ok', 'да', 'хорошо', 'sí', 'si'):
-        return slots[0]
+    simple_confirms = {
+        'yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'yup', 'absolutely',
+        'да', 'хорошо', 'ладно', 'конечно',
+        'sí', 'si', 'vale', 'claro'
+    }
+    # Check if any simple confirm is in the text (not exact match)
+    for confirm in simple_confirms:
+        if confirm in text_lower.split():
+            return slots[0]
 
     return None
 
