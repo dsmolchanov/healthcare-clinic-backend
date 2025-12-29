@@ -1,19 +1,20 @@
 """
 Orchestrator Factory
-Dynamically creates LangGraph orchestrators from agent configurations
+Creates FSM orchestrators for conversation handling.
+
+Phase 6: Now uses pure FSM orchestrator (legacy LangGraph removed).
 """
 from typing import Optional, Dict, Any
 import logging
 from app.services.agent_service import AgentConfig
-from app.services.orchestrator.base_langgraph import BaseLangGraphOrchestrator
-from app.services.orchestrator.templates.healthcare_template import HealthcareLangGraph
-from app.services.orchestrator.templates.general_template import GeneralLangGraph
+from app.services.orchestrator.fsm_orchestrator import FSMOrchestrator
+from app.config import get_redis_client
 
 logger = logging.getLogger(__name__)
 
 
 class OrchestratorFactory:
-    """Factory for creating LangGraph orchestrators from agent configs"""
+    """Factory for creating FSM orchestrators from agent configs"""
 
     def __init__(self):
         self._orchestrator_cache = {}
@@ -22,16 +23,16 @@ class OrchestratorFactory:
         self,
         agent_config: AgentConfig,
         context: Optional[Dict[str, Any]] = None
-    ):
+    ) -> FSMOrchestrator:
         """
-        Create orchestrator instance from agent configuration
+        Create FSM orchestrator instance from agent configuration
 
         Args:
             agent_config: Agent configuration
             context: Additional context (clinic_id, services, etc.)
 
         Returns:
-            Orchestrator instance (BaseLangGraphOrchestrator or subclass)
+            FSMOrchestrator instance
         """
         # Check cache
         cache_key = f"orchestrator:{agent_config.id}"
@@ -39,110 +40,62 @@ class OrchestratorFactory:
             logger.debug(f"Using cached orchestrator for agent {agent_config.name}")
             return self._orchestrator_cache[cache_key]
 
-        # Determine orchestrator type
-        orchestrator_type = agent_config.orchestrator_type
-        base_template = agent_config.base_template
-
         logger.info(
-            f"Creating orchestrator: type={orchestrator_type}, "
-            f"template={base_template}, agent={agent_config.name}"
+            f"Creating FSM orchestrator for agent={agent_config.name}"
         )
 
-        # Create orchestrator based on type
-        if base_template == "HealthcareLangGraph":
-            orchestrator = await self._create_healthcare_orchestrator(
-                agent_config, context
-            )
-        elif base_template == "GeneralLangGraph":
-            orchestrator = await self._create_general_orchestrator(
-                agent_config, context
-            )
-        else:
-            # Default to base orchestrator
-            orchestrator = await self._create_base_orchestrator(
-                agent_config, context
-            )
+        # Create FSM orchestrator
+        orchestrator = await self._create_fsm_orchestrator(agent_config, context)
 
         # Cache it
         self._orchestrator_cache[cache_key] = orchestrator
 
         return orchestrator
 
-    async def _create_healthcare_orchestrator(
+    async def _create_fsm_orchestrator(
         self,
         agent_config: AgentConfig,
         context: Optional[Dict[str, Any]]
-    ) -> HealthcareLangGraph:
-        """Create healthcare-specific orchestrator"""
-        # Import dependencies
+    ) -> FSMOrchestrator:
+        """Create FSM orchestrator"""
         from app.services.orchestrator.tools.appointment_tools import AppointmentTools
+        from app.tools.price_query_tool import PriceQueryTool
+        from app.services.llm import LLMFactory
         from app.db.supabase_client import get_supabase_client
 
         # Get services from context
         clinic_id = context.get("clinic_id") if context else None
         supabase_client = context.get("supabase_client") if context else get_supabase_client()
+        clinic_profile = context.get("clinic_profile", {}) if context else {}
 
-        # Initialize PHI middleware if compliance mode is HIPAA
-        phi_middleware = None
-        if agent_config.langgraph_config.get("compliance_mode") == "hipaa":
-            try:
-                from app.security.phi_encryption import get_phi_middleware
-                phi_middleware = get_phi_middleware()
-            except ImportError:
-                logger.warning("PHI middleware not available, creating orchestrator without PHI protection")
-                phi_middleware = None
+        # Initialize LLM factory
+        llm_factory = LLMFactory(supabase_client=supabase_client)
 
-        # Initialize appointment tools if calendar capability enabled
-        appointment_service = None
+        # Initialize tools
+        appointment_tools = None
         if "calendar_integration" in agent_config.capabilities:
-            appointment_service = AppointmentTools(
+            appointment_tools = AppointmentTools(
                 supabase_client=supabase_client,
                 clinic_id=clinic_id
             )
 
-        # Create orchestrator (HealthcareLangGraph doesn't accept enable_* parameters)
-        orchestrator = HealthcareLangGraph(
-            phi_middleware=phi_middleware,
-            appointment_service=appointment_service,
-            enable_emergency_detection=True,
+        price_tool = None
+        try:
+            # Pass redis_client to use cached services from startup warmup
+            redis_client = get_redis_client()
+            price_tool = PriceQueryTool(clinic_id=clinic_id, redis_client=redis_client)
+        except Exception as e:
+            logger.warning(f"Failed to create PriceQueryTool: {e}")
+
+        # Create FSM orchestrator
+        orchestrator = FSMOrchestrator(
+            clinic_id=clinic_id,
+            llm_factory=llm_factory,
             supabase_client=supabase_client,
-            clinic_id=clinic_id
+            appointment_tools=appointment_tools,
+            price_tool=price_tool,
+            clinic_profile=clinic_profile,
         )
-
-        # Override system prompt from agent config
-        orchestrator.system_prompt = agent_config.system_prompt
-
-        return orchestrator
-
-    async def _create_general_orchestrator(
-        self,
-        agent_config: AgentConfig,
-        context: Optional[Dict[str, Any]]
-    ) -> GeneralLangGraph:
-        """Create general-purpose orchestrator"""
-        orchestrator = GeneralLangGraph(
-            enable_memory=agent_config.langgraph_config.get("enable_memory", True),
-            enable_rag=agent_config.langgraph_config.get("enable_rag", True),
-            enable_checkpointing=agent_config.langgraph_config.get("enable_checkpointing", True)
-        )
-
-        orchestrator.system_prompt = agent_config.system_prompt
-
-        return orchestrator
-
-    async def _create_base_orchestrator(
-        self,
-        agent_config: AgentConfig,
-        context: Optional[Dict[str, Any]]
-    ) -> BaseLangGraphOrchestrator:
-        """Create base orchestrator"""
-        orchestrator = BaseLangGraphOrchestrator(
-            enable_memory=agent_config.langgraph_config.get("enable_memory", True),
-            enable_rag=agent_config.langgraph_config.get("enable_rag", True),
-            enable_checkpointing=agent_config.langgraph_config.get("enable_checkpointing", True)
-        )
-
-        orchestrator.system_prompt = agent_config.system_prompt
 
         return orchestrator
 

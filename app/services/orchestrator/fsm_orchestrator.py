@@ -33,6 +33,7 @@ from app.services.orchestrator.fsm.state import (
 from app.services.orchestrator.fsm import booking_fsm, pricing_fsm
 from app.services.orchestrator.fsm.router import route_message, fallback_router
 from app.tools.clinic_info_tool import ClinicInfoTool
+from app.config import get_redis_client
 # Preserve existing guardrails
 from app.services.orchestrator.templates.handlers.guardrails import (
     detect_emergency, detect_phi_ssn, get_emergency_response_by_language,
@@ -582,11 +583,13 @@ class FSMOrchestrator:
             state: Current booking state
             language: Language code
         """
-        # Fetch doctor list from database
+        # Fetch doctor list from database (uses Redis cache if available)
         doctor_list = []
         try:
             if self.supabase_client:
-                clinic_tool = ClinicInfoTool(self.clinic_id)
+                # Get redis client for cache access
+                redis_client = get_redis_client()
+                clinic_tool = ClinicInfoTool(self.clinic_id, redis_client=redis_client)
                 doctor_info = await clinic_tool.get_doctor_count(self.supabase_client)
                 # Format as "Dr. FirstName LastName"
                 doctor_list = [
