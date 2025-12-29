@@ -12,8 +12,16 @@ Key principle: LLMs understand; Code decides.
 """
 
 import logging
+import re
 from typing import Dict, Any, Optional, Callable, Awaitable, Union
 from dataclasses import asdict
+
+try:
+    import phonenumbers
+    from phonenumbers import NumberParseException
+    PHONENUMBERS_AVAILABLE = True
+except ImportError:
+    PHONENUMBERS_AVAILABLE = False
 
 from app.services.orchestrator.fsm.types import (
     Action, AskUser, CallTool, Respond, Escalate,
@@ -24,6 +32,7 @@ from app.services.orchestrator.fsm.state import (
 )
 from app.services.orchestrator.fsm import booking_fsm, pricing_fsm
 from app.services.orchestrator.fsm.router import route_message, fallback_router
+from app.tools.clinic_info_tool import ClinicInfoTool
 # Preserve existing guardrails
 from app.services.orchestrator.templates.handlers.guardrails import (
     detect_emergency, detect_phi_ssn, get_emergency_response_by_language,
@@ -34,6 +43,43 @@ from app.services.orchestrator.templates.handlers.phi_handler import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def validate_phone_number(phone: Optional[str], default_region: str = "MX") -> Optional[str]:
+    """
+    Validate and normalize phone number.
+
+    Args:
+        phone: Phone number string to validate
+        default_region: Default region code (MX for Mexico)
+
+    Returns:
+        E.164 formatted phone or None if invalid
+    """
+    if not phone:
+        return None
+
+    # If phonenumbers library is available, use it for proper validation
+    if PHONENUMBERS_AVAILABLE:
+        try:
+            # Try parsing with default region
+            parsed = phonenumbers.parse(phone, default_region)
+            if phonenumbers.is_valid_number(parsed):
+                return phonenumbers.format_number(
+                    parsed, phonenumbers.PhoneNumberFormat.E164
+                )
+        except NumberParseException:
+            pass
+
+    # Fallback: if it looks like E.164 already, use as-is
+    # E.164 format: +[country code][subscriber number], 10-15 digits
+    if phone.startswith('+') and len(phone) >= 10:
+        # Basic validation: contains mostly digits
+        clean = phone.replace('+', '').replace(' ', '').replace('-', '')
+        if clean.isdigit() and 9 <= len(clean) <= 15:
+            return phone
+
+    return None
 
 
 class FSMOrchestrator:
@@ -152,6 +198,9 @@ class FSMOrchestrator:
         session_id: str,
         state: Optional[Dict[str, Any]] = None,
         language: str = "en",
+        # NEW: Session context from WhatsApp for pre-population
+        user_phone: Optional[str] = None,
+        user_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Process a user message through the FSM.
@@ -161,6 +210,8 @@ class FSMOrchestrator:
             session_id: Session identifier for state persistence
             state: Previous FSM state (serialized dict)
             language: Language code
+            user_phone: WhatsApp phone number (JID) for pre-population
+            user_name: WhatsApp display name (pushName) for pre-population
 
         Returns:
             {
@@ -200,9 +251,9 @@ class FSMOrchestrator:
             }
 
         # ==========================================
-        # STEP 1: Load or initialize state
+        # STEP 1: Load or initialize state WITH session context
         # ==========================================
-        fsm_state = self._load_state(state)
+        fsm_state = self._load_state(state, user_phone=user_phone, user_name=user_name)
 
         # ==========================================
         # STEP 2: Route message (one LLM call)
@@ -226,6 +277,12 @@ class FSMOrchestrator:
                 "route": "exit",
                 "guardrail_triggered": False,
             }
+
+        # Handle doctor_info tangent (fetch doctor list from DB)
+        if router_output.route == "doctor_info":
+            return await self._handle_doctor_info(
+                router_output, fsm_state, language
+            )
 
         if router_output.route == "info":
             return await self._handle_info(message, language)
@@ -510,6 +567,64 @@ class FSMOrchestrator:
             "guardrail_triggered": False,
         }
 
+    async def _handle_doctor_info(
+        self,
+        router_output: RouterOutput,
+        state: BookingState,
+        language: str,
+    ) -> Dict[str, Any]:
+        """Handle doctor info tangent questions.
+
+        Fetches actual doctor list from database for accurate matching.
+
+        Args:
+            router_output: Router output with doctor_name and doctor_info_kind
+            state: Current booking state
+            language: Language code
+        """
+        # Fetch doctor list from database
+        doctor_list = []
+        try:
+            if self.supabase_client:
+                clinic_tool = ClinicInfoTool(self.clinic_id)
+                doctor_info = await clinic_tool.get_doctor_count(self.supabase_client)
+                # Format as "Dr. FirstName LastName"
+                doctor_list = [
+                    f"Dr. {name}" if not name.lower().startswith('dr') else name
+                    for name in doctor_info.get('doctor_list', [])
+                ]
+                logger.info(f"[FSM] Fetched {len(doctor_list)} doctors for clinic {self.clinic_id}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch doctor list: {e}")
+            # Will fall back to hardcoded default in handler
+
+        # Call FSM tangent handler with actual doctor list
+        new_state, actions = booking_fsm.handle_doctor_info_tangent(
+            state=state,
+            doctor_name=router_output.doctor_name,
+            doctor_info_kind=router_output.doctor_info_kind or "exists",
+            lang=language,
+            doctor_list=doctor_list if doctor_list else None,  # Pass None to use default
+        )
+
+        # Extract response
+        response_text = ""
+        for action in actions:
+            if isinstance(action, AskUser):
+                response_text = action.text
+                break
+            if isinstance(action, Respond):
+                response_text = action.text
+                break
+
+        return {
+            "response": response_text,
+            "state": self._serialize_state(new_state),
+            "tools_called": [],
+            "route": "doctor_info",
+            "guardrail_triggered": False,
+        }
+
     async def _handle_irrelevant(
         self,
         message: str,
@@ -536,15 +651,46 @@ class FSMOrchestrator:
             "guardrail_triggered": False,
         }
 
-    def _load_state(self, state_dict: Optional[Dict[str, Any]]) -> BookingState:
-        """Load FSM state from serialized dict."""
+    def _load_state(
+        self,
+        state_dict: Optional[Dict[str, Any]],
+        user_phone: Optional[str] = None,
+        user_name: Optional[str] = None,
+    ) -> BookingState:
+        """Load FSM state from serialized dict, pre-populating from session.
+
+        Args:
+            state_dict: Serialized FSM state
+            user_phone: WhatsApp phone number (JID) for pre-population
+            user_name: WhatsApp display name (pushName) for pre-population
+
+        Returns:
+            BookingState with pre-populated fields if available
+        """
+        # Validate phone number before use (cuts ~15% invalid)
+        validated_phone = validate_phone_number(user_phone)
+
+        # Store display_name separately from patient_name for compliance
+        # WhatsApp pushName may be nickname like "Dmitry 😎" - not legal name
+        display_name = user_name
+
         if not state_dict:
-            return BookingState()
+            # NEW: Initialize with session context if available
+            return BookingState(
+                patient_phone=validated_phone,
+                patient_name=None,  # Don't assume display_name is legal name
+                display_name=display_name,  # Store separately for reference
+            )
 
         try:
             # Convert stage string back to enum
             stage_str = state_dict.get('stage', 'INTENT')
             stage = BookingStage[stage_str] if isinstance(stage_str, str) else stage_str
+
+            # Pre-populate patient info from session if not already in state
+            patient_phone = state_dict.get('patient_phone') or validated_phone
+            patient_name = state_dict.get('patient_name')  # Don't auto-fill from display_name
+            stored_display_name = state_dict.get('display_name') or display_name
 
             return BookingState(
                 stage=stage,
@@ -553,9 +699,10 @@ class FSMOrchestrator:
                 time_of_day=state_dict.get('time_of_day'),
                 doctor_name=state_dict.get('doctor_name'),
                 doctor_id=state_dict.get('doctor_id'),
-                patient_name=state_dict.get('patient_name'),
-                patient_phone=state_dict.get('patient_phone'),
+                patient_name=patient_name,
+                patient_phone=patient_phone,  # Pre-populated & validated
                 patient_id=state_dict.get('patient_id'),
+                display_name=stored_display_name,  # WhatsApp pushName (may be nickname)
                 available_slots=state_dict.get('available_slots', []),
                 selected_slot=state_dict.get('selected_slot'),
                 appointment_id=state_dict.get('appointment_id'),
@@ -563,10 +710,17 @@ class FSMOrchestrator:
                 has_pain=state_dict.get('has_pain', False),
                 language=state_dict.get('language', 'en'),
                 clarification_count=state_dict.get('clarification_count', 0),
+                # Phase 1: Contextual response handling
+                awaiting_field=state_dict.get('awaiting_field'),
+                pending_action=state_dict.get('pending_action'),
+                user_prefers_concise=state_dict.get('user_prefers_concise', False),
             )
         except Exception as e:
             logger.warning(f"Failed to load state, starting fresh: {e}")
-            return BookingState()
+            return BookingState(
+                patient_phone=validated_phone,
+                display_name=display_name,
+            )
 
     def _serialize_state(self, state: BookingState) -> Dict[str, Any]:
         """Serialize FSM state to dict for persistence."""
@@ -580,6 +734,7 @@ class FSMOrchestrator:
             'patient_name': state.patient_name,
             'patient_phone': state.patient_phone,
             'patient_id': state.patient_id,
+            'display_name': state.display_name,  # WhatsApp pushName
             'available_slots': state.available_slots,
             'selected_slot': state.selected_slot,
             'appointment_id': state.appointment_id,
@@ -587,6 +742,10 @@ class FSMOrchestrator:
             'has_pain': state.has_pain,
             'language': state.language,
             'clarification_count': state.clarification_count,
+            # Phase 1: Contextual response handling
+            'awaiting_field': state.awaiting_field,
+            'pending_action': state.pending_action,
+            'user_prefers_concise': state.user_prefers_concise,
         }
 
     def _get_goodbye(self, language: str) -> str:
