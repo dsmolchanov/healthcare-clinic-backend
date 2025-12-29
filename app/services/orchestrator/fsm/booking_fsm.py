@@ -17,6 +17,18 @@ from .types import (
 )
 from .state import BookingState, BookingStage
 
+# Phase 5: Import SOTA reminder templates for rich confirmation messages
+from app.services.reminder_templates import format_confirmation_message as format_sota_confirmation
+
+# Phase 5.1: Import robust multilingual text utilities
+from .text_utils import (
+    is_affirmative as _is_affirmative,
+    is_confirmation,
+    is_rejection,
+    normalize_tokens,
+    has_availability_intent,
+)
+
 
 # Localized messages
 MESSAGES = {
@@ -24,51 +36,61 @@ MESSAGES = {
         'en': "What type of appointment do you need? We offer cleanings, checkups, consultations, and more.",
         'ru': "Какой тип приёма вам нужен? Мы предлагаем чистку, осмотр, консультацию и другое.",
         'es': "Qué tipo de cita necesita? Ofrecemos limpiezas, chequeos, consultas y más.",
+        'he': "איזה סוג תור אתה צריך? אנחנו מציעים ניקוי, בדיקה, ייעוץ ועוד.",
     },
     'ask_date': {
         'en': "When would you like to come in? You can say something like 'tomorrow at 2pm' or 'next Monday morning'.",
         'ru': "Когда вы хотели бы прийти? Можете сказать 'завтра в 14:00' или 'в следующий понедельник утром'.",
         'es': "Cuándo le gustaría venir? Puede decir algo como 'mañana a las 2pm' o 'el próximo lunes por la mañana'.",
+        'he': "מתי תרצה להגיע? אפשר להגיד 'מחר ב-14:00' או 'יום שני הבא בבוקר'.",
     },
     'ask_patient_info': {
         'en': "Could you please provide your name and phone number so I can find your record?",
         'ru': "Не могли бы вы назвать ваше имя и номер телефона, чтобы я нашёл(а) вашу карту?",
         'es': "Podría proporcionarme su nombre y número de teléfono para encontrar su registro?",
+        'he': "האם תוכל לספק את שמך ומספר הטלפון שלך כדי שאוכל למצוא את הרשומה שלך?",
     },
     'no_availability': {
         'en': "I checked and unfortunately we don't have availability at that time. Our hours are Monday-Friday 9am-5pm. Would you like to try a different time?",
         'ru': "Я проверил(а), но, к сожалению, на это время нет записи. Мы работаем Пн-Пт 9:00-17:00. Хотите попробовать другое время?",
         'es': "He verificado y lamentablemente no tenemos disponibilidad en ese horario. Nuestro horario es de lunes a viernes de 9am a 5pm. Le gustaría probar otro horario?",
+        'he': "בדקתי ולצערי אין לנו פנוי בזמן הזה. שעות הפעילות שלנו הן ראשון-חמישי 9:00-17:00. תרצה לנסות זמן אחר?",
     },
     'empathy_prefix': {
         'en': "I'm sorry to hear you're in discomfort. ",
         'ru': "Мне жаль, что вам нехорошо. ",
         'es': "Lamento que tenga molestias. ",
+        'he': "מצטער לשמוע שלא נוח לך. ",
     },
     'pain_urgent': {
         'en': "I'm sorry to hear you're in pain. Let me check for the earliest available appointment right away.",
         'ru': "Мне жаль, что вам больно. Позвольте проверить ближайшее доступное время.",
         'es': "Lamento que tenga dolor. Déjeme verificar la cita disponible más temprana de inmediato.",
+        'he': "מצטער לשמוע שיש לך כאבים. תן לי לבדוק את התור הקרוב ביותר מיד.",
     },
     'escalate': {
         'en': "I'm having trouble understanding your request. Let me connect you with our staff who can help directly.",
         'ru': "Мне сложно понять ваш запрос. Позвольте соединить вас с нашим персоналом.",
         'es': "Tengo dificultades para entender su solicitud. Permítame conectarlo con nuestro personal.",
+        'he': "אני מתקשה להבין את הבקשה שלך. תן לי לחבר אותך לצוות שלנו שיוכל לעזור ישירות.",
     },
     'try_different_time': {
         'en': "No problem. Would you like to try a different time?",
         'ru': "Хорошо. Хотите попробовать другое время?",
         'es': "No hay problema. Le gustaría probar otro horario?",
+        'he': "אין בעיה. תרצה לנסות זמן אחר?",
     },
     'booking_failed': {
         'en': "I wasn't able to complete the booking: {error}. Would you like to try again?",
         'ru': "Не удалось завершить запись: {error}. Хотите попробовать снова?",
         'es': "No pude completar la reserva: {error}. Le gustaría intentar de nuevo?",
+        'he': "לא הצלחתי להשלים את ההזמנה: {error}. תרצה לנסות שוב?",
     },
     'fallback': {
         'en': "I'm not sure how to help with that. Could you rephrase?",
         'ru': "Не уверен(а), как помочь с этим. Не могли бы вы перефразировать?",
         'es': "No estoy seguro de cómo ayudar con eso. Podría reformular?",
+        'he': "אני לא בטוח איך לעזור עם זה. אפשר לנסח מחדש?",
     },
 }
 
@@ -201,12 +223,12 @@ def format_hours_naturally(hours: List[int], lang: str) -> str:
     if len(hours) == 1:
         return f"{hours[0]}:00"
     elif len(hours) == 2:
-        connectors = {'en': 'or', 'ru': 'или', 'es': 'o'}
+        connectors = {'en': 'or', 'ru': 'или', 'es': 'o', 'he': 'או'}
         connector = connectors.get(lang, 'or')
         return f"{hours[0]}:00 {connector} {hours[1]}:00"
     else:
         # "9:00, 10:00, or 11:00"
-        connectors = {'en': 'or', 'ru': 'или', 'es': 'o'}
+        connectors = {'en': 'or', 'ru': 'или', 'es': 'o', 'he': 'או'}
         connector = connectors.get(lang, 'or')
         formatted = ", ".join(f"{h}:00" for h in hours[:-1])
         return f"{formatted}, {connector} {hours[-1]}:00"
@@ -358,10 +380,12 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
     # ==========================================
     if state.stage == BookingStage.COLLECT_DATE:
         if not state.target_date:
-            # FIX: If user asked about a specific doctor, check their availability
-            # without requiring a specific date ("Is Dr. Smith available?")
-            if state.doctor_name:
-                # Check doctor's upcoming availability
+            # Phase 5.1: Availability intent guardrail
+            # Only auto-check availability if user EXPLICITLY asked about it
+            # This prevents "Да, мне нужно отбеливание" from triggering check_availability
+            if state.doctor_name and has_availability_intent(event.text, lang):
+                # User asked about doctor availability explicitly
+                # e.g., "Доктор Штерн свободен?" "Is Dr. Smith available?"
                 state = replace(state, has_pain=False, target_date="this week")
                 state = replace(state, stage=BookingStage.CHECK_AVAILABILITY)
                 return state, [CallTool(
@@ -374,7 +398,7 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
                     }
                 )]
 
-            # Ask for date with empathy if pain was mentioned
+            # No date and no explicit availability question - ask for preferred date
             # Clear pain flag after using empathy
             state = replace(state, has_pain=False)
             return state, [AskUser(
@@ -630,6 +654,9 @@ def handle_tool_result(state: BookingState, event: ToolResultEvent) -> Tuple[Boo
     if event.tool_name == "book_appointment":
         if event.success:
             appointment_id = event.result.get('appointment_id')
+            # Phase 5: Extract clinic data for SOTA confirmation
+            clinic_data = event.result.get('clinic', {})
+
             state = replace(
                 state,
                 stage=BookingStage.COMPLETE,
@@ -637,7 +664,7 @@ def handle_tool_result(state: BookingState, event: ToolResultEvent) -> Tuple[Boo
                 confirmation_message=event.result.get('confirmation_message')
             )
             return state, [Respond(
-                text=format_booking_confirmation(state, lang)
+                text=format_booking_confirmation(state, lang, clinic=clinic_data)
             )]
         else:
             # Booking failed
@@ -686,19 +713,22 @@ def format_slots_message(
         has_title = doc_ref.lower().startswith((
             'dr', 'dr.', 'doctor',           # English
             'доктор', 'врач', 'док.',         # Russian
-            'dra', 'dra.', 'doctor', 'doctora'  # Spanish
+            'dra', 'dra.', 'doctor', 'doctora',  # Spanish
+            'ד"ר', 'דוקטור',                  # Hebrew
         ))
         if not has_title:
-            doc_prefix = {'en': 'Dr. ', 'ru': 'доктор ', 'es': 'Dr. '}
+            doc_prefix = {'en': 'Dr. ', 'ru': 'доктор ', 'es': 'Dr. ', 'he': 'ד"ר '}
             doc_ref = doc_prefix.get(lang, 'Dr. ') + doc_ref
 
     # Build date reference
     date_ref = target_date or ""
     date_refs = {
-        'tomorrow': {'en': 'tomorrow', 'ru': 'завтра', 'es': 'mañana'},
-        'today': {'en': 'today', 'ru': 'сегодня', 'es': 'hoy'},
-        'завтра': {'en': 'tomorrow', 'ru': 'завтра', 'es': 'mañana'},
-        'сегодня': {'en': 'today', 'ru': 'сегодня', 'es': 'hoy'},
+        'tomorrow': {'en': 'tomorrow', 'ru': 'завтра', 'es': 'mañana', 'he': 'מחר'},
+        'today': {'en': 'today', 'ru': 'сегодня', 'es': 'hoy', 'he': 'היום'},
+        'завтра': {'en': 'tomorrow', 'ru': 'завтра', 'es': 'mañana', 'he': 'מחר'},
+        'сегодня': {'en': 'today', 'ru': 'сегодня', 'es': 'hoy', 'he': 'היום'},
+        'מחר': {'en': 'tomorrow', 'ru': 'завтра', 'es': 'mañana', 'he': 'מחר'},
+        'היום': {'en': 'today', 'ru': 'сегодня', 'es': 'hoy', 'he': 'היום'},
     }
     for key, translations in date_refs.items():
         if key in date_ref.lower():
@@ -715,6 +745,7 @@ def format_slots_message(
             'en': f"Yes, {doc_ref} is available {date_ref}. Open slots at {hours_str}. Which works better?",
             'ru': f"Да, {doc_ref} {date_ref} свободен. Есть время в {hours_str}. Какое удобнее?",
             'es': f"Sí, {doc_ref} está disponible {date_ref}. Horarios: {hours_str}. ¿Cuál prefiere?",
+            'he': f"כן, {doc_ref} פנוי {date_ref}. יש תורים ב-{hours_str}. מה מתאים יותר?",
         }
         return templates.get(lang, templates['en']).replace("  ", " ").strip()
 
@@ -725,14 +756,14 @@ def format_slots_message(
 
     periods = []
     if has_morning:
-        periods.append({'en': 'morning', 'ru': 'утром', 'es': 'por la mañana'}.get(lang, 'morning'))
+        periods.append({'en': 'morning', 'ru': 'утром', 'es': 'por la mañana', 'he': 'בבוקר'}.get(lang, 'morning'))
     if has_afternoon:
-        periods.append({'en': 'afternoon', 'ru': 'после обеда', 'es': 'por la tarde'}.get(lang, 'afternoon'))
+        periods.append({'en': 'afternoon', 'ru': 'после обеда', 'es': 'por la tarde', 'he': 'אחר הצהריים'}.get(lang, 'afternoon'))
     if has_evening:
-        periods.append({'en': 'evening', 'ru': 'вечером', 'es': 'por la noche'}.get(lang, 'evening'))
+        periods.append({'en': 'evening', 'ru': 'вечером', 'es': 'por la noche', 'he': 'בערב'}.get(lang, 'evening'))
 
     if len(periods) >= 2:
-        connectors = {'en': 'or', 'ru': 'или', 'es': 'o'}
+        connectors = {'en': 'or', 'ru': 'или', 'es': 'o', 'he': 'או'}
         connector = connectors.get(lang, 'or')
         period_str = f" {connector} ".join(periods)
     else:
@@ -742,6 +773,7 @@ def format_slots_message(
         'en': f"Yes, {doc_ref} is available {date_ref} {period_str}. Which time works better?",
         'ru': f"Да, {doc_ref} {date_ref} работает {period_str}. Когда удобнее?",
         'es': f"Sí, {doc_ref} está disponible {date_ref} {period_str}. ¿Qué horario prefiere?",
+        'he': f"כן, {doc_ref} פנוי {date_ref} {period_str}. מתי מתאים יותר?",
     }
     return templates.get(lang, templates['en']).replace("  ", " ").strip()
 
@@ -763,26 +795,46 @@ def format_confirmation_message(state: BookingState, lang: str) -> str:
         'en': f"Please confirm: Book {service} for {state.patient_name or 'you'} at {slot_time}\n\nReply 'yes' to confirm or 'no' to cancel.",
         'ru': f"Подтвердите: Записать на {service} для {state.patient_name or 'вас'} в {slot_time}\n\nОтветьте 'да' для подтверждения или 'нет' для отмены.",
         'es': f"Por favor confirme: Reservar {service} para {state.patient_name or 'usted'} a las {slot_time}\n\nResponda 'sí' para confirmar o 'no' para cancelar.",
+        'he': f"אנא אשר: להזמין {service} עבור {state.patient_name or 'אותך'} ב-{slot_time}\n\nהשב 'כן' לאישור או 'לא' לביטול.",
     }
     return templates.get(lang, templates['en'])
 
 
-def format_booking_confirmation(state: BookingState, lang: str) -> str:
+def format_booking_confirmation(
+    state: BookingState,
+    lang: str,
+    clinic: Optional[Dict[str, Any]] = None
+) -> str:
     """Format successful booking confirmation.
+
+    Phase 5: Now uses SOTA templates with location and entry instructions
+    when clinic data is available.
 
     Args:
         state: Booking state with appointment details
         lang: Language code
+        clinic: Optional clinic data with location_data and entry_instructions_i18n
 
     Returns:
         Formatted confirmation message
     """
     slot_time = state.selected_slot.get('datetime', '') if state.selected_slot else state.target_date or ''
 
+    # Phase 5: Use SOTA template if clinic data is available
+    if clinic and clinic.get('location_data'):
+        appointment = {
+            'scheduled_at': slot_time,
+            'service_name': state.service_type or '',
+            'doctor_name': state.doctor_name or ''
+        }
+        return format_sota_confirmation(appointment, clinic, lang)
+
+    # Fallback to simple template if no clinic data
     templates = {
         'en': f"Your appointment has been booked for {slot_time}. We'll send you a confirmation shortly. Is there anything else I can help with?",
         'ru': f"Ваша запись подтверждена на {slot_time}. Мы отправим вам подтверждение. Могу ли я помочь вам с чем-то ещё?",
         'es': f"Su cita ha sido reservada para {slot_time}. Le enviaremos una confirmación pronto. Hay algo más en lo que pueda ayudarle?",
+        'he': f"התור שלך נקבע ל-{slot_time}. נשלח לך אישור בקרוב. האם יש משהו נוסף שאוכל לעזור בו?",
     }
     return templates.get(lang, templates['en'])
 
@@ -933,69 +985,6 @@ def parse_slot_selection(text: str, slots: List[Dict[str, Any]]) -> Optional[Dic
     return None
 
 
-def is_confirmation(text: str, lang: str) -> bool:
-    """Check if text is a confirmation.
-
-    Args:
-        text: User's response text
-        lang: Language code (not used but kept for consistency)
-
-    Returns:
-        True if this is a confirmation
-    """
-    confirms = {
-        'yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'confirm',
-        'да', 'хорошо', 'ладно', 'подтверждаю',
-        'sí', 'si', 'vale', 'confirmo'
-    }
-    return text.lower().strip() in confirms
-
-
-def is_rejection(text: str, lang: str) -> bool:
-    """Check if text is a rejection.
-
-    Args:
-        text: User's response text
-        lang: Language code (not used but kept for consistency)
-
-    Returns:
-        True if this is a rejection
-    """
-    rejects = {
-        'no', 'nope', 'cancel', 'nevermind', 'never mind',
-        'нет', 'отмена', 'не надо',
-        'no', 'cancelar', 'no quiero'
-    }
-    return text.lower().strip() in rejects
-
-
-def _is_affirmative(text: str, lang: str) -> bool:
-    """Check if user response is affirmative (yes, да, sí, etc.).
-
-    Used for contextual "yes" handling when we're awaiting confirmation.
-
-    Args:
-        text: User's response text
-        lang: Language code
-
-    Returns:
-        True if this is an affirmative response
-    """
-    affirmatives = {
-        'en': ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'please', 'absolutely'],
-        'ru': ['да', 'ага', 'конечно', 'хорошо', 'давай', 'давайте', 'запиши', 'хочу'],
-        'es': ['sí', 'si', 'claro', 'por supuesto', 'ok', 'bueno', 'vale'],
-    }
-
-    text_lower = text.lower().strip()
-
-    for lang_key, words in affirmatives.items():
-        if any(word == text_lower or word in text_lower.split() for word in words):
-            return True
-
-    return False
-
-
 def _wants_concise_prompts(text: str) -> bool:
     """Detect if user explicitly asked for shorter prompts.
 
@@ -1034,7 +1023,7 @@ def get_date_prompt(lang: str, clarification_count: int, user_prefers_concise: b
     """
     # User explicitly asked for short prompts
     if user_prefers_concise:
-        prompts = {'en': "When?", 'ru': "Когда?", 'es': "¿Cuándo?"}
+        prompts = {'en': "When?", 'ru': "Когда?", 'es': "¿Cuándo?", 'he': "מתי?"}
         return prompts.get(lang, prompts['en'])
 
     if clarification_count == 0:
@@ -1042,18 +1031,21 @@ def get_date_prompt(lang: str, clarification_count: int, user_prefers_concise: b
             'en': "When would you like to come? You can say 'tomorrow at 2pm' or 'next Monday morning'.",
             'ru': "Когда вы хотели бы прийти? Можете сказать 'завтра в 14:00' или 'в следующий понедельник утром'.",
             'es': "¿Cuándo le gustaría venir? Puede decir 'mañana a las 2pm' o 'el próximo lunes por la mañana'.",
+            'he': "מתי תרצה להגיע? אפשר להגיד 'מחר ב-14:00' או 'יום שני הבא בבוקר'.",
         }
     elif clarification_count == 1:
         prompts = {
             'en': "What day works for you?",
             'ru': "Какой день вам удобен?",
             'es': "¿Qué día le conviene?",
+            'he': "איזה יום מתאים לך?",
         }
     else:
         prompts = {
             'en': "When?",
             'ru': "Когда?",
             'es': "¿Cuándo?",
+            'he': "מתי?",
         }
 
     return prompts.get(lang, prompts['en'])
