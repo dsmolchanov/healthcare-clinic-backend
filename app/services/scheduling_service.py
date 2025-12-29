@@ -42,6 +42,8 @@ from app.services.policy_adapter import (
     build_slot_context,
     context_field_truthy,
 )
+from app.services.clinic_data_cache import ClinicDataCache
+from app.config import get_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -66,12 +68,13 @@ class SchedulingService:
     - Escalation on zero slots
     """
 
-    def __init__(self, supabase: Client = None):
+    def __init__(self, supabase: Client = None, redis_client=None):
         """
         Initialize scheduling service.
 
         Args:
             supabase: Optional Supabase client (creates new if not provided)
+            redis_client: Optional Redis client for cache access
         """
         if supabase:
             self.db = supabase
@@ -87,6 +90,10 @@ class SchedulingService:
                 os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
                 options=options
             )
+
+        # Initialize cache for service lookups
+        self.redis_client = redis_client or get_redis_client()
+        self.cache = ClinicDataCache(self.redis_client, default_ttl=3600) if self.redis_client else None
 
         self.constraint_engine = ConstraintEngine(self.db)
         self.escalation_manager = EscalationManager(self.db)
@@ -583,15 +590,27 @@ class SchedulingService:
         candidates = []
 
         try:
-            # Get service details for duration
-            service_result = self.db.table("services")\
-                .select("duration_minutes")\
-                .eq("id", str(service_id))\
-                .execute()
-
+            # Get service details for duration (use cache if available)
             duration_minutes = 30  # Default
-            if service_result.data:
-                duration_minutes = service_result.data[0].get("duration_minutes", 30)
+
+            if self.cache:
+                try:
+                    services = await self.cache.get_services(str(clinic_id), self.db)
+                    service = next((s for s in services if s.get('id') == str(service_id)), None)
+                    if service:
+                        duration_minutes = service.get("duration_minutes", 30)
+                        logger.debug(f"✅ Cache HIT: service {service_id} duration={duration_minutes}")
+                except Exception as e:
+                    logger.warning(f"Cache error for service duration: {e}, falling back to DB")
+
+            # Fallback to direct DB if cache miss or not available
+            if duration_minutes == 30:  # Still default, try DB
+                service_result = self.db.table("services")\
+                    .select("duration_minutes")\
+                    .eq("id", str(service_id))\
+                    .execute()
+                if service_result.data:
+                    duration_minutes = service_result.data[0].get("duration_minutes", 30)
 
             # Get eligible doctors and rooms
             doctors = await self._get_eligible_doctors(

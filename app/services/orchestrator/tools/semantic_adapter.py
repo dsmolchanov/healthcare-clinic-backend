@@ -30,6 +30,9 @@ from zoneinfo import ZoneInfo
 import re
 import logging
 
+from app.services.clinic_data_cache import ClinicDataCache
+from app.config import get_redis_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +57,8 @@ class SemanticAdapter:
         clinic_id: str,
         context: Dict[str, Any],
         supabase_client: Optional[Any] = None,
-        clinic_timezone: str = "UTC"
+        clinic_timezone: str = "UTC",
+        redis_client=None
     ):
         """
         Initialize semantic adapter.
@@ -64,11 +68,16 @@ class SemanticAdapter:
             context: Session context containing cached data (doctors, patient_profile, etc.)
             supabase_client: Optional Supabase client for database lookups
             clinic_timezone: Clinic's timezone for date parsing (e.g., "America/New_York")
+            redis_client: Optional Redis client for cache access
         """
         self.clinic_id = clinic_id
         self.context = context
         self.supabase = supabase_client
         self.clinic_timezone = clinic_timezone
+
+        # Initialize Redis cache
+        self.redis_client = redis_client or get_redis_client()
+        self.cache = ClinicDataCache(self.redis_client, default_ttl=3600) if self.redis_client else None
 
         # Pre-cache doctors from context if available
         self.doctors_cache: List[Dict] = context.get('clinic_doctors', [])
@@ -159,7 +168,22 @@ class SemanticAdapter:
         return None
 
     async def _db_doctor_search(self, search_term: str) -> Optional[str]:
-        """Search database for doctor by name."""
+        """Search for doctor by name using cache, fallback to database."""
+        # Try Redis cache first
+        if self.cache and self.supabase:
+            try:
+                doctors = await self.cache.get_doctors(self.clinic_id, self.supabase)
+                if doctors:
+                    for doctor in doctors:
+                        first_name = (doctor.get('first_name') or '').lower()
+                        last_name = (doctor.get('last_name') or '').lower()
+                        if search_term in first_name or search_term in last_name:
+                            logger.debug(f"✅ Cache HIT: Found doctor '{search_term}' → {doctor['id']}")
+                            return doctor['id']
+            except Exception as e:
+                logger.warning(f"[adapter] Cache doctor lookup failed: {e}, falling back to DB")
+
+        # Fallback to direct DB query
         if not self.supabase:
             return None
 

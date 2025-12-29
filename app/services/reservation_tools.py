@@ -23,7 +23,9 @@ from app.services.external_calendar_service import ExternalCalendarService
 from app.services.intelligent_scheduler import IntelligentScheduler, SchedulingStrategy
 from app.services.realtime_conflict_detector import RealtimeConflictDetector
 from app.services.redis_session_manager import RedisSessionManager
+from app.services.clinic_data_cache import ClinicDataCache
 from app.database import create_supabase_client
+from app.config import get_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +49,8 @@ class ReservationTools:
         clinic_id: str,
         patient_id: Optional[str] = None,
         business_hours: Optional[Dict] = None,
-        clinic_timezone: Optional[str] = None
+        clinic_timezone: Optional[str] = None,
+        redis_client=None
     ):
         """
         Initialize reservation tools with clinic context.
@@ -57,12 +60,17 @@ class ReservationTools:
             patient_id: Optional patient ID for personalized operations
             business_hours: Pre-loaded business hours from clinic warmup (avoids DB fetch)
             clinic_timezone: Pre-loaded timezone from clinic warmup (avoids DB fetch)
+            redis_client: Redis client for cache access (if None, uses get_redis_client())
         """
         self.clinic_id = clinic_id
         self.patient_id = patient_id
         self.business_hours = business_hours or {}
         self.clinic_timezone = clinic_timezone
         self.supabase = create_supabase_client()
+
+        # Initialize cache for doctor/service lookups
+        self.redis_client = redis_client or get_redis_client()
+        self.cache = ClinicDataCache(self.redis_client, default_ttl=3600) if self.redis_client else None
 
         # Initialize services with pre-loaded business hours and timezone
         # Phase C: Removed deprecated AppointmentBookingService
@@ -84,6 +92,96 @@ class ReservationTools:
         self.session_manager = RedisSessionManager()
 
         logger.info(f"Initialized ReservationTools for clinic {clinic_id} (tz={clinic_timezone})")
+
+    async def _get_cached_doctors(self) -> List[Dict[str, Any]]:
+        """Get doctors from cache, fallback to database."""
+        if self.cache:
+            try:
+                doctors = await self.cache.get_doctors(self.clinic_id, self.supabase)
+                if doctors:
+                    logger.debug(f"✅ Cache HIT: {len(doctors)} doctors for clinic {self.clinic_id}")
+                    return doctors
+            except Exception as e:
+                logger.warning(f"Cache error for doctors: {e}, falling back to DB")
+
+        # Fallback to direct DB query
+        try:
+            result = self.supabase.schema('healthcare').table('doctors').select(
+                'id, first_name, last_name, specialization, phone, email'
+            ).eq('clinic_id', self.clinic_id).eq('active', True).execute()
+            return result.data or []
+        except Exception as e:
+            logger.error(f"Failed to fetch doctors: {e}")
+            return []
+
+    async def _get_cached_services(self) -> List[Dict[str, Any]]:
+        """Get services from cache, fallback to database."""
+        if self.cache:
+            try:
+                services = await self.cache.get_services(self.clinic_id, self.supabase)
+                if services:
+                    logger.debug(f"✅ Cache HIT: {len(services)} services for clinic {self.clinic_id}")
+                    return services
+            except Exception as e:
+                logger.warning(f"Cache error for services: {e}, falling back to DB")
+
+        # Fallback to direct DB query
+        try:
+            result = self.supabase.schema('healthcare').table('services').select('*').eq(
+                'clinic_id', self.clinic_id
+            ).eq('active', True).execute()
+            return result.data or []
+        except Exception as e:
+            logger.error(f"Failed to fetch services: {e}")
+            return []
+
+    def _find_doctor_by_name(self, doctors: List[Dict], doctor_name: str) -> Optional[Dict]:
+        """Find a doctor by name with transliteration support."""
+        doctor_name_lower = doctor_name.lower().strip()
+
+        # Transliterate Cyrillic to Latin for matching
+        cyrillic_to_latin = {
+            'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+            'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+            'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+            'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+            'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya'
+        }
+        doctor_name_transliterated = ''.join(
+            cyrillic_to_latin.get(c, c) for c in doctor_name_lower
+        )
+
+        for doc in doctors:
+            first_name = (doc.get('first_name') or '').lower()
+            last_name = (doc.get('last_name') or '').lower()
+            full_name = f"{first_name} {last_name}"
+
+            # Check various matching patterns (both original and transliterated)
+            if (doctor_name_transliterated in first_name or
+                doctor_name_transliterated in last_name or
+                doctor_name_transliterated in full_name or
+                first_name in doctor_name_transliterated or
+                last_name in doctor_name_transliterated or
+                doctor_name_lower in first_name or
+                doctor_name_lower in last_name):
+                return doc
+        return None
+
+    def _find_service_by_name(self, services: List[Dict], service_name: str) -> Optional[Dict]:
+        """Find a service by name with fuzzy matching."""
+        service_name_lower = service_name.lower().strip()
+
+        for service in services:
+            name = (service.get('name') or '').lower()
+            name_ru = (service.get('name_ru') or '').lower()
+            name_en = (service.get('name_en') or '').lower()
+
+            if (service_name_lower in name or
+                service_name_lower in name_ru or
+                service_name_lower in name_en or
+                name in service_name_lower):
+                return service
+        return None
 
     async def check_availability_tool(
         self,
@@ -146,48 +244,14 @@ class ReservationTools:
                 uuid_module.UUID(doctor_id)
                 # Valid UUID, use as-is
             except (ValueError, AttributeError):
-                # Not a UUID - try to look up doctor by name
+                # Not a UUID - try to look up doctor by name using cache
                 logger.info(f"doctor_id '{doctor_id}' is not a UUID, looking up by name")
-                doctor_result = self.supabase.schema('healthcare').table('doctors').select('id, first_name, last_name').eq('clinic_id', self.clinic_id).execute()
-
-                matched_doctor = None
-                doctor_name_lower = doctor_id.lower().strip()
-
-                # Transliterate Cyrillic to Latin for matching
-                cyrillic_to_latin = {
-                    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
-                    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
-                    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
-                    'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
-                    'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya'
-                }
-                doctor_name_transliterated = ''.join(
-                    cyrillic_to_latin.get(c, c) for c in doctor_name_lower
-                )
-                logger.info(f"Doctor name lookup: '{doctor_name_lower}' → transliterated: '{doctor_name_transliterated}'")
-
-                for doc in doctor_result.data or []:
-                    first_name = (doc.get('first_name') or '').lower()
-                    last_name = (doc.get('last_name') or '').lower()
-                    full_name = f"{first_name} {last_name}"
-
-                    # Check various matching patterns (both original and transliterated)
-                    name_to_check = doctor_name_transliterated  # Use transliterated for matching
-                    if (name_to_check in first_name or
-                        name_to_check in last_name or
-                        name_to_check in full_name or
-                        first_name in name_to_check or
-                        last_name in name_to_check or
-                        # Also check original (in case DB has Cyrillic)
-                        doctor_name_lower in first_name or
-                        doctor_name_lower in last_name):
-                        matched_doctor = doc
-                        logger.info(f"Matched doctor: {first_name} {last_name}")
-                        break
+                doctors = await self._get_cached_doctors()
+                matched_doctor = self._find_doctor_by_name(doctors, doctor_id)
 
                 if matched_doctor:
                     doctor_id = matched_doctor['id']
-                    logger.info(f"Resolved doctor name to UUID: {matched_doctor['first_name']} {matched_doctor['last_name']} → {doctor_id}")
+                    logger.info(f"Resolved doctor name to UUID: {matched_doctor.get('first_name')} {matched_doctor.get('last_name')} → {doctor_id}")
                 else:
                     logger.warning(f"Could not find doctor matching '{doctor_id}'")
                     return {
@@ -468,28 +532,25 @@ class ReservationTools:
                 is_uuid = False
                 logger.info(f"service_id '{service_id}' is not a UUID, looking up by name")
 
-            # Get service details from healthcare schema
+            # Get service details from cache
+            services = await self._get_cached_services()
+            service = None
+
             if is_uuid:
-                service_result = self.supabase.schema('healthcare').table('services').select('*').eq('id', service_id).execute()
+                # Find by ID in cached services
+                service = next((s for s in services if s.get('id') == service_id), None)
             else:
-                # Lookup by name - try multiple language columns
-                service_result = self.supabase.schema('healthcare').table('services').select('*').eq('clinic_id', self.clinic_id).or_(
-                    f'name.ilike.%{service_id}%,'
-                    f'name_ru.ilike.%{service_id}%,'
-                    f'name_en.ilike.%{service_id}%,'
-                    f'name_es.ilike.%{service_id}%'
-                ).limit(1).execute()
-                if service_result.data:
-                    # Update service_id with the actual UUID
-                    service_id = service_result.data[0]['id']
+                # Lookup by name using helper
+                service = self._find_service_by_name(services, service_id)
+                if service:
+                    service_id = service['id']
                     logger.info(f"Resolved service name to UUID: {service_id}")
 
-            if not service_result.data:
+            if not service:
                 return {
                     "success": False,
                     "error": "Service not found"
                 }
-            service = service_result.data[0]
 
             # Check if multi-stage service
             stage_config = service.get('stage_config', {})
@@ -605,10 +666,17 @@ class ReservationTools:
 
                     appointment_record = appt_result.data[0] if appt_result.data else {}
 
+                    # Get clinic data for SOTA confirmation message (Phase 5)
+                    clinic_result = self.supabase.schema('healthcare').table('clinics').select(
+                        'id, name, address, city, state, location_data, entry_instructions_i18n'
+                    ).eq('id', self.clinic_id).limit(1).execute()
+                    clinic_record = clinic_result.data[0] if clinic_result.data else {}
+
                     booking_result = {
                         "success": True,
                         "appointment_id": result.appointment_id,
                         "appointment": appointment_record,
+                        "clinic": clinic_record,  # Phase 5: Include clinic for SOTA confirmation
                         "confirmation_message": self._format_confirmation_message(appointment_record, service)
                     }
 
@@ -1218,11 +1286,10 @@ class ReservationTools:
                     f"No doctor-service mappings found for service {service_id}, "
                     f"falling back to all active doctors at clinic {clinic_id}"
                 )
-                fallback_result = self.supabase.schema('healthcare').table('doctors').select(
-                    'id, first_name, last_name, specialization'
-                ).eq('clinic_id', clinic_id).eq('active', True).execute()
+                # Use cached doctors instead of direct DB query
+                cached_doctors = await self._get_cached_doctors()
 
-                for doc in fallback_result.data or []:
+                for doc in cached_doctors:
                     doctors.append({
                         'id': doc['id'],
                         'name': f"Dr. {doc.get('first_name', '')} {doc.get('last_name', '')}".strip(),

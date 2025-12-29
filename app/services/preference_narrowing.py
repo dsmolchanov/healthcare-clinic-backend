@@ -13,6 +13,8 @@ from app.domain.preferences.narrowing import (
     NarrowingInstruction, ToolCallPlan
 )
 from app.services.conversation_constraints import ConversationConstraints
+from app.services.clinic_data_cache import ClinicDataCache
+from app.config import get_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +44,53 @@ class PreferenceNarrowingService:
     This is the "decision engine" that ensures consistent agent behavior.
     """
 
-    def __init__(self, supabase_client=None):
+    def __init__(self, supabase_client=None, redis_client=None):
         self.supabase = supabase_client
+        # Initialize cache for service lookups
+        self.redis_client = redis_client or get_redis_client()
+        self.cache = ClinicDataCache(self.redis_client, default_ttl=3600) if self.redis_client else None
+
+    async def _find_service_id(self, service_name: str, clinic_id: str) -> Optional[str]:
+        """Find service ID by name using cache."""
+        if not service_name or not clinic_id:
+            return None
+
+        # Try cache first
+        if self.cache and self.supabase:
+            try:
+                services = await self.cache.get_services(clinic_id, self.supabase)
+                if services:
+                    service_name_lower = service_name.lower()
+                    for service in services:
+                        name = (service.get('name') or '').lower()
+                        name_ru = (service.get('name_ru') or '').lower()
+                        name_en = (service.get('name_en') or '').lower()
+                        name_es = (service.get('name_es') or '').lower()
+
+                        if (service_name_lower in name or
+                            service_name_lower in name_ru or
+                            service_name_lower in name_en or
+                            service_name_lower in name_es):
+                            logger.debug(f"✅ Cache HIT: Found service '{service_name}' → {service['id']}")
+                            return service['id']
+            except Exception as e:
+                logger.warning(f"Cache error for services: {e}, falling back to DB")
+
+        # Fallback to direct DB query
+        if self.supabase:
+            try:
+                result = self.supabase.schema('healthcare').table('services').select('id').eq('clinic_id', clinic_id).or_(
+                    f'name.ilike.%{service_name}%,'
+                    f'name_ru.ilike.%{service_name}%,'
+                    f'name_en.ilike.%{service_name}%,'
+                    f'name_es.ilike.%{service_name}%'
+                ).limit(1).execute()
+                if result.data:
+                    return result.data[0]['id']
+            except Exception as e:
+                logger.error(f"Failed to find service: {e}")
+
+        return None
 
     def classify_urgency(self, user_message: str) -> UrgencyLevel:
         """Detect urgency level from user message text."""
@@ -115,19 +162,13 @@ class PreferenceNarrowingService:
             return None, []  # None signals "couldn't check", not "zero doctors"
 
         try:
-            # First, resolve service_name to service_id
-            service_result = self.supabase.schema('healthcare').table('services').select('id').eq('clinic_id', clinic_id).or_(
-                f'name.ilike.%{service_name}%,'
-                f'name_ru.ilike.%{service_name}%,'
-                f'name_en.ilike.%{service_name}%,'
-                f'name_es.ilike.%{service_name}%'
-            ).limit(1).execute()
+            # First, resolve service_name to service_id using cache
+            service_id = await self._find_service_id(service_name, clinic_id)
 
-            if not service_result.data:
+            if not service_id:
                 logger.warning(f"Service not found for name: {service_name}")
                 return None, []
 
-            service_id = service_result.data[0]['id']
             logger.debug(f"Resolved service '{service_name}' to ID: {service_id}")
 
             result = self.supabase.rpc(
