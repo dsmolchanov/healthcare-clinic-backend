@@ -1059,6 +1059,76 @@ def get_date_prompt(lang: str, clarification_count: int, user_prefers_concise: b
     return prompts.get(lang, prompts['en'])
 
 
+def _normalize_name_for_matching(name: str) -> str:
+    """
+    Normalize a name for fuzzy matching across Cyrillic/Latin.
+
+    Transliterates common Cyrillic characters to Latin equivalents
+    to allow matching "Марк" with "Mark", "Штерн" with "Shtern", etc.
+    """
+    # Cyrillic to Latin transliteration map (common dental clinic names)
+    translit_map = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+    }
+
+    result = []
+    for char in name.lower():
+        if char in translit_map:
+            result.append(translit_map[char])
+        else:
+            result.append(char)
+
+    return ''.join(result)
+
+
+def _names_match(query_name: str, doctor_name: str) -> bool:
+    """
+    Check if a query name matches a doctor name.
+
+    Handles:
+    - Case-insensitive matching
+    - Cyrillic/Latin transliteration (Марк → Mark)
+    - Partial matching (just first or last name)
+    - Title stripping (Dr., доктор, etc.)
+    """
+    # Strip common titles
+    titles = ['dr.', 'dr', 'doctor', 'доктор', 'врач', 'док.']
+    query_clean = query_name.lower().strip()
+    doctor_clean = doctor_name.lower().strip()
+
+    for title in titles:
+        query_clean = query_clean.replace(title, '').strip()
+        doctor_clean = doctor_clean.replace(title, '').strip()
+
+    # Normalize both names (transliterate Cyrillic)
+    query_norm = _normalize_name_for_matching(query_clean)
+    doctor_norm = _normalize_name_for_matching(doctor_clean)
+
+    # Check for exact match
+    if query_norm == doctor_norm:
+        return True
+
+    # Check if query is contained in doctor name (partial match)
+    if query_norm in doctor_norm or doctor_norm in query_norm:
+        return True
+
+    # Check each word in query against doctor name parts
+    query_parts = query_norm.split()
+    doctor_parts = doctor_norm.split()
+
+    for qpart in query_parts:
+        if len(qpart) >= 3:  # Only match parts with 3+ chars
+            for dpart in doctor_parts:
+                if qpart in dpart or dpart in qpart:
+                    return True
+
+    return False
+
+
 def handle_doctor_info_tangent(
     state: BookingState,
     doctor_name: Optional[str],
@@ -1086,14 +1156,13 @@ def handle_doctor_info_tangent(
     """
     # Default doctor list if not provided
     if doctor_list is None:
-        doctor_list = ["Dr. Mark", "Dr. Marie", "Dr. Shtern"]
+        doctor_list = ["Dr. Mark Shtern", "Dr. Marie", "Dr. Shtern"]
 
     if doctor_info_kind == "exists" and doctor_name:
-        # Check if doctor exists in our list (case-insensitive partial match)
-        name_lower = doctor_name.lower()
+        # Check if doctor exists using fuzzy matching (handles Cyrillic/Latin)
         found_doctor = None
         for doc in doctor_list:
-            if name_lower in doc.lower():
+            if _names_match(doctor_name, doc):
                 found_doctor = doc
                 break
 
@@ -1112,7 +1181,14 @@ def handle_doctor_info_tangent(
             )
         else:
             # Doctor NOT found - ask for clarification
-            similar = [d for d in doctor_list if name_lower[:3] in d.lower()]
+            # Find similar names using transliteration
+            query_norm = _normalize_name_for_matching(doctor_name)
+            similar = []
+            for d in doctor_list:
+                doc_norm = _normalize_name_for_matching(d)
+                # Check if first 3 chars of query match any part of doctor name
+                if len(query_norm) >= 3 and query_norm[:3] in doc_norm:
+                    similar.append(d)
             suggestion = ""
             if similar:
                 suggestion_templates = {
