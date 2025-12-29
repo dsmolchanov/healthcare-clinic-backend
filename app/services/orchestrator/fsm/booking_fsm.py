@@ -78,6 +78,173 @@ def get_msg(key: str, lang: str) -> str:
     return MESSAGES.get(key, {}).get(lang, MESSAGES.get(key, {}).get('en', ''))
 
 
+def normalize_time_phrase(text: str) -> Optional[int]:
+    """
+    Parse multilingual time phrases to hour (0-23).
+
+    Supports:
+    - Russian: "10 утра" → 10, "3 вечера" → 15, "в 10" → 10
+    - Spanish: "10 de la mañana" → 10, "3 de la tarde" → 15
+    - European: "10.00" → 10, "10:00" → 10
+    - English: "10am" → 10, "3pm" → 15
+
+    Returns:
+        Hour as int (0-23), or None if no match
+    """
+    text_lower = text.lower().strip()
+
+    # Pattern 1: Russian time of day - "10 утра", "3 вечера", "2 дня"
+    # утра = morning (AM), дня = afternoon (12-17), вечера = evening (17+)
+    ru_patterns = [
+        (r'(\d{1,2})\s*(?:утра|утром)', 0),        # 10 утра → +0
+        (r'(\d{1,2})\s*(?:дня|днём)', 12),          # 3 дня → +12 (if < 12)
+        (r'(\d{1,2})\s*(?:вечера|вечером)', 12),    # 7 вечера → +12 (if < 12)
+        (r'в\s+(\d{1,2})(?:\s|$|:)', 0),            # в 10 → assume context
+    ]
+
+    for pattern, offset in ru_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            hour = int(match.group(1))
+            # Apply offset for PM times
+            if offset > 0 and hour < 12:
+                hour += offset
+            # Note: "12 утра" is unusual; "12 дня" is more natural for noon
+            # Treat "12 утра" as 12:00 (noon) - add unit test to lock behavior
+            return hour
+
+    # Pattern 2: Spanish time of day - "10 de la mañana", "3 de la tarde"
+    es_patterns = [
+        (r'(\d{1,2})\s*(?:de la mañana|por la mañana)', 0),    # 10 de la mañana → +0
+        (r'(\d{1,2})\s*(?:de la tarde|por la tarde)', 12),     # 3 de la tarde → +12
+        (r'(\d{1,2})\s*(?:de la noche|por la noche)', 12),     # 7 de la noche → +12
+        (r'a las\s+(\d{1,2})(?:\s|$|:)', 0),                    # a las 10 → assume context
+    ]
+
+    for pattern, offset in es_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            hour = int(match.group(1))
+            if offset > 0 and hour < 12:
+                hour += offset
+            return hour
+
+    # Pattern 3: European format - "10.00", "14.30"
+    eu_match = re.search(r'(\d{1,2})\.(\d{2})(?:\s|$)', text_lower)
+    if eu_match:
+        return int(eu_match.group(1))
+
+    # Pattern 4: 24-hour format - "10:00", "14:00", "20:00"
+    time_match = re.search(r'(\d{1,2}):(\d{2})(?:\s|$)', text_lower)
+    if time_match:
+        return int(time_match.group(1))
+
+    # Pattern 5: Bare number with context clues - "10", "в 10"
+    bare_match = re.search(r'^(\d{1,2})$', text_lower)
+    if bare_match:
+        hour = int(bare_match.group(1))
+        # Assume business hours context (9-17)
+        return hour if 0 <= hour <= 23 else None
+
+    return None
+
+
+def cluster_slots_by_hour(slots: List[Dict[str, Any]]) -> Dict[str, List[int]]:
+    """
+    Cluster slots into morning/afternoon/evening hours.
+
+    Returns:
+        {
+            "morning": [9, 10, 11],
+            "afternoon": [14, 15, 16],
+            "evening": [17, 18]
+        }
+
+    Note: Hours 0-5 and 22-23 are ignored as they're outside typical clinic hours.
+    """
+    clusters: Dict[str, List[int]] = {"morning": [], "afternoon": [], "evening": []}
+    seen_hours: set = set()
+
+    for slot in slots:
+        # IMPORTANT: Always wrap in str() to handle datetime objects
+        slot_time = str(slot.get('datetime', slot.get('time', slot.get('start', ''))))
+        hour_match = re.search(r'T(\d{2}):', slot_time)
+        if hour_match:
+            hour = int(hour_match.group(1))
+            if hour not in seen_hours:
+                seen_hours.add(hour)
+                # Tightened buckets (per expert feedback):
+                # - Morning: 6-11 (6 <= hour < 12)
+                # - Afternoon: 12-16 (12 <= hour < 17)
+                # - Evening: 17-21 (17 <= hour < 22)
+                # - Ignore: 0-5, 22-23 (unusual hours)
+                if 6 <= hour < 12:
+                    clusters["morning"].append(hour)
+                elif 12 <= hour < 17:
+                    clusters["afternoon"].append(hour)
+                elif 17 <= hour < 22:
+                    clusters["evening"].append(hour)
+                # else: ignore unusual hours (0-5, 22-23)
+
+    # Sort each cluster
+    for key in clusters:
+        clusters[key].sort()
+
+    return clusters
+
+
+def format_hours_naturally(hours: List[int], lang: str) -> str:
+    """Format a list of hours in natural language."""
+    if not hours:
+        return ""
+
+    if len(hours) == 1:
+        return f"{hours[0]}:00"
+    elif len(hours) == 2:
+        connectors = {'en': 'or', 'ru': 'или', 'es': 'o'}
+        connector = connectors.get(lang, 'or')
+        return f"{hours[0]}:00 {connector} {hours[1]}:00"
+    else:
+        # "9:00, 10:00, or 11:00"
+        connectors = {'en': 'or', 'ru': 'или', 'es': 'o'}
+        connector = connectors.get(lang, 'or')
+        formatted = ", ".join(f"{h}:00" for h in hours[:-1])
+        return f"{formatted}, {connector} {hours[-1]}:00"
+
+
+def _should_update_language(text: str) -> bool:
+    """
+    Determine if the input text is substantial enough to trust language detection.
+
+    Prevents language flip-flopping on:
+    - Short inputs ("10", "да", "ok")
+    - Timestamps ("10.00", "14:30", "10:00")
+    - Purely numeric inputs
+
+    Returns:
+        True if language should be updated, False to keep existing
+    """
+    clean = text.strip()
+
+    # Check for explicit time strings that shouldn't trigger language switch
+    # Matches: "10.00", "14:30", "9:00", "10.30"
+    is_time_string = bool(re.match(r'^\d{1,2}[.:]\d{2}$', clean))
+    if is_time_string:
+        return False
+
+    # Check if only digits and punctuation (no actual text)
+    only_digits_punct = clean.replace('.', '').replace(':', '').replace(' ', '').isdigit()
+    if only_digits_punct:
+        return False
+
+    # Check if it "looks like real text" - has alphabetic characters
+    is_texty = any(ch.isalpha() for ch in clean)
+
+    # Require at least 2 characters of text-like content
+    # This allows "да", "si", "ok" to update language while avoiding noise
+    return is_texty and len(clean) >= 2
+
+
 def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]:
     """
     Pure function: (state, event) -> (new_state, actions)
@@ -107,8 +274,47 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
 
     # Merge any new info from router (fills gaps, doesn't overwrite)
     state = state.merge_router_output(event.router)
-    state = replace(state, language=event.language)
-    lang = event.language
+
+    # === STICKY LANGUAGE: Only update on substantial text input ===
+    # Prevents hallucinations like "10.00" → Spanish or short confirmations
+    # from triggering unwanted language switches
+    if _should_update_language(event.text):
+        state = replace(state, language=event.language)
+        lang = event.language
+    # else: keep existing state.language (sticky)
+
+    # === CHECK FOR CONCISE PROMPT PREFERENCE ===
+    if _wants_concise_prompts(event.text):
+        state = replace(state, user_prefers_concise=True)
+
+    # === HANDLE DOCTOR_INFO ROUTE (Tangent) ===
+    # This handles "Доктор Марк у вас работает?" regardless of current stage
+    if event.router.route == "doctor_info":
+        doctor_info_kind = event.router.doctor_info_kind or "exists"
+        return handle_doctor_info_tangent(
+            state=state,
+            doctor_name=event.router.doctor_name,
+            doctor_info_kind=doctor_info_kind,
+            lang=lang,
+        )
+
+    # === HANDLE CONTEXTUAL "YES" BASED ON pending_action ===
+    # Only trigger special logic if we're awaiting specific confirmation
+    if _is_affirmative(event.text, lang):
+        if state.awaiting_field == 'booking_confirmation' and state.pending_action:
+            action = state.pending_action
+            if action.get('type') == 'start_booking':
+                # Proceed to date collection with doctor pre-filled (if any)
+                new_state = replace(
+                    state,
+                    stage=BookingStage.COLLECT_DATE,
+                    awaiting_field=None,
+                    pending_action=None,
+                )
+                return new_state, [AskUser(
+                    text=get_date_prompt(lang, state.clarification_count, state.user_prefers_concise),
+                    field_awaiting='target_date'
+                )]
 
     # Build empathy prefix if needed (don't clear pain flag yet - need it for logic below)
     empathy = get_msg('empathy_prefix', lang) if state.has_pain else ""
@@ -221,7 +427,12 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
         else:
             # Couldn't parse selection - re-present slots
             return state, [AskUser(
-                text=format_slots_message(state.available_slots, lang),
+                text=format_slots_message(
+                    state.available_slots,
+                    lang,
+                    doctor_name=state.doctor_name,
+                    target_date=state.target_date,
+                ),
                 field_awaiting='slot_selection'
             )]
 
@@ -229,7 +440,37 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
     # Stage: COLLECT_PATIENT_INFO
     # ==========================================
     if state.stage == BookingStage.COLLECT_PATIENT_INFO:
-        if not state.patient_phone:
+        # Check if we have pre-populated phone but need patient name
+        if state.patient_phone and not state.patient_name:
+            # Phone is pre-populated from WhatsApp - show UX transparency message
+            phone_preview = state.patient_phone[-4:] if len(state.patient_phone) >= 4 else state.patient_phone
+            transparency_templates = {
+                'en': f"I'll book using your WhatsApp number (ending in {phone_preview}). What name should I use for the appointment?",
+                'ru': f"Запишу вас на этот номер WhatsApp (заканчивается на {phone_preview}). Как вас записать?",
+                'es': f"Usaré tu número de WhatsApp (termina en {phone_preview}). ¿A qué nombre hago la cita?",
+            }
+            state = replace(state, clarification_count=state.clarification_count + 1)
+            if state.clarification_count > 3:
+                return replace(state, stage=BookingStage.COMPLETE), [
+                    Escalate(
+                        reason="max_clarifications_exceeded",
+                        context={
+                            "attempts": state.clarification_count,
+                            "missing_field": "patient_name",
+                            "partial_booking": {
+                                "service": state.service_type,
+                                "date": state.target_date,
+                                "slot": state.selected_slot
+                            }
+                        }
+                    ),
+                    Respond(text=get_msg('escalate', lang))
+                ]
+            return state, [AskUser(
+                text=transparency_templates.get(lang, transparency_templates['en']),
+                field_awaiting='patient_name'
+            )]
+        elif not state.patient_phone:
             state = replace(state, clarification_count=state.clarification_count + 1)
             if state.clarification_count > 3:  # Raised threshold per feedback
                 # Use Escalate action for proper handoff tracking
@@ -374,7 +615,12 @@ def handle_tool_result(state: BookingState, event: ToolResultEvent) -> Tuple[Boo
         # Have slots - present them
         state = replace(state, stage=BookingStage.AWAIT_SLOT_SELECTION)
         return state, [AskUser(
-            text=format_slots_message(slots, lang),
+            text=format_slots_message(
+                slots,
+                lang,
+                doctor_name=state.doctor_name,
+                target_date=state.target_date,
+            ),
             field_awaiting='slot_selection'
         )]
 
@@ -407,41 +653,97 @@ def handle_tool_result(state: BookingState, event: ToolResultEvent) -> Tuple[Boo
 # Helper Functions
 # ==========================================
 
-def format_slots_message(slots: List[Dict[str, Any]], lang: str) -> str:
-    """Format available slots for display.
+def format_slots_message(
+    slots: List[Dict[str, Any]],
+    lang: str,
+    doctor_name: Optional[str] = None,
+    target_date: Optional[str] = None,
+) -> str:
+    """
+    Format available slots for human-like display.
+
+    New approach:
+    - Few slots (1-2 hours): "Да, доктор Марк завтра свободен в 9 или в 10 утра."
+    - Many slots: "Доктор Марк завтра работает утром и после обеда. Когда удобнее?"
 
     Args:
         slots: List of slot dictionaries
         lang: Language code
-
-    Returns:
-        Formatted message string
+        doctor_name: Doctor name for personalized response
+        target_date: Target date string for context
     """
     if not slots:
         return get_msg('no_availability', lang)
 
-    headers = {
-        'en': "I found these times available:\n",
-        'ru': "Я нашёл(а) свободные окна:\n",
-        'es': "Encontré estos horarios disponibles:\n",
-    }
-    footers = {
-        'en': "\nWhich time works best for you?",
-        'ru': "\nКакое время вам подходит?",
-        'es': "\nCuál le conviene mejor?",
-    }
+    # Cluster slots by time of day
+    clusters = cluster_slots_by_hour(slots)
+    total_hours = len(clusters["morning"]) + len(clusters["afternoon"]) + len(clusters["evening"])
 
-    lines = [headers.get(lang, headers['en'])]
-    for i, slot in enumerate(slots[:5], 1):
-        dt = slot.get('datetime', slot.get('time', slot.get('start', '')))
-        provider = slot.get('provider_name', slot.get('doctor_name', ''))
-        if provider:
-            lines.append(f"{i}. {dt} - {provider}")
-        else:
-            lines.append(f"{i}. {dt}")
-    lines.append(footers.get(lang, footers['en']))
+    # Build doctor reference with duplication check (per expert feedback)
+    doc_ref = doctor_name or ""
+    if doc_ref:
+        # Check if already has a title prefix (avoid "Dr. Dr. Mark")
+        has_title = doc_ref.lower().startswith((
+            'dr', 'dr.', 'doctor',           # English
+            'доктор', 'врач', 'док.',         # Russian
+            'dra', 'dra.', 'doctor', 'doctora'  # Spanish
+        ))
+        if not has_title:
+            doc_prefix = {'en': 'Dr. ', 'ru': 'доктор ', 'es': 'Dr. '}
+            doc_ref = doc_prefix.get(lang, 'Dr. ') + doc_ref
 
-    return '\n'.join(lines)
+    # Build date reference
+    date_ref = target_date or ""
+    date_refs = {
+        'tomorrow': {'en': 'tomorrow', 'ru': 'завтра', 'es': 'mañana'},
+        'today': {'en': 'today', 'ru': 'сегодня', 'es': 'hoy'},
+        'завтра': {'en': 'tomorrow', 'ru': 'завтра', 'es': 'mañana'},
+        'сегодня': {'en': 'today', 'ru': 'сегодня', 'es': 'hoy'},
+    }
+    for key, translations in date_refs.items():
+        if key in date_ref.lower():
+            date_ref = translations.get(lang, date_ref)
+            break
+
+    # FEW SLOTS: 1-2 distinct hours - list them directly
+    if total_hours <= 2:
+        all_hours = clusters["morning"] + clusters["afternoon"] + clusters["evening"]
+        all_hours.sort()
+        hours_str = format_hours_naturally(all_hours, lang)
+
+        templates = {
+            'en': f"Yes, {doc_ref} is available {date_ref}. Open slots at {hours_str}. Which works better?",
+            'ru': f"Да, {doc_ref} {date_ref} свободен. Есть время в {hours_str}. Какое удобнее?",
+            'es': f"Sí, {doc_ref} está disponible {date_ref}. Horarios: {hours_str}. ¿Cuál prefiere?",
+        }
+        return templates.get(lang, templates['en']).replace("  ", " ").strip()
+
+    # MANY SLOTS: Ask for time preference first
+    has_morning = len(clusters["morning"]) > 0
+    has_afternoon = len(clusters["afternoon"]) > 0
+    has_evening = len(clusters["evening"]) > 0
+
+    periods = []
+    if has_morning:
+        periods.append({'en': 'morning', 'ru': 'утром', 'es': 'por la mañana'}.get(lang, 'morning'))
+    if has_afternoon:
+        periods.append({'en': 'afternoon', 'ru': 'после обеда', 'es': 'por la tarde'}.get(lang, 'afternoon'))
+    if has_evening:
+        periods.append({'en': 'evening', 'ru': 'вечером', 'es': 'por la noche'}.get(lang, 'evening'))
+
+    if len(periods) >= 2:
+        connectors = {'en': 'or', 'ru': 'или', 'es': 'o'}
+        connector = connectors.get(lang, 'or')
+        period_str = f" {connector} ".join(periods)
+    else:
+        period_str = periods[0] if periods else ""
+
+    templates = {
+        'en': f"Yes, {doc_ref} is available {date_ref} {period_str}. Which time works better?",
+        'ru': f"Да, {doc_ref} {date_ref} работает {period_str}. Когда удобнее?",
+        'es': f"Sí, {doc_ref} está disponible {date_ref} {period_str}. ¿Qué horario prefiere?",
+    }
+    return templates.get(lang, templates['en']).replace("  ", " ").strip()
 
 
 def format_confirmation_message(state: BookingState, lang: str) -> str:
@@ -524,6 +826,22 @@ def parse_slot_selection(text: str, slots: List[Dict[str, Any]]) -> Optional[Dic
         if word in text_lower and idx < len(slots):
             return slots[idx]
 
+    # === NEW: MULTILINGUAL TIME PARSING ===
+    # Try to parse time from text using normalize_time_phrase
+    # This handles: "10 утра", "3 вечера", "10.00", "14:30", "a las 10", etc.
+    target_hour = normalize_time_phrase(text_lower)
+    if target_hour is not None:
+        # Find slot matching this hour
+        for slot in slots:
+            # IMPORTANT: Always wrap in str() to handle datetime objects safely
+            slot_time = str(slot.get('datetime', slot.get('time', slot.get('start', ''))))
+            # Extract hour from ISO datetime (e.g., "2025-12-29T09:00:00")
+            hour_match = re.search(r'T(\d{2}):', slot_time)
+            if hour_match:
+                slot_hour = int(hour_match.group(1))
+                if slot_hour == target_hour:
+                    return slot
+
     # Time-based selection: look for time patterns and match to slots
     # Patterns: "3pm", "3 pm", "3:00", "15:00", "morning", "afternoon"
     time_patterns = [
@@ -548,7 +866,8 @@ def parse_slot_selection(text: str, slots: List[Dict[str, Any]]) -> Optional[Dic
 
             # Find slot with matching hour
             for slot in slots:
-                slot_time = slot.get('datetime', slot.get('time', ''))
+                # IMPORTANT: Always wrap in str() to handle datetime objects safely
+                slot_time = str(slot.get('datetime', slot.get('time', '')))
                 # Extract hour from datetime string (e.g., "2025-12-29T09:00:00")
                 time_match = re.search(r'T(\d{2}):', slot_time)
                 if time_match:
@@ -559,7 +878,8 @@ def parse_slot_selection(text: str, slots: List[Dict[str, Any]]) -> Optional[Dic
     # Time of day preference: "morning", "afternoon"
     if any(word in text_lower for word in ['morning', 'утр', 'mañana']):
         for slot in slots:
-            slot_time = slot.get('datetime', slot.get('time', ''))
+            # IMPORTANT: Always wrap in str() to handle datetime objects safely
+            slot_time = str(slot.get('datetime', slot.get('time', '')))
             time_match = re.search(r'T(\d{2}):', slot_time)
             if time_match:
                 slot_hour = int(time_match.group(1))
@@ -567,7 +887,8 @@ def parse_slot_selection(text: str, slots: List[Dict[str, Any]]) -> Optional[Dic
                     return slot
     elif any(word in text_lower for word in ['afternoon', 'вечер', 'tarde']):
         for slot in slots:
-            slot_time = slot.get('datetime', slot.get('time', ''))
+            # IMPORTANT: Always wrap in str() to handle datetime objects safely
+            slot_time = str(slot.get('datetime', slot.get('time', '')))
             time_match = re.search(r'T(\d{2}):', slot_time)
             if time_match:
                 slot_hour = int(time_match.group(1))
@@ -646,3 +967,210 @@ def is_rejection(text: str, lang: str) -> bool:
         'no', 'cancelar', 'no quiero'
     }
     return text.lower().strip() in rejects
+
+
+def _is_affirmative(text: str, lang: str) -> bool:
+    """Check if user response is affirmative (yes, да, sí, etc.).
+
+    Used for contextual "yes" handling when we're awaiting confirmation.
+
+    Args:
+        text: User's response text
+        lang: Language code
+
+    Returns:
+        True if this is an affirmative response
+    """
+    affirmatives = {
+        'en': ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'please', 'absolutely'],
+        'ru': ['да', 'ага', 'конечно', 'хорошо', 'давай', 'давайте', 'запиши', 'хочу'],
+        'es': ['sí', 'si', 'claro', 'por supuesto', 'ok', 'bueno', 'vale'],
+    }
+
+    text_lower = text.lower().strip()
+
+    for lang_key, words in affirmatives.items():
+        if any(word == text_lower or word in text_lower.split() for word in words):
+            return True
+
+    return False
+
+
+def _wants_concise_prompts(text: str) -> bool:
+    """Detect if user explicitly asked for shorter prompts.
+
+    Args:
+        text: User's message text
+
+    Returns:
+        True if user wants concise prompts
+    """
+    concise_signals = [
+        'не надо примеры', 'я сам знаю', 'без лишнего',
+        'покороче', 'не подсказывай', 'сам знаю',
+        "don't prompt me", "i know", "skip examples",
+        'no examples', 'be brief', 'short please',
+    ]
+    text_lower = text.lower()
+    return any(signal in text_lower for signal in concise_signals)
+
+
+def get_date_prompt(lang: str, clarification_count: int, user_prefers_concise: bool = False) -> str:
+    """
+    Get date prompt with decreasing verbosity based on clarification count.
+
+    - user_prefers_concise=True: Always use shortest form
+    - count 0: Full prompt with examples
+    - count 1: Medium prompt without examples
+    - count 2+: Short prompt
+
+    Args:
+        lang: Language code
+        clarification_count: Number of times we've re-prompted
+        user_prefers_concise: Whether user asked for short prompts
+
+    Returns:
+        Localized date prompt
+    """
+    # User explicitly asked for short prompts
+    if user_prefers_concise:
+        prompts = {'en': "When?", 'ru': "Когда?", 'es': "¿Cuándo?"}
+        return prompts.get(lang, prompts['en'])
+
+    if clarification_count == 0:
+        prompts = {
+            'en': "When would you like to come? You can say 'tomorrow at 2pm' or 'next Monday morning'.",
+            'ru': "Когда вы хотели бы прийти? Можете сказать 'завтра в 14:00' или 'в следующий понедельник утром'.",
+            'es': "¿Cuándo le gustaría venir? Puede decir 'mañana a las 2pm' o 'el próximo lunes por la mañana'.",
+        }
+    elif clarification_count == 1:
+        prompts = {
+            'en': "What day works for you?",
+            'ru': "Какой день вам удобен?",
+            'es': "¿Qué día le conviene?",
+        }
+    else:
+        prompts = {
+            'en': "When?",
+            'ru': "Когда?",
+            'es': "¿Cuándo?",
+        }
+
+    return prompts.get(lang, prompts['en'])
+
+
+def handle_doctor_info_tangent(
+    state: BookingState,
+    doctor_name: Optional[str],
+    doctor_info_kind: str,  # "exists" | "list" | "recommend"
+    lang: str,
+    doctor_list: Optional[List[str]] = None,  # From ClinicInfoTool
+) -> Tuple[BookingState, List[Action]]:
+    """
+    Handle doctor info questions as tangents.
+
+    This handles questions like:
+    - "Доктор Марк у вас работает?" (Does Dr. Mark work here?)
+    - "Какие у вас врачи?" (Who are your doctors?)
+    - "Какого врача порекомендуете?" (Which doctor do you recommend?)
+
+    Args:
+        state: Current booking state
+        doctor_name: Doctor name from router (if any)
+        doctor_info_kind: Type of doctor info question
+        lang: Language code
+        doctor_list: List of doctor names from clinic (optional)
+
+    Returns:
+        Tuple of (new_state, actions)
+    """
+    # Default doctor list if not provided
+    if doctor_list is None:
+        doctor_list = ["Dr. Mark", "Dr. Marie", "Dr. Shtern"]
+
+    if doctor_info_kind == "exists" and doctor_name:
+        # Check if doctor exists in our list (case-insensitive partial match)
+        name_lower = doctor_name.lower()
+        found_doctor = None
+        for doc in doctor_list:
+            if name_lower in doc.lower():
+                found_doctor = doc
+                break
+
+        if found_doctor:
+            # Doctor exists - offer to book
+            templates = {
+                'en': f"Yes, {found_doctor} works at our clinic. Would you like to book an appointment?",
+                'ru': f"Да, {found_doctor} работает в нашей клинике. Хотите записаться?",
+                'es': f"Sí, {found_doctor} trabaja en nuestra clínica. ¿Le gustaría agendar una cita?",
+            }
+            new_state = replace(
+                state,
+                doctor_name=found_doctor,
+                awaiting_field='booking_confirmation',
+                pending_action={'type': 'start_booking', 'doctor_name': found_doctor},
+            )
+        else:
+            # Doctor NOT found - ask for clarification
+            similar = [d for d in doctor_list if name_lower[:3] in d.lower()]
+            suggestion = ""
+            if similar:
+                suggestion_templates = {
+                    'en': f" Did you mean {', '.join(similar[:2])}?",
+                    'ru': f" Возможно, вы имеете в виду {', '.join(similar[:2])}?",
+                    'es': f" ¿Quizás quiso decir {', '.join(similar[:2])}?",
+                }
+                suggestion = suggestion_templates.get(lang, suggestion_templates['en'])
+
+            templates = {
+                'en': f"I don't see {doctor_name} on our roster.{suggestion} Could you spell the name?",
+                'ru': f"Не вижу доктора {doctor_name} в списке наших врачей.{suggestion} Как правильно пишется?",
+                'es': f"No encuentro al Dr. {doctor_name} en nuestro personal.{suggestion} ¿Podría deletrear el nombre?",
+            }
+            new_state = replace(state, awaiting_field='doctor_name_clarification')
+
+        return new_state, [AskUser(
+            text=templates.get(lang, templates['en']),
+            field_awaiting=new_state.awaiting_field
+        )]
+
+    elif doctor_info_kind == "list":
+        # List all doctors
+        if doctor_list:
+            names = ", ".join(doctor_list[:5])  # Limit to 5
+            templates = {
+                'en': f"Our doctors: {names}. Would you like to book with any of them?",
+                'ru': f"Наши врачи: {names}. Хотите записаться к кому-то из них?",
+                'es': f"Nuestros doctores: {names}. ¿Le gustaría agendar con alguno?",
+            }
+        else:
+            templates = {
+                'en': "We have several experienced doctors. Would you like me to check availability?",
+                'ru': "У нас работают несколько опытных врачей. Хотите, проверю свободные окна?",
+                'es': "Tenemos varios doctores experimentados. ¿Quiere que revise disponibilidad?",
+            }
+        new_state = replace(
+            state,
+            awaiting_field='booking_confirmation',
+            pending_action={'type': 'start_booking'},
+        )
+        return new_state, [AskUser(
+            text=templates.get(lang, templates['en']),
+            field_awaiting='booking_confirmation'
+        )]
+
+    elif doctor_info_kind == "recommend":
+        # Safe recommendation: ask for service context first (avoid medical advice)
+        templates = {
+            'en': "To recommend the right doctor, what type of appointment do you need? Cleaning, consultation, or something else?",
+            'ru': "Чтобы порекомендовать врача, уточните: какой тип приёма вам нужен? Чистка, консультация, или что-то другое?",
+            'es': "Para recomendar un doctor, ¿qué tipo de cita necesita? ¿Limpieza, consulta u otro?",
+        }
+        new_state = replace(state, awaiting_field='service_type')
+        return new_state, [AskUser(
+            text=templates.get(lang, templates['en']),
+            field_awaiting='service_type'
+        )]
+
+    # Fallback - shouldn't reach here
+    return state, []

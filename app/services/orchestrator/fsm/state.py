@@ -78,9 +78,10 @@ class BookingState:
     doctor_id: Optional[str] = None
 
     # Patient info
-    patient_name: Optional[str] = None
-    patient_phone: Optional[str] = None
+    patient_name: Optional[str] = None      # Confirmed legal name for appointment
+    patient_phone: Optional[str] = None     # Validated E.164 phone number
     patient_id: Optional[str] = None
+    display_name: Optional[str] = None      # WhatsApp pushName (may be nickname)
 
     # Availability results
     available_slots: List[Dict[str, Any]] = field(default_factory=list)
@@ -94,6 +95,11 @@ class BookingState:
     has_pain: bool = False
     language: str = "en"
     clarification_count: int = 0
+
+    # Contextual response handling (for "да"/"yes" disambiguation)
+    awaiting_field: Optional[str] = None      # Persisted from AskUser.field_awaiting
+    pending_action: Optional[Dict[str, Any]] = None  # What "да" means in context
+    user_prefers_concise: bool = False        # User said "не надо примеры"
 
     # Idempotency - prevent duplicate bookings
     last_tool_call_id: Optional[str] = None  # Track to skip duplicate tool calls

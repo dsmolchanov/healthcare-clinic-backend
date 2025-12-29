@@ -83,12 +83,19 @@ def _extract_service_from_message(message: str) -> str | None:
 ROUTER_SYSTEM_PROMPT = """You are a medical clinic receptionist assistant router. Parse user messages and extract structured information.
 
 ROUTING RULES:
-- "scheduling": Booking, rescheduling, visiting, "come in", availability requests, pain/symptoms
+- "scheduling": Booking, rescheduling, visiting, "come in", availability requests WITH DATES/TIMES, pain/symptoms
 - "pricing": Cost, price, how much, fee questions
+- "doctor_info": Questions about if a doctor works here, who they are, recommendations (NOT availability with dates)
 - "cancel": Cancel, void, remove appointment
 - "info": Hours, location, address, phone, parking, current time questions, timezone questions, "what time is it"
 - "exit": Goodbye, thanks bye, done
 - "irrelevant": General knowledge (history, geography, math), politics, jokes, non-clinic topics, anything NOT about dental/medical appointments
+
+IMPORTANT - DOCTOR QUESTIONS:
+- "Does Dr. X work here?" / "Доктор X у вас работает?" (no date) → doctor_info (existence check)
+- "Is Dr. X available tomorrow?" / "Доктор X завтра работает?" (with date) → scheduling (availability check)
+- "Which doctor do you recommend?" → doctor_info
+- The key distinction: questions about EXISTENCE vs questions about AVAILABILITY on a specific date
 
 IMPORTANT:
 - Questions about current time ("what time is it", "what's the time there") are INFO queries, NOT scheduling.
@@ -153,6 +160,24 @@ User: "I meant Dr. Mark, not Dr. Marie"
 User: "а сегодня работает доктор Марк?"
 → {"route": "scheduling", "doctor_name": "доктор Марк", "target_date": "сегодня"}
 
+User: "Доктор Марк у вас работает?"
+→ {"route": "doctor_info", "doctor_name": "Марк", "doctor_info_kind": "exists"}
+
+User: "Does Dr. Smith work at your clinic?"
+→ {"route": "doctor_info", "doctor_name": "Dr. Smith", "doctor_info_kind": "exists"}
+
+User: "Who are your doctors?"
+→ {"route": "doctor_info", "doctor_info_kind": "list"}
+
+User: "Какие у вас врачи?"
+→ {"route": "doctor_info", "doctor_info_kind": "list"}
+
+User: "Which doctor do you recommend?"
+→ {"route": "doctor_info", "doctor_info_kind": "recommend"}
+
+User: "К какому врачу вы мне порекомендуете?"
+→ {"route": "doctor_info", "doctor_info_kind": "recommend"}
+
 Respond with JSON only. Include all fields you can extract."""
 
 
@@ -200,6 +225,7 @@ async def route_message(
 
         return RouterOutput(
             route=data.get('route', 'scheduling'),
+            doctor_info_kind=data.get('doctor_info_kind'),  # For doctor_info route
             service_type=data.get('service_type'),
             target_date=data.get('target_date'),
             time_of_day=data.get('time_of_day'),
@@ -215,6 +241,98 @@ async def route_message(
         logger.warning(f"Router LLM failed, using fallback: {e}")
         # Fallback to keyword-based routing
         return fallback_router(message, language)
+
+
+def has_temporal_tokens(text: str) -> bool:
+    """
+    Check if text contains date/time words that indicate scheduling intent.
+
+    If present, "работает" means "is working/available" not "is employed".
+
+    Args:
+        text: User's message text
+
+    Returns:
+        True if temporal tokens are present (→ scheduling)
+    """
+    text_lower = text.lower()
+
+    temporal_patterns = [
+        # Russian
+        r'сегодня|завтра|послезавтра',
+        r'в\s+(понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье)',
+        r'на\s+\d{1,2}',                    # на 10 (at 10)
+        r'утра|вечера|дня|днём',
+        r'\d{1,2}[:.]\d{2}',                # 10:00, 14.30
+        # English
+        r'today|tomorrow|next\s+\w+day|on\s+monday|at\s+\d',
+        r'this\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
+        # Spanish
+        r'hoy|mañana|próximo|el\s+lunes|a\s+las',
+    ]
+
+    for pattern in temporal_patterns:
+        if re.search(pattern, text_lower):
+            return True
+    return False
+
+
+def detect_doctor_info_intent(text: str) -> str | None:
+    """
+    Detect if user is asking about a doctor's existence/info, not availability.
+
+    IMPORTANT: If text contains temporal tokens, return None (→ scheduling).
+
+    Args:
+        text: User's message text
+
+    Returns:
+        Doctor info kind: "exists" | "list" | "recommend" | None
+    """
+    text_lower = text.lower()
+
+    # === TEMPORAL GUARD: If date/time words present, route to scheduling ===
+    if has_temporal_tokens(text_lower):
+        return None  # "работает завтра?" → scheduling
+
+    # === EXISTENCE patterns ===
+    existence_patterns = [
+        r'работает\s*(\?|$)',           # "работает?" at end (no date)
+        r'у вас работает',               # "у вас работает"
+        r'кто такой',                    # "кто такой доктор"
+        r'work here\??',                 # "does X work here?"
+        r'works? at.*clinic',            # "works at your clinic?"
+        r'trabaja aquí',                 # Spanish
+    ]
+    for pattern in existence_patterns:
+        if re.search(pattern, text_lower):
+            return "exists"
+
+    # === LIST patterns ===
+    list_patterns = [
+        r'какие.*врач',                  # "какие у вас врачи?"
+        r'кто.*работает',                # "кто у вас работает?" (no specific doctor)
+        r'who are.*doctor',              # "who are your doctors?"
+        r'list.*doctor',
+        r'cuáles.*doctor',               # Spanish
+    ]
+    for pattern in list_patterns:
+        if re.search(pattern, text_lower):
+            return "list"
+
+    # === RECOMMEND patterns ===
+    recommend_patterns = [
+        r'порекомендуй|рекомендуете|посоветуй',
+        r'к какому.*врач',               # "к какому врачу пойти?"
+        r'какому.*врач.*порекомендуете', # "какому врачу порекомендуете"
+        r'recommend|suggest',
+        r'recomend',                     # Spanish
+    ]
+    for pattern in recommend_patterns:
+        if re.search(pattern, text_lower):
+            return "recommend"
+
+    return None
 
 
 def fallback_router(message: str, language: str = "en") -> RouterOutput:
@@ -329,6 +447,20 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
     ]
     if any(kw in m for kw in irrelevant_patterns):
         return RouterOutput(route='irrelevant', language=language)
+
+    # === Doctor info detection (before scheduling default) ===
+    doctor_info_kind = detect_doctor_info_intent(m)
+    if doctor_info_kind:
+        # Extract doctor name if present
+        doctor_match = re.search(r'(?:dr\.?|doctor|доктор|врач)\s+([a-zA-Zа-яА-ЯёЁ]+)', m, re.IGNORECASE)
+        doctor_name = doctor_match.group(1).title() if doctor_match else None
+        logger.info(f"Doctor info intent detected: kind={doctor_info_kind}, doctor={doctor_name}")
+        return RouterOutput(
+            route='doctor_info',
+            doctor_info_kind=doctor_info_kind,
+            doctor_name=doctor_name,
+            language=language
+        )
 
     # Pain keywords (multilingual)
     has_pain = any(kw in m for kw in ['pain', 'hurt', 'ache', 'болит', 'dolor', 'duele', 'больно'])

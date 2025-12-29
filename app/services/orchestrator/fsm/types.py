@@ -6,7 +6,7 @@ These types define the interface between the FSM and the outside world:
 """
 
 from dataclasses import dataclass
-from typing import Union, Dict, Any, Optional
+from typing import Union, Dict, Any, Optional, Literal
 from enum import Enum, auto
 
 
@@ -78,7 +78,8 @@ class RouterOutput:
     Let Python tools (dateparser) resolve to actual datetimes.
 
     Attributes:
-        route: The intent route ("scheduling", "pricing", "info", "cancel", "exit")
+        route: The intent route ("scheduling", "pricing", "info", "doctor_info", "cancel", "exit")
+        doctor_info_kind: For doctor_info route: "exists" | "list" | "recommend"
         service_type: Type of service requested (e.g., "cleaning", "checkup")
         target_date: Raw date string (e.g., "tomorrow", "next tuesday")
         time_of_day: Raw time string (e.g., "morning", "2pm")
@@ -90,7 +91,8 @@ class RouterOutput:
         confidence: Router's confidence in the classification
         language: Detected language code (e.g., "en", "ru", "es")
     """
-    route: str  # "scheduling", "pricing", "info", "cancel", "exit"
+    route: str  # "scheduling", "pricing", "info", "doctor_info", "cancel", "exit"
+    doctor_info_kind: Optional[Literal["exists", "list", "recommend"]] = None  # For doctor_info route
     service_type: Optional[str] = None
     target_date: Optional[str] = None  # Raw string: "tomorrow", "next tuesday" - NOT ISO
     time_of_day: Optional[str] = None  # Raw string: "morning", "2pm" - NOT calculated
