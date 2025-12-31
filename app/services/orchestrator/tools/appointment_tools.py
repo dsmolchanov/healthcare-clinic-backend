@@ -397,11 +397,33 @@ class AppointmentTools:
                 except:
                     continue
 
-            # Handle natural language (simplified)
-            if "tomorrow" in date_str.lower():
-                return (datetime.now() + timedelta(days=1)).date()
-            elif "today" in date_str.lower():
+            # Handle natural language (simplified + multilingual)
+            date_lower = date_str.lower()
+
+            # Today
+            if any(kw in date_lower for kw in ["today", "сегодня", "hoy", "היום"]):
                 return datetime.now().date()
+
+            # Tomorrow
+            if any(kw in date_lower for kw in ["tomorrow", "завтра", "mañana", "מחר"]):
+                return (datetime.now() + timedelta(days=1)).date()
+
+            # This week - return next business day
+            if any(kw in date_lower for kw in ["this week", "на этой неделе", "esta semana", "השבוע"]):
+                today = datetime.now().date()
+                # Find next business day (Mon-Fri)
+                days_ahead = 1
+                while (today + timedelta(days=days_ahead)).weekday() >= 5:  # Skip weekends
+                    days_ahead += 1
+                return today + timedelta(days=days_ahead)
+
+            # Next week - return Monday of next week
+            if any(kw in date_lower for kw in ["next week", "на следующей неделе", "próxima semana", "שבוע הבא"]):
+                today = datetime.now().date()
+                days_until_monday = (7 - today.weekday()) % 7
+                if days_until_monday == 0:
+                    days_until_monday = 7  # If today is Monday, go to next Monday
+                return today + timedelta(days=days_until_monday)
 
             raise ValueError(f"Could not parse date: {date_str}")
 

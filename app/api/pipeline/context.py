@@ -89,7 +89,7 @@ class PipelineContext:
     lane_metadata: Dict[str, Any] = field(default_factory=dict)
 
     # ===== Language (set by RoutingStep or LanguageStep) =====
-    detected_language: str = "es"
+    detected_language: str = "en"  # Default to English (was "es" which caused Spanish fallbacks)
 
     # ===== Response (set by FastPath/LLM steps) =====
     response: Optional[str] = None

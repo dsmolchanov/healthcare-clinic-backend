@@ -192,11 +192,11 @@ class RoutingStep(PipelineStep):
     def _detect_language_fallback(self, text: str) -> str:
         """Fallback language detection using character analysis."""
         if not text:
-            return 'es'
+            return 'en'  # Default to English for empty text
 
         text_len = len(text)
         if text_len == 0:
-            return 'es'
+            return 'en'  # Default to English for empty text
 
         # Cyrillic → Russian
         cyrillic = sum(1 for c in text if '\u0400' <= c <= '\u04FF')

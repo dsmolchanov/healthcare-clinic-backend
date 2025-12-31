@@ -32,6 +32,7 @@ from app.services.orchestrator.fsm.state import (
 )
 from app.services.orchestrator.fsm import booking_fsm, pricing_fsm
 from app.services.orchestrator.fsm.router import route_message, fallback_router
+from app.services.orchestrator.fsm.text_utils import is_affirmative, is_rejection
 from app.tools.clinic_info_tool import ClinicInfoTool
 from app.config import get_redis_client
 # Preserve existing guardrails
@@ -297,6 +298,18 @@ class FSMOrchestrator:
             return await self._handle_cancel(message, language, serialized_state)
 
         if router_output.route == "irrelevant":
+            # CONTEXT-AWARE ROUTING: Check if this looks like a yes/no response
+            # before treating it as truly irrelevant. This catches typos like "Yse"
+            # that the LLM router might not recognize.
+            message_len = len(message.split())
+            if message_len <= 3:  # Short responses are likely yes/no
+                if is_affirmative(message, language) or is_rejection(message, language):
+                    # This is likely a yes/no response to a previous question
+                    # Route it through scheduling instead of irrelevant
+                    logger.info(f"[FSM] Rerouting short affirmative/rejection from 'irrelevant' to 'scheduling': {message}")
+                    return await self._handle_scheduling(
+                        message, router_output, fsm_state, language, tools_called
+                    )
             return await self._handle_irrelevant(message, language)
 
         # Default: scheduling (booking)

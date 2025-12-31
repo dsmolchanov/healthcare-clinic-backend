@@ -20,7 +20,9 @@ from typing import List, Set
 
 AFFIRMATIVES = {
     "ru": {"да", "ага", "угу", "конечно", "хорошо", "давай", "давайте", "запиши", "хочу", "ладно"},
-    "en": {"yes", "yeah", "yep", "sure", "ok", "okay", "please", "absolutely", "confirm"},
+    # Added common typos: "yse", "yas", "yea", "ye", "yess", "yees", "yup", "yeh"
+    "en": {"yes", "yeah", "yep", "sure", "ok", "okay", "please", "absolutely", "confirm",
+           "yse", "yas", "yea", "ye", "yess", "yees", "yup", "yeh"},
     "es": {"sí", "si", "claro", "ok", "bueno", "vale", "confirmo"},
     "he": {"כן", "בטח", "אוקי", "טוב", "בסדר", "נכון", "מעולה", "סבבה", "יופי", "אישור"},
 }
@@ -183,8 +185,10 @@ def is_confirmation(text: str, lang: str) -> bool:
         return False
 
     # Confirmation words (subset of affirmatives, more strict)
+    # Includes common typos: "yse", "yas", "yea", "ye", "yess"
     confirms = {
         "yes", "yeah", "yep", "sure", "ok", "okay", "confirm",
+        "yse", "yas", "yea", "ye", "yess", "yees", "yup", "yeh",  # Common typos
         "да", "хорошо", "ладно", "подтверждаю", "конечно",
         "sí", "si", "vale", "confirmo", "claro",
         "כן", "בסדר", "טוב", "אישור", "מאשר",  # Hebrew
