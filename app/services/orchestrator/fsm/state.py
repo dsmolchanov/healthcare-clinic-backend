@@ -117,27 +117,28 @@ class BookingState:
             object.__setattr__(self, 'stage', BookingStage.COMPLETE)
 
     def merge_router_output(self, router: 'RouterOutput') -> 'BookingState':
-        """Merge new info from router without overwriting existing values.
+        """Merge new info from router, allowing corrections to override.
 
-        IMPORTANT: Existing values are preserved. This prevents accidental
-        overwrites when the router extracts partial info. For intentional
-        changes (like backtracking), use explicit replace() in the FSM logic.
+        IMPORTANT: New router values take precedence over existing values.
+        This allows user corrections like "No, I meant Monday" to properly
+        update the date even if we already had "Tuesday" stored.
 
         Args:
             router: RouterOutput with newly extracted entities
 
         Returns:
-            New BookingState with merged values (existing preserved, gaps filled)
+            New BookingState with merged values (new values override existing)
         """
         return replace(
             self,
-            # Prioritize Self (existing) -> Fallback to Router (new)
-            service_type=self.service_type or router.service_type,
-            target_date=self.target_date or router.target_date,
-            time_of_day=self.time_of_day or router.time_of_day,
-            doctor_name=self.doctor_name or router.doctor_name,
-            patient_name=self.patient_name or router.patient_name,
-            patient_phone=self.patient_phone or router.patient_phone,
+            # Prioritize Router (new) -> Fallback to Self (existing)
+            # This allows corrections to work: "No, I meant Monday" overrides existing date
+            service_type=router.service_type or self.service_type,
+            target_date=router.target_date or self.target_date,
+            time_of_day=router.time_of_day or self.time_of_day,
+            doctor_name=router.doctor_name or self.doctor_name,
+            patient_name=router.patient_name or self.patient_name,
+            patient_phone=router.patient_phone or self.patient_phone,
             # Pain is additive - once mentioned, stays true
             has_pain=router.has_pain or self.has_pain,
         )
@@ -197,11 +198,13 @@ class PricingState:
         query: The user's pricing query
         results: List of pricing results
         language: Detected language code
+        is_correction: Whether user is correcting a previous response
     """
     stage: PricingStage = PricingStage.QUERY
     query: Optional[str] = None
     results: List[Dict[str, Any]] = field(default_factory=list)
     language: str = "en"
+    is_correction: bool = False  # Track if user is correcting us
 
 
 @dataclass

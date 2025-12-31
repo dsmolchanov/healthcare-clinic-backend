@@ -41,6 +41,55 @@ SERVICE_ALIASES_RU = {
 }
 
 
+def is_correction_message(text: str) -> bool:
+    """Detect if user message is correcting a previous response.
+
+    Patterns detected:
+    - "я спрашивал про X" (I asked about X)
+    - "нет, мне нужно X" (No, I need X)
+    - "это не то" (That's not it)
+    - "я имел в виду X" (I meant X)
+    - "а я про X" (but I meant X)
+
+    Args:
+        text: User message text
+
+    Returns:
+        True if this appears to be a correction
+    """
+    if not text:
+        return False
+
+    text_lower = text.lower()
+
+    # Correction patterns in Russian
+    correction_patterns_ru = [
+        r'спрашивал\s+(?:про|о|об)',      # "я спрашивал про"
+        r'имел\s+в\s+виду',                # "я имел в виду"
+        r'это\s+(?:не\s+то|другое)',       # "это не то" / "это другое"
+        r'нет,?\s+(?:мне|я)',              # "нет, мне нужно"
+        r'а\s+я\s+(?:про|о|об)',           # "а я про"
+        r'не\s+(?:это|то),?\s+а',          # "не это, а"
+    ]
+
+    # Correction patterns in English
+    correction_patterns_en = [
+        r'i\s+(?:asked|meant|wanted)',     # "I asked/meant/wanted"
+        r'no,?\s+i\s+(?:need|want)',       # "no, I need/want"
+        r"that'?s?\s+not\s+(?:it|what)",   # "that's not it"
+        r'i\s+was\s+asking\s+(?:about|for)',  # "I was asking about"
+    ]
+
+    all_patterns = correction_patterns_ru + correction_patterns_en
+
+    for pattern in all_patterns:
+        if re.search(pattern, text_lower):
+            logger.info(f"Detected correction pattern in: '{text[:50]}...'")
+            return True
+
+    return False
+
+
 def extract_service_keyword(text: str, language: str = 'ru') -> Optional[str]:
     """Extract service keyword from user text.
 
@@ -189,8 +238,8 @@ def step(state: PricingState, event: Event) -> Tuple[PricingState, List[Action]]
                 msg = get_no_results_message(lang, state.query)
                 return replace(state, stage=PricingStage.COMPLETE), [Respond(text=msg)]
 
-            # Format pricing response
-            response = format_pricing_response(results, lang)
+            # Format pricing response (with acknowledgment if this was a correction)
+            response = format_pricing_response(results, lang, is_correction=state.is_correction)
             return replace(state, stage=PricingStage.COMPLETE), [Respond(text=response)]
 
         # Unknown tool result
@@ -199,11 +248,16 @@ def step(state: PricingState, event: Event) -> Tuple[PricingState, List[Action]]
     # Handle user query
     assert isinstance(event, UserEvent)
 
+    # Detect if this is a correction message
+    correction_detected = is_correction_message(event.text)
+    if correction_detected:
+        logger.info(f"Correction detected in pricing query: '{event.text[:50]}...'")
+
     # Extract clean service query (uses router.service_type if available)
     clean_query = get_clean_query(event)
     logger.info(f"Pricing query: raw='{event.text[:50]}...' → clean='{clean_query}'")
 
-    state = replace(state, query=clean_query, language=event.language)
+    state = replace(state, query=clean_query, language=event.language, is_correction=correction_detected)
     lang = event.language
 
     if state.stage == PricingStage.QUERY:
@@ -215,12 +269,13 @@ def step(state: PricingState, event: Event) -> Tuple[PricingState, List[Action]]
     return state, [Respond(text=get_anything_else_message(lang))]
 
 
-def format_pricing_response(results: List[Dict[str, Any]], lang: str) -> str:
+def format_pricing_response(results: List[Dict[str, Any]], lang: str, is_correction: bool = False) -> str:
     """Format pricing results.
 
     Args:
         results: List of service pricing dictionaries
         lang: Language code
+        is_correction: Whether this is a response to a correction
 
     Returns:
         Formatted pricing response string
@@ -235,18 +290,29 @@ def format_pricing_response(results: List[Dict[str, Any]], lang: str) -> str:
         else:
             lines.append(f"• {name}: Price available upon consultation")
 
-    headers = {
-        'en': "Here are our prices:\n",
-        'ru': "Вот наши цены:\n",
-        'es': "Estos son nuestros precios:\n",
-    }
+    # Add acknowledgment prefix if this is a correction
+    if is_correction:
+        correction_ack = {
+            'en': "I apologize for the confusion. Here's what you asked for:\n",
+            'ru': "Прошу прощения за путаницу. Вот что вы спрашивали:\n",
+            'es': "Disculpe la confusión. Aquí está lo que preguntó:\n",
+        }
+        header = correction_ack.get(lang, correction_ack['en'])
+    else:
+        headers = {
+            'en': "Here are our prices:\n",
+            'ru': "Вот наши цены:\n",
+            'es': "Estos son nuestros precios:\n",
+        }
+        header = headers.get(lang, headers['en'])
+
     footers = {
         'en': "\n\nWould you like to book an appointment for any of these services?",
         'ru': "\n\nХотите записаться на какую-либо из этих услуг?",
         'es': "\n\n¿Le gustaría agendar una cita para alguno de estos servicios?",
     }
 
-    return headers.get(lang, headers['en']) + '\n'.join(lines) + footers.get(lang, footers['en'])
+    return header + '\n'.join(lines) + footers.get(lang, footers['en'])
 
 
 def get_no_results_message(lang: str, query: Optional[str] = None) -> str:

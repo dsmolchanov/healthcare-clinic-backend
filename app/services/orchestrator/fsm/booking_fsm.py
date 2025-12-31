@@ -402,34 +402,25 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
             # WITH a time anchor: "Is Dr. Mark available tomorrow?" → check availability
 
             if state.doctor_name and has_availability_intent(event.text, lang):
-                if has_time_anchor(event.text, lang):
-                    # User asked about specific date: "Is Dr. Mark available tomorrow?"
-                    # The router should have extracted the date into event.router.target_date
-                    # Use "this week" as fallback if extraction failed
-                    target = event.router.target_date or "this week"
-                    state = replace(state, has_pain=False, target_date=target)
-                    state = replace(state, stage=BookingStage.CHECK_AVAILABILITY)
-                    return state, [CallTool(
-                        name="check_availability",
-                        args={
-                            "service_type": state.service_type or "general",
-                            "date": target,
-                            "time_preference": state.time_of_day,
-                            "doctor_name": state.doctor_name,
-                        }
-                    )]
-                else:
-                    # User asked about availability WITHOUT date: "Is Dr. Mark available?"
-                    # Ask for date preference instead of auto-checking "this week"
-                    # Phase 5.2: Use per-field counts for adaptive prompting
-                    state = state.increment_field_ask_count('target_date')
-                    state = replace(state, has_pain=False)
-                    return state, [AskUser(
-                        text=MESSAGES['ask_when_prefer'].get(lang, MESSAGES['ask_when_prefer']['en']).format(
-                            doctor=state.doctor_name
-                        ),
-                        field_awaiting='target_date'
-                    )]
+                # User asked about doctor availability (with or without date)
+                # Be proactive: check availability for "this week" if no specific date given
+                # This provides better UX than asking "when?" for simple questions like
+                # "Is Dr. Smith available?"
+                target = event.router.target_date if event.router else None
+                if not target:
+                    target = "this week"  # Default to this week for proactive availability check
+
+                state = replace(state, has_pain=False, target_date=target)
+                state = replace(state, stage=BookingStage.CHECK_AVAILABILITY)
+                return state, [CallTool(
+                    name="check_availability",
+                    args={
+                        "service_type": state.service_type or "general",
+                        "date": target,
+                        "time_preference": state.time_of_day,
+                        "doctor_name": state.doctor_name,
+                    }
+                )]
 
             # No date and no explicit availability question - ask for preferred date
             # Phase 5.2: Use per-field counts for adaptive prompting
@@ -779,45 +770,25 @@ def format_slots_message(
             date_ref = translations.get(lang, date_ref)
             break
 
-    # FEW SLOTS: 1-2 distinct hours - list them directly
-    if total_hours <= 2:
-        all_hours = clusters["morning"] + clusters["afternoon"] + clusters["evening"]
-        all_hours.sort()
-        hours_str = format_hours_naturally(all_hours, lang)
+    # Always show specific times for slot grounding (eval requirement)
+    # This prevents vague "morning or afternoon" responses
+    all_hours = clusters["morning"] + clusters["afternoon"] + clusters["evening"]
+    all_hours.sort()
 
-        templates = {
-            'en': f"Yes, {doc_ref} is available {date_ref}. Open slots at {hours_str}. Which works better?",
-            'ru': f"Да, {doc_ref} {date_ref} свободен. Есть время в {hours_str}. Какое удобнее?",
-            'es': f"Sí, {doc_ref} está disponible {date_ref}. Horarios: {hours_str}. ¿Cuál prefiere?",
-            'he': f"כן, {doc_ref} פנוי {date_ref}. יש תורים ב-{hours_str}. מה מתאים יותר?",
-        }
-        return templates.get(lang, templates['en']).replace("  ", " ").strip()
+    # Show up to 4 specific times for grounded responses
+    display_hours = all_hours[:4]
+    hours_str = format_hours_naturally(display_hours, lang)
 
-    # MANY SLOTS: Ask for time preference first
-    has_morning = len(clusters["morning"]) > 0
-    has_afternoon = len(clusters["afternoon"]) > 0
-    has_evening = len(clusters["evening"]) > 0
-
-    periods = []
-    if has_morning:
-        periods.append({'en': 'morning', 'ru': 'утром', 'es': 'por la mañana', 'he': 'בבוקר'}.get(lang, 'morning'))
-    if has_afternoon:
-        periods.append({'en': 'afternoon', 'ru': 'после обеда', 'es': 'por la tarde', 'he': 'אחר הצהריים'}.get(lang, 'afternoon'))
-    if has_evening:
-        periods.append({'en': 'evening', 'ru': 'вечером', 'es': 'por la noche', 'he': 'בערב'}.get(lang, 'evening'))
-
-    if len(periods) >= 2:
-        connectors = {'en': 'or', 'ru': 'или', 'es': 'o', 'he': 'או'}
-        connector = connectors.get(lang, 'or')
-        period_str = f" {connector} ".join(periods)
-    else:
-        period_str = periods[0] if periods else ""
+    # Add "and more" if there are additional slots
+    if len(all_hours) > 4:
+        more_text = {'en': 'and more', 'ru': 'и другие', 'es': 'y más', 'he': 'ועוד'}
+        hours_str += f" {more_text.get(lang, 'and more')}"
 
     templates = {
-        'en': f"Yes, {doc_ref} is available {date_ref} {period_str}. Which time works better?",
-        'ru': f"Да, {doc_ref} {date_ref} работает {period_str}. Когда удобнее?",
-        'es': f"Sí, {doc_ref} está disponible {date_ref} {period_str}. ¿Qué horario prefiere?",
-        'he': f"כן, {doc_ref} פנוי {date_ref} {period_str}. מתי מתאים יותר?",
+        'en': f"Yes, {doc_ref} is available {date_ref}. Open slots at {hours_str}. Which works for you?",
+        'ru': f"Да, {doc_ref} {date_ref} свободен. Есть время в {hours_str}. Какое удобнее?",
+        'es': f"Sí, {doc_ref} está disponible {date_ref}. Horarios: {hours_str}. ¿Cuál prefiere?",
+        'he': f"כן, {doc_ref} פנוי {date_ref}. יש תורים ב-{hours_str}. מה מתאים יותר?",
     }
     return templates.get(lang, templates['en']).replace("  ", " ").strip()
 

@@ -171,6 +171,7 @@ async def run_evals():
             stack.enter_context(patch('app.services.tool_state_gate.ToolStateGate', return_value=mock_gate))
 
             # MessageContextHydrator (Replaces CacheService mock)
+            # Include WhatsApp phone for E2E booking scenarios that expect phone from context
             mock_hydrator = MagicMock()
             mock_hydrator.hydrate = AsyncMock(return_value={
                 'clinic': {
@@ -290,11 +291,46 @@ async def run_evals():
 
             # PriceQueryTool - patch where it's actually imported in healthcare_template.py
             mock_price_tool = MagicMock()
-            mock_price_tool.get_services_by_query = AsyncMock(return_value=[
-                {'name': 'Dental Cleaning', 'price': 100.0, 'base_price': 100.0},
-                {'name': 'Root Canal', 'price': 500.0, 'base_price': 500.0},
-                {'name': 'Teeth Whitening', 'price': 300.0, 'base_price': 300.0}
-            ])
+
+            # Dynamic pricing mock that returns query-appropriate services
+            # This fixes the "Pricing - Veneers" scenarios that were failing
+            async def smart_price_query(query: str, **kwargs):
+                """Return services matching the query with relevance scores."""
+                query_lower = query.lower() if query else ""
+
+                # Service catalog with pricing
+                all_services = {
+                    'veneers': {'name': 'Veneers', 'price': 800.0, 'base_price': 800.0, 'relevance_score': 0.95},
+                    'виниры': {'name': 'Veneers', 'price': 800.0, 'base_price': 800.0, 'relevance_score': 0.95},
+                    'cleaning': {'name': 'Dental Cleaning', 'price': 100.0, 'base_price': 100.0, 'relevance_score': 0.95},
+                    'чистка': {'name': 'Dental Cleaning', 'price': 100.0, 'base_price': 100.0, 'relevance_score': 0.95},
+                    'root canal': {'name': 'Root Canal', 'price': 500.0, 'base_price': 500.0, 'relevance_score': 0.95},
+                    'whitening': {'name': 'Teeth Whitening', 'price': 300.0, 'base_price': 300.0, 'relevance_score': 0.95},
+                    'отбеливание': {'name': 'Teeth Whitening', 'price': 300.0, 'base_price': 300.0, 'relevance_score': 0.95},
+                    'implants': {'name': 'Dental Implants', 'price': 2500.0, 'base_price': 2500.0, 'relevance_score': 0.95},
+                    'импланты': {'name': 'Dental Implants', 'price': 2500.0, 'base_price': 2500.0, 'relevance_score': 0.95},
+                    'crown': {'name': 'Dental Crown', 'price': 900.0, 'base_price': 900.0, 'relevance_score': 0.95},
+                    'коронка': {'name': 'Dental Crown', 'price': 900.0, 'base_price': 900.0, 'relevance_score': 0.95},
+                }
+
+                # Find matching services
+                results = []
+                for keyword, service in all_services.items():
+                    if keyword in query_lower:
+                        # Avoid duplicates (e.g., 'veneers' and 'виниры' both map to same service)
+                        if not any(r['name'] == service['name'] for r in results):
+                            results.append(service.copy())
+
+                # If no specific match, return empty (service not found)
+                # This triggers the "offer consultation" behavior
+                if not results:
+                    print(f"DEBUG: No pricing match for query '{query}' - returning empty")
+                    return []
+
+                print(f"DEBUG: Pricing query '{query}' matched: {[r['name'] for r in results]}")
+                return results
+
+            mock_price_tool.get_services_by_query = smart_price_query
             # Patch BOTH locations - the original handler and where healthcare_template imports it
             stack.enter_context(patch('app.services.tools.price_handler.PriceQueryTool', return_value=mock_price_tool))
             stack.enter_context(patch('app.tools.price_query_tool.PriceQueryTool', return_value=mock_price_tool))
@@ -304,12 +340,14 @@ async def run_evals():
             # Slots must use 'datetime' field in ISO format (not separate date/start_time)
             # This matches the real IntelligentScheduler output format
             # Slots are for Nov 27 (Thursday = tomorrow) and Nov 28 (Friday)
+            # Include 15:00 (3pm) for E2E booking scenarios that reference "3pm slot"
             mock_reservation_tools.check_availability_tool = AsyncMock(return_value={
                 'success': True,
                 'available_slots': [
                     {'datetime': '2025-11-27T09:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
                     {'datetime': '2025-11-27T10:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
                     {'datetime': '2025-11-27T14:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
+                    {'datetime': '2025-11-27T15:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
                     {'datetime': '2025-11-28T09:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
                     {'datetime': '2025-11-28T11:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'}
                 ],
@@ -418,14 +456,16 @@ async def run_evals():
                 date_iso = target_date.strftime('%Y-%m-%d')
 
                 # Return slots for the calculated date
+                # Include 15:00 (3pm) for E2E booking scenarios that reference "3pm slot"
                 return {
                     'success': True,
                     'available_slots': [
                         {'datetime': f'{date_iso}T09:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
                         {'datetime': f'{date_iso}T10:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
                         {'datetime': f'{date_iso}T14:00:00', 'doctor_name': 'Dr. Smith', 'doctor_id': 'doc-1'},
+                        {'datetime': f'{date_iso}T15:00:00', 'doctor_name': 'Dr. Shtern', 'doctor_id': 'doc-2'},
                     ],
-                    'message': f'Found 3 available slots for {date_iso}.'
+                    'message': f'Found 4 available slots for {date_iso}.'
                 }
 
             mock_appointment_tools.check_availability = smart_check_availability
@@ -438,9 +478,8 @@ async def run_evals():
                 'success': True,
                 'message': 'Appointment cancelled successfully'
             })
-            # Patch AppointmentTools class in the orchestrator template
+            # Patch AppointmentTools class in the orchestrator tools module
             mock_appointment_tools_class = MagicMock(return_value=mock_appointment_tools)
-            stack.enter_context(patch('app.services.orchestrator.templates.healthcare_template.AppointmentTools', mock_appointment_tools_class))
             stack.enter_context(patch('app.services.orchestrator.tools.appointment_tools.AppointmentTools', mock_appointment_tools_class))
 
         else:

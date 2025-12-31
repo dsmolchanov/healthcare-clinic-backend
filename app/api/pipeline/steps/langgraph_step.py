@@ -1,19 +1,19 @@
 """
-LangGraphExecutionStep - Route complex conversations through LangGraph or FSM orchestrator.
+FSMExecutionStep - Route complex conversations through FSM orchestrator.
 
-Phase 3B of the Agentic Flow Architecture Refactor.
+Phase 6 of the Agentic Flow Architecture Refactor.
 
-This step routes complex AI path conversations through either:
-- FSM orchestrator (USE_FSM_ORCHESTRATOR=true) - Pure Python state machine, fast and deterministic
-- LangGraph orchestrator (default) - Multi-node graph with LLM reasoning
+This step routes complex AI path conversations through the FSM orchestrator:
+- Pure Python state machine with deterministic behavior
+- Single LLM call (router) per turn
+- 87.5% eval pass rate achieved
 
 Usage:
-    - SCHEDULING/COMPLEX lanes are routed through orchestrator
+    - SCHEDULING/COMPLEX lanes are routed through FSM orchestrator
     - Falls through to LLMGenerationStep if skipped
 """
 
 import logging
-import os
 import time
 from typing import Dict, Tuple, Any, Optional
 
@@ -28,22 +28,17 @@ from app.services.orchestrator.thread_ids import make_thread_id, make_checkpoint
 
 logger = logging.getLogger(__name__)
 
-# Feature flag for FSM orchestrator
-# Phase 6: FSM is now the default orchestrator (87.5% eval pass rate achieved)
-# Set USE_FSM_ORCHESTRATOR=false to fall back to LangGraph if needed
-USE_FSM_ORCHESTRATOR = os.environ.get("USE_FSM_ORCHESTRATOR", "true").lower() == "true"
-
 
 class LangGraphExecutionStep(PipelineStep):
     """
-    Routes complex conversations through LangGraph orchestrator.
+    Routes complex conversations through FSM orchestrator.
 
     Used for:
     - Multi-turn booking flows (SCHEDULING lane)
     - Complex queries requiring multiple tool calls (COMPLEX lane)
     - Conversations requiring state tracking
 
-    Always enabled for SCHEDULING/COMPLEX lanes (feature flags removed in Phase 2).
+    Phase 6: Now uses pure FSM orchestrator (legacy LangGraph removed).
     """
 
     # In-memory state store for when Redis is unavailable (e.g., in evals)
@@ -144,30 +139,22 @@ class LangGraphExecutionStep(PipelineStep):
             # 7. Build initial state from pipeline context
             initial_state = self._build_orchestrator_state(ctx)
 
-            # 8. Execute orchestrator (FSM or LangGraph)
-            if USE_FSM_ORCHESTRATOR:
-                # FSM orchestrator - pass state for multi-turn persistence
-                fsm_state = self._load_fsm_state(ctx)
-                result = await orchestrator.process(
-                    message=ctx.message,
-                    session_id=session_id,
-                    state=fsm_state,
-                    language=ctx.detected_language or "en",
-                )
-            else:
-                # LangGraph orchestrator
-                result = await orchestrator.process(
-                    message=ctx.message,
-                    session_id=session_id,
-                    metadata=initial_state.get("metadata", {}),
-                    context=initial_state.get("context", {}),
-                )
+            # 8. Execute FSM orchestrator
+            fsm_state = self._load_fsm_state(ctx)
+            result = await orchestrator.process(
+                message=ctx.message,
+                session_id=session_id,
+                state=fsm_state,
+                language=ctx.detected_language or "en",
+                # Pass WhatsApp context for patient info pre-population
+                user_phone=ctx.from_phone,
+                user_name=ctx.profile_name,
+            )
 
             # 9. Extract response
             if result and result.get("response"):
                 ctx.response = result["response"]
-                ctx.response_metadata["langgraph"] = not USE_FSM_ORCHESTRATOR
-                ctx.response_metadata["fsm"] = USE_FSM_ORCHESTRATOR
+                ctx.response_metadata["fsm"] = True
                 ctx.response_metadata["orchestrator_audit"] = result.get("audit_trail", [])
                 ctx.response_metadata["langgraph_intent"] = result.get("intent")
                 ctx.response_metadata["route"] = result.get("route")
@@ -340,7 +327,7 @@ class LangGraphExecutionStep(PipelineStep):
             ctx.last_agent_action = result.get("pending_action")
 
         # Persist FSM state for multi-turn continuity
-        if USE_FSM_ORCHESTRATOR and ctx.session_id:
+        if ctx.session_id:
             fsm_state = result.get("state")
             if fsm_state:
                 # Try Redis first
@@ -404,28 +391,20 @@ class LangGraphExecutionStep(PipelineStep):
 
     async def _get_orchestrator(self, ctx: PipelineContext):
         """
-        Get or create orchestrator instance for clinic.
+        Get or create FSM orchestrator instance for clinic.
 
         Uses caching to avoid creating multiple instances per clinic.
-        Returns FSM orchestrator if USE_FSM_ORCHESTRATOR flag is set.
         """
         clinic_id = ctx.effective_clinic_id
+        cache_key = f"{clinic_id}_fsm"
 
-        # Check cache key includes orchestrator type
-        cache_key = f"{clinic_id}_{'fsm' if USE_FSM_ORCHESTRATOR else 'langgraph'}"
         if cache_key in self._orchestrator_cache:
             return self._orchestrator_cache[cache_key]
 
         try:
-            if USE_FSM_ORCHESTRATOR:
-                # Use FSM orchestrator - pure Python, fast and deterministic
-                return await self._create_fsm_orchestrator(ctx, cache_key)
-            else:
-                # Use LangGraph orchestrator - multi-node graph with LLM reasoning
-                return await self._create_langgraph_orchestrator(ctx, cache_key)
-
+            return await self._create_fsm_orchestrator(ctx, cache_key)
         except Exception as e:
-            logger.error(f"[Orchestrator] Failed to create orchestrator: {e}", exc_info=True)
+            logger.error(f"[FSM] Failed to create orchestrator: {e}", exc_info=True)
             return None
 
     async def _create_fsm_orchestrator(self, ctx: PipelineContext, cache_key: str):
@@ -467,36 +446,6 @@ class LangGraphExecutionStep(PipelineStep):
 
         self._orchestrator_cache[cache_key] = orchestrator
         logger.info(f"[FSM] Created FSM orchestrator for clinic {clinic_id}")
-
-        return orchestrator
-
-    async def _create_langgraph_orchestrator(self, ctx: PipelineContext, cache_key: str):
-        """Create LangGraph orchestrator instance."""
-        from app.services.orchestrator.templates.healthcare_template import HealthcareLangGraph
-
-        clinic_id = ctx.effective_clinic_id
-
-        # Build agent config from context
-        # Model selection: TIER_TOOL_CALLING_MODEL > default
-        primary_model = os.environ.get("TIER_TOOL_CALLING_MODEL", "gpt-5-mini")
-        agent_config = {
-            "llm_settings": {
-                "primary_model": primary_model,
-                "temperature": 0.7,
-                "max_tokens": 1024,
-            },
-            "capabilities": ["calendar_integration"] if ctx.clinic_profile else [],
-        }
-
-        # Create orchestrator
-        orchestrator = HealthcareLangGraph(
-            supabase_client=self.supabase,
-            clinic_id=clinic_id,
-            agent_config=agent_config,
-        )
-
-        self._orchestrator_cache[cache_key] = orchestrator
-        logger.info(f"[LangGraph] Created orchestrator for clinic {clinic_id}, cache size: {len(self._orchestrator_cache)}/{self._orchestrator_cache.maxsize}")
 
         return orchestrator
 

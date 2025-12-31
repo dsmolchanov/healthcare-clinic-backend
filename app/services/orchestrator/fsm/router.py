@@ -543,12 +543,47 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
                     target_date = f"this {day}" if 'this' in m or 'this' not in m else day
                     break
 
+    # Extract patient name from patterns like "I'm Sarah Miller", "My name is John"
+    patient_name = None
+    name_patterns = [
+        r"(?:i'?m|my name is|this is|i am)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",  # English
+        r"(?:меня зовут|я)\s+([А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)?)",  # Russian
+        r"(?:me llamo|soy)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",  # Spanish
+    ]
+    for pattern in name_patterns:
+        name_match = re.search(pattern, message, re.IGNORECASE)
+        if name_match:
+            patient_name = name_match.group(1).title()
+            logger.info(f"Extracted patient name from fallback: '{patient_name}'")
+            break
+
+    # Extract phone number from patterns like "555-111-2222", "555 1234", "(555) 123-4567"
+    patient_phone = None
+    phone_patterns = [
+        r'\b(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})\b',  # 555-111-2222, 555.111.2222, 555 111 2222
+        r'\b(\d{3}[-.\s]?\d{4})\b',  # 555-1234
+        r'\((\d{3})\)\s*(\d{3})[-.\s]?(\d{4})',  # (555) 123-4567
+    ]
+    for pattern in phone_patterns:
+        phone_match = re.search(pattern, message)
+        if phone_match:
+            # Normalize phone number
+            if len(phone_match.groups()) == 3:
+                # Handle (555) 123-4567 format
+                patient_phone = f"{phone_match.group(1)}-{phone_match.group(2)}-{phone_match.group(3)}"
+            else:
+                patient_phone = phone_match.group(1)
+            logger.info(f"Extracted patient phone from fallback: '{patient_phone}'")
+            break
+
     # Default to scheduling
     return RouterOutput(
         route='scheduling',
         service_type=service_type,
         target_date=target_date,
         doctor_name=doctor_name,
+        patient_name=patient_name,
+        patient_phone=patient_phone,
         has_pain=has_pain,
         language=language
     )
