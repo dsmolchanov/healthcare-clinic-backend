@@ -4,6 +4,7 @@ RoutingStep - Route message to appropriate lane and handle fast-path queries.
 Extracted from process_message() lines 489-580.
 
 Phase 2A of the Agentic Flow Architecture Refactor.
+Phase 5.2: Added language inertia to prevent flip-flopping on short messages.
 """
 
 import logging
@@ -12,6 +13,7 @@ from typing import Tuple
 
 from ..base import PipelineStep
 from ..context import PipelineContext
+from app.services.language_fallback_service import LanguageFallbackService
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ class RoutingStep(PipelineStep):
         self._router_service = router_service
         self._fast_path_service = fast_path_service
         self._memory_manager = memory_manager
+        self._language_fallback_service = LanguageFallbackService()
 
     @property
     def name(self) -> str:
@@ -67,11 +70,8 @@ class RoutingStep(PipelineStep):
         - (ctx, False) if fast-path handled response
         - (ctx, True) to continue to LLM generation
         """
-        # 1. Detect language
-        if self._language_service:
-            ctx.detected_language = self._language_service.detect_sync(ctx.message)
-        else:
-            ctx.detected_language = self._detect_language_fallback(ctx.message)
+        # 1. Detect language with inertia (prevents flip-flopping on short messages)
+        ctx.detected_language = await self._detect_language_with_inertia(ctx)
 
         # 2. Extract name from message
         ctx.extracted_first_name, ctx.extracted_last_name = self._extract_name_from_message(ctx.message)
@@ -163,6 +163,58 @@ class RoutingStep(PipelineStep):
             )
 
         return None
+
+    async def _detect_language_with_inertia(self, ctx: PipelineContext) -> str:
+        """
+        Detect language with session inertia for short/ambiguous messages.
+
+        Phase 5.2: Language Inertia Implementation
+
+        Rules:
+        1. If message < 4 words OR < 20 chars → use session_language (bypass detector)
+        2. If detector confidence < 80% → use session_language
+        3. Otherwise → update session_language with new detection
+
+        This prevents language flip-flopping on:
+        - Short responses ("да", "ok", "yse")
+        - Typos that look like other languages ("Impalnts")
+        - Confirmations with minimal text
+
+        Args:
+            ctx: Pipeline context with message and session_language
+
+        Returns:
+            Detected language code
+        """
+        message = ctx.message.strip()
+        word_count = len(message.split())
+        char_count = len(message)
+
+        # Rule 1: Short text bypass - don't trust detector on minimal input
+        if word_count < 4 or char_count < 20:
+            if ctx.session_language:
+                logger.info(
+                    f"[Language] Short text bypass: keeping session_language={ctx.session_language} "
+                    f"(words={word_count}, chars={char_count})"
+                )
+                return ctx.session_language
+
+        # Detect fresh using language service or fallback
+        if self._language_service:
+            detected = self._language_service.detect_sync(message)
+        else:
+            detected = self._detect_language_fallback(message)
+
+        # Rule 2: Low confidence check (if service supports it)
+        # For now, trust detection on substantial text
+
+        # Rule 3: Update session language on substantial text
+        if word_count >= 4 and char_count >= 20:
+            if ctx.session_language != detected:
+                logger.info(f"[Language] Updating session_language: {ctx.session_language} → {detected}")
+            ctx.session_language = detected
+
+        return detected
 
     def _build_router_context(self, ctx: PipelineContext) -> dict:
         """Build context dictionary for router service."""

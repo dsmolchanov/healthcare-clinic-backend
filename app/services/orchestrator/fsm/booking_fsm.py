@@ -21,12 +21,14 @@ from .state import BookingState, BookingStage
 from app.services.reminder_templates import format_confirmation_message as format_sota_confirmation
 
 # Phase 5.1: Import robust multilingual text utilities
+# Phase 5.2: Added has_time_anchor for auto-availability guard
 from .text_utils import (
     is_affirmative as _is_affirmative,
     is_confirmation,
     is_rejection,
     normalize_tokens,
     has_availability_intent,
+    has_time_anchor,
 )
 
 
@@ -37,6 +39,13 @@ MESSAGES = {
         'ru': "Какой тип приёма вам нужен? Мы предлагаем чистку, осмотр, консультацию и другое.",
         'es': "Qué tipo de cita necesita? Ofrecemos limpiezas, chequeos, consultas y más.",
         'he': "איזה סוג תור אתה צריך? אנחנו מציעים ניקוי, בדיקה, ייעוץ ועוד.",
+    },
+    # Phase 5.2: New template for doctor availability without date
+    'ask_when_prefer': {
+        'en': "When would you like to see {doctor}? You can say a date like 'tomorrow' or 'next Monday'.",
+        'ru': "Когда вы хотели бы к {doctor}? Можете сказать дату, например 'завтра' или 'в понедельник'.",
+        'es': "¿Cuándo le gustaría ver a {doctor}? Puede decir una fecha como 'mañana' o 'el lunes'.",
+        'he': "מתי תרצה להיפגש עם {doctor}? אפשר לומר תאריך כמו 'מחר' או 'ביום שני'.",
     },
     'ask_date': {
         'en': "When would you like to come in? You can say something like 'tomorrow at 2pm' or 'next Monday morning'.",
@@ -327,14 +336,16 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
             action = state.pending_action
             if action.get('type') == 'start_booking':
                 # Proceed to date collection with doctor pre-filled (if any)
+                # Phase 5.2: Increment per-field ask count for adaptive prompting
+                new_state = state.increment_field_ask_count('target_date')
                 new_state = replace(
-                    state,
+                    new_state,
                     stage=BookingStage.COLLECT_DATE,
                     awaiting_field=None,
                     pending_action=None,
                 )
                 return new_state, [AskUser(
-                    text=get_date_prompt(lang, state.clarification_count, state.user_prefers_concise),
+                    text=get_date_prompt(lang, new_state.get_field_ask_count('target_date'), new_state.user_prefers_concise),
                     field_awaiting='target_date'
                 )]
 
@@ -380,29 +391,62 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
     # ==========================================
     if state.stage == BookingStage.COLLECT_DATE:
         if not state.target_date:
-            # Phase 5.1: Availability intent guardrail
-            # Only auto-check availability if user EXPLICITLY asked about it
-            # This prevents "Да, мне нужно отбеливание" from triggering check_availability
+            # Phase 5.2: STRICT GUARD for auto-availability shortcut
+            # Only auto-check availability when:
+            # 1. User explicitly asked about availability (has_availability_intent)
+            # 2. Message contains a time anchor (has_time_anchor) - specific date/time
+            # 3. We're NOT awaiting a confirmation or service selection
+            # 4. Doctor name is mentioned
+            #
+            # WITHOUT a time anchor: "Is Dr. Mark available?" → ASK for date preference
+            # WITH a time anchor: "Is Dr. Mark available tomorrow?" → check availability
+
             if state.doctor_name and has_availability_intent(event.text, lang):
-                # User asked about doctor availability explicitly
-                # e.g., "Доктор Штерн свободен?" "Is Dr. Smith available?"
-                state = replace(state, has_pain=False, target_date="this week")
-                state = replace(state, stage=BookingStage.CHECK_AVAILABILITY)
-                return state, [CallTool(
-                    name="check_availability",
-                    args={
-                        "service_type": state.service_type or "general",
-                        "date": "this week",
-                        "time_preference": state.time_of_day,
-                        "doctor_name": state.doctor_name,
-                    }
-                )]
+                if has_time_anchor(event.text, lang):
+                    # User asked about specific date: "Is Dr. Mark available tomorrow?"
+                    # The router should have extracted the date into event.router.target_date
+                    # Use "this week" as fallback if extraction failed
+                    target = event.router.target_date or "this week"
+                    state = replace(state, has_pain=False, target_date=target)
+                    state = replace(state, stage=BookingStage.CHECK_AVAILABILITY)
+                    return state, [CallTool(
+                        name="check_availability",
+                        args={
+                            "service_type": state.service_type or "general",
+                            "date": target,
+                            "time_preference": state.time_of_day,
+                            "doctor_name": state.doctor_name,
+                        }
+                    )]
+                else:
+                    # User asked about availability WITHOUT date: "Is Dr. Mark available?"
+                    # Ask for date preference instead of auto-checking "this week"
+                    # Phase 5.2: Use per-field counts for adaptive prompting
+                    state = state.increment_field_ask_count('target_date')
+                    state = replace(state, has_pain=False)
+                    return state, [AskUser(
+                        text=MESSAGES['ask_when_prefer'].get(lang, MESSAGES['ask_when_prefer']['en']).format(
+                            doctor=state.doctor_name
+                        ),
+                        field_awaiting='target_date'
+                    )]
 
             # No date and no explicit availability question - ask for preferred date
-            # Clear pain flag after using empathy
+            # Phase 5.2: Use per-field counts for adaptive prompting
+            state = state.increment_field_ask_count('target_date')
+            date_ask_count = state.get_field_ask_count('target_date')
             state = replace(state, has_pain=False)
+
+            # Use adaptive prompt verbosity based on ask count
+            if date_ask_count >= 2:
+                date_prompt = {'en': "When?", 'ru': "Когда?", 'es': "¿Cuándo?", 'he': "מתי?"}.get(lang, "When?")
+            elif date_ask_count == 1:
+                date_prompt = get_msg('ask_date', lang)  # Medium verbosity
+            else:
+                date_prompt = empathy + get_msg('ask_date', lang)  # Full verbosity with empathy
+
             return state, [AskUser(
-                text=empathy + get_msg('ask_date', lang),
+                text=date_prompt,
                 field_awaiting='target_date'
             )]
 
@@ -1004,9 +1048,11 @@ def _wants_concise_prompts(text: str) -> bool:
     return any(signal in text_lower for signal in concise_signals)
 
 
-def get_date_prompt(lang: str, clarification_count: int, user_prefers_concise: bool = False) -> str:
+def get_date_prompt(lang: str, field_ask_count: int, user_prefers_concise: bool = False) -> str:
     """
-    Get date prompt with decreasing verbosity based on clarification count.
+    Get date prompt with decreasing verbosity based on field-specific ask count.
+
+    Phase 5.2: Updated to use per-field ask counts instead of global clarification_count.
 
     - user_prefers_concise=True: Always use shortest form
     - count 0: Full prompt with examples
@@ -1015,7 +1061,7 @@ def get_date_prompt(lang: str, clarification_count: int, user_prefers_concise: b
 
     Args:
         lang: Language code
-        clarification_count: Number of times we've re-prompted
+        field_ask_count: Number of times we've asked for THIS field (not global)
         user_prefers_concise: Whether user asked for short prompts
 
     Returns:
@@ -1026,14 +1072,14 @@ def get_date_prompt(lang: str, clarification_count: int, user_prefers_concise: b
         prompts = {'en': "When?", 'ru': "Когда?", 'es': "¿Cuándo?", 'he': "מתי?"}
         return prompts.get(lang, prompts['en'])
 
-    if clarification_count == 0:
+    if field_ask_count == 0:
         prompts = {
             'en': "When would you like to come? You can say 'tomorrow at 2pm' or 'next Monday morning'.",
             'ru': "Когда вы хотели бы прийти? Можете сказать 'завтра в 14:00' или 'в следующий понедельник утром'.",
             'es': "¿Cuándo le gustaría venir? Puede decir 'mañana a las 2pm' o 'el próximo lunes por la mañana'.",
             'he': "מתי תרצה להגיע? אפשר להגיד 'מחר ב-14:00' או 'יום שני הבא בבוקר'.",
         }
-    elif clarification_count == 1:
+    elif field_ask_count == 1:
         prompts = {
             'en': "What day works for you?",
             'ru': "Какой день вам удобен?",

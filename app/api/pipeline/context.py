@@ -90,6 +90,7 @@ class PipelineContext:
 
     # ===== Language (set by RoutingStep or LanguageStep) =====
     detected_language: str = "en"  # Default to English (was "es" which caused Spanish fallbacks)
+    session_language: Optional[str] = None  # Language from previous turns (sticky)
 
     # ===== Response (set by FastPath/LLM steps) =====
     response: Optional[str] = None
@@ -128,6 +129,7 @@ class PipelineContext:
             'lane': self.lane,
             'has_response': self.response is not None,
             'detected_language': self.detected_language,
+            'session_language': self.session_language,
             'step_timings': dict(self.step_timings),
             'constraints_active': bool(
                 self.constraints and (

@@ -117,6 +117,12 @@ class SessionManagementStep(PipelineStep):
             ctx.session = session_ctx.session_obj
             ctx.is_new_session = session_ctx.is_new_session
             ctx.previous_session_summary = session_ctx.previous_session_summary
+
+            # Phase 5.2: Load session language for language inertia
+            # Priority: session → patient profile preferred_language
+            if ctx.session and ctx.session.get('session_language'):
+                ctx.session_language = ctx.session['session_language']
+                logger.info(f"[Language] Loaded session_language from session: {ctx.session_language}")
         else:
             # Fallback: generate session ID if no controller
             ctx.session_id = str(uuid.uuid4())

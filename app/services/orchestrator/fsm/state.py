@@ -101,6 +101,11 @@ class BookingState:
     pending_action: Optional[Dict[str, Any]] = None  # What "да" means in context
     user_prefers_concise: bool = False        # User said "не надо примеры"
 
+    # Phase 5.2: Per-field ask counts for adaptive prompting
+    # Tracks how many times we've asked for each field
+    # Format: {"target_date": 2, "patient_name": 1}
+    field_ask_counts: Dict[str, int] = field(default_factory=dict)
+
     # Idempotency - prevent duplicate bookings
     last_tool_call_id: Optional[str] = None  # Track to skip duplicate tool calls
 
@@ -136,6 +141,51 @@ class BookingState:
             # Pain is additive - once mentioned, stays true
             has_pain=router.has_pain or self.has_pain,
         )
+
+    def increment_field_ask_count(self, field_name: str) -> 'BookingState':
+        """
+        Increment the ask count for a specific field.
+
+        Phase 5.2: Used for adaptive prompting - shorten prompts
+        when we've asked for the same field multiple times.
+
+        Args:
+            field_name: Name of the field being asked for
+
+        Returns:
+            New BookingState with incremented count
+        """
+        new_counts = dict(self.field_ask_counts)
+        new_counts[field_name] = new_counts.get(field_name, 0) + 1
+        return replace(self, field_ask_counts=new_counts)
+
+    def get_field_ask_count(self, field_name: str) -> int:
+        """
+        Get how many times we've asked for a specific field.
+
+        Args:
+            field_name: Name of the field
+
+        Returns:
+            Number of times we've asked for this field
+        """
+        return self.field_ask_counts.get(field_name, 0)
+
+    def reset_field_ask_count(self, field_name: str) -> 'BookingState':
+        """
+        Reset the ask count for a field (when user provides new info).
+
+        Phase 5.2: Decay logic - reset when user provides substantive input.
+
+        Args:
+            field_name: Name of the field to reset
+
+        Returns:
+            New BookingState with reset count
+        """
+        new_counts = dict(self.field_ask_counts)
+        new_counts[field_name] = 0
+        return replace(self, field_ask_counts=new_counts)
 
 
 @dataclass

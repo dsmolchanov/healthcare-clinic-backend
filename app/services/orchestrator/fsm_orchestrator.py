@@ -47,6 +47,56 @@ from app.services.orchestrator.templates.handlers.phi_handler import (
 logger = logging.getLogger(__name__)
 
 
+# ==========================================
+# Phase 5.2: Tangent Resolution
+# ==========================================
+
+class TangentResolver:
+    """
+    Resolve tangent routes before they reach FSM state machine.
+
+    Phase 5.2: Unified preflight for tangent handling.
+
+    Tangents are questions that temporarily interrupt the booking flow
+    but don't reset the state. Examples:
+    - "Does Dr. Mark work here?" (doctor_info)
+    - "How much is a cleaning?" (pricing)
+    - "What are your hours?" (clinic_hours)
+
+    Key insight: Only handle as tangent when in ACTIVE booking flow.
+    At INTENT or COMPLETE stages, these should start fresh flows.
+    """
+
+    # Routes that should be handled as tangents (don't modify booking state)
+    TANGENT_ROUTES = {'doctor_info', 'pricing', 'info'}
+
+    def should_handle_as_tangent(
+        self,
+        route: str,
+        current_stage: BookingStage
+    ) -> bool:
+        """
+        Return True if this route should be handled as a tangent.
+
+        Args:
+            route: Router output route string
+            current_stage: Current FSM stage
+
+        Returns:
+            True if should handle as tangent (preserve booking state)
+
+        Examples:
+            - INTENT + doctor_info → False (start booking with doctor)
+            - COLLECT_DATE + pricing → True (answer price, return to date)
+            - COMPLETE + info → False (just answer info)
+        """
+        # Only handle tangents when in ACTIVE booking flow
+        if current_stage in {BookingStage.INTENT, BookingStage.COMPLETE}:
+            return False
+
+        return route in self.TANGENT_ROUTES
+
+
 def validate_phone_number(phone: Optional[str], default_region: str = "MX") -> Optional[str]:
     """
     Validate and normalize phone number.
@@ -122,6 +172,9 @@ class FSMOrchestrator:
         self.clinic_profile = clinic_profile or {}
         self.appointment_tools = appointment_tools
         self.price_tool = price_tool
+
+        # Phase 5.2: Tangent resolver for handling interruptions
+        self._tangent_resolver = TangentResolver()
 
         # Tool registry - maps tool names to handlers
         self.tool_registry: Dict[str, Callable[..., Awaitable[Dict[str, Any]]]] = {}
@@ -280,17 +333,43 @@ class FSMOrchestrator:
                 "guardrail_triggered": False,
             }
 
-        # Handle doctor_info tangent (fetch doctor list from DB)
+        # Phase 5.2: Check if this route should be handled as a tangent
+        # Tangents preserve booking state while answering side questions
+        is_tangent = self._tangent_resolver.should_handle_as_tangent(
+            router_output.route, fsm_state.stage
+        )
+
+        # Handle doctor_info (tangent or new flow depending on stage)
         if router_output.route == "doctor_info":
-            return await self._handle_doctor_info(
+            result = await self._handle_doctor_info(
                 router_output, fsm_state, language
             )
+            # Phase 5.2: If tangent, preserve original booking state
+            if is_tangent:
+                result["state"] = self._serialize_state(fsm_state)
+                result["is_tangent"] = True
+                logger.info(f"[FSM] Handled doctor_info as tangent (stage={fsm_state.stage.name})")
+            return result
 
+        # Handle info queries (tangent or standalone)
         if router_output.route == "info":
-            return await self._handle_info(message, language)
+            result = await self._handle_info(message, language)
+            # Phase 5.2: If tangent, preserve booking state
+            if is_tangent:
+                result["state"] = self._serialize_state(fsm_state)
+                result["is_tangent"] = True
+                logger.info(f"[FSM] Handled info as tangent (stage={fsm_state.stage.name})")
+            return result
 
+        # Handle pricing queries (tangent or standalone)
         if router_output.route == "pricing":
-            return await self._handle_pricing(message, router_output, language)
+            result = await self._handle_pricing(message, router_output, language)
+            # Phase 5.2: If tangent, preserve booking state
+            if is_tangent:
+                result["state"] = self._serialize_state(fsm_state)
+                result["is_tangent"] = True
+                logger.info(f"[FSM] Handled pricing as tangent (stage={fsm_state.stage.name})")
+            return result
 
         if router_output.route == "cancel":
             # Pass serialized state for appointment_id lookup
@@ -730,6 +809,8 @@ class FSMOrchestrator:
                 awaiting_field=state_dict.get('awaiting_field'),
                 pending_action=state_dict.get('pending_action'),
                 user_prefers_concise=state_dict.get('user_prefers_concise', False),
+                # Phase 5.2: Per-field ask counts for adaptive prompting
+                field_ask_counts=state_dict.get('field_ask_counts', {}),
             )
         except Exception as e:
             logger.warning(f"Failed to load state, starting fresh: {e}")
@@ -762,6 +843,8 @@ class FSMOrchestrator:
             'awaiting_field': state.awaiting_field,
             'pending_action': state.pending_action,
             'user_prefers_concise': state.user_prefers_concise,
+            # Phase 5.2: Per-field ask counts for adaptive prompting
+            'field_ask_counts': state.field_ask_counts,
         }
 
     def _get_goodbye(self, language: str) -> str:

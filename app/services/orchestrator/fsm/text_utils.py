@@ -2,16 +2,18 @@
 Unicode-safe text utilities for multilingual WhatsApp input.
 
 Phase 5.1: Robust multilingual tokenization and intent detection.
+Phase 5.2: Added Levenshtein distance fuzzy matching for service names.
 
 Key improvements over naive split()/strip():
 1. Unicode normalization (NFKC) handles full-width chars, combined accents
 2. Punctuation removal by Unicode category (not hardcoded ASCII list)
 3. Negation-first checking prevents "не хочу" → True false positives
 4. Language-scoped matching with English fallback
+5. Fuzzy matching for typos like "Impalnts" → "implants"
 """
 import re
 import unicodedata
-from typing import List, Set
+from typing import List, Set, Optional
 
 
 # ==========================================
@@ -40,6 +42,103 @@ REJECTIONS = {
     "es": {"no", "cancelar", "nunca"},
     "he": {"לא", "ביטול", "לבטל", "עזוב", "תעזוב"},
 }
+
+
+# ==========================================
+# Phase 5.2: Levenshtein Distance Fuzzy Matching
+# ==========================================
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """
+    Calculate Levenshtein (edit) distance between two strings.
+
+    The edit distance is the minimum number of single-character edits
+    (insertions, deletions, substitutions) required to change one
+    string into the other.
+
+    Args:
+        s1: First string
+        s2: Second string
+
+    Returns:
+        Integer edit distance
+
+    Examples:
+        >>> levenshtein_distance("implants", "Impalnts")
+        2  # Two substitutions needed
+        >>> levenshtein_distance("cleaning", "cleannig")
+        2  # Two transpositions
+    """
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+# Service keywords for fuzzy matching (subset of router.py keywords)
+SERVICE_KEYWORDS_FLAT = {
+    'cleaning': ['cleaning', 'clean'],
+    'checkup': ['checkup', 'check-up', 'exam'],
+    'consultation': ['consultation', 'consult'],
+    'filling': ['filling', 'cavity'],
+    'extraction': ['extraction', 'pull'],
+    'whitening': ['whitening', 'bleach'],
+    'veneers': ['veneers', 'veneer'],
+    'implants': ['implants', 'implant'],
+    'crown': ['crown', 'crowns'],
+    'root canal': ['root canal', 'rootcanal'],
+}
+
+
+def fuzzy_match_service(word: str, threshold: int = 2) -> Optional[str]:
+    """
+    Fuzzy match a word to known service types using Levenshtein distance.
+
+    Phase 5.2: Handles common typos like "Impalnts" → "implants"
+
+    Args:
+        word: Input word (potentially misspelled)
+        threshold: Maximum edit distance to accept (default 2)
+
+    Returns:
+        Matched service name or None if no match within threshold
+
+    Examples:
+        >>> fuzzy_match_service("Impalnts")
+        'implants'
+        >>> fuzzy_match_service("cleannig")
+        'cleaning'
+        >>> fuzzy_match_service("xyz")
+        None  # No match within threshold
+    """
+    word_lower = word.lower().strip()
+    if len(word_lower) < 4:  # Too short to fuzzy match reliably
+        return None
+
+    best_match = None
+    best_distance = threshold + 1
+
+    for service, keywords in SERVICE_KEYWORDS_FLAT.items():
+        for kw in keywords:
+            dist = levenshtein_distance(word_lower, kw.lower())
+            if dist < best_distance:
+                best_distance = dist
+                best_match = service
+
+    if best_distance <= threshold:
+        return best_match
+    return None
 
 
 # ==========================================
@@ -301,3 +400,60 @@ def has_availability_intent(text: str, lang: str) -> bool:
 
     # Check for any availability keyword
     return any(t in kw_set for t in tokens)
+
+
+# ==========================================
+# Phase 5.2: Time anchor detection
+# ==========================================
+
+def has_time_anchor(text: str, lang: str = "en") -> bool:
+    """
+    Check if text contains a time/date anchor.
+
+    Phase 5.2: Used to distinguish:
+    - "Does Dr. Mark work here?" (no anchor → doctor_info)
+    - "Is Dr. Mark available tomorrow?" (has anchor → scheduling)
+
+    This guards the auto-availability shortcut to only fire on
+    explicit scheduling questions, not general doctor info queries.
+
+    Args:
+        text: User's message text
+        lang: Language code (checks all languages for anchors)
+
+    Returns:
+        True if text contains a time/date anchor
+
+    Examples:
+        >>> has_time_anchor("Is Dr. Mark available?", "en")
+        False  # No date/time specified
+        >>> has_time_anchor("Is Dr. Mark available tomorrow?", "en")
+        True  # "tomorrow" is a time anchor
+        >>> has_time_anchor("Dr. Mark at 2pm?", "en")
+        True  # "2pm" is a time anchor
+    """
+    text_lower = text.lower()
+
+    time_anchors = {
+        'en': ['today', 'tomorrow', 'monday', 'tuesday', 'wednesday', 'thursday',
+               'friday', 'saturday', 'sunday', 'next week', 'this week', 'morning',
+               'afternoon', 'evening', 'at ', 'pm', 'am'],
+        'ru': ['сегодня', 'завтра', 'понедельник', 'вторник', 'среда', 'четверг',
+               'пятница', 'суббота', 'воскресенье', 'утром', 'вечером', 'днём',
+               'на следующей неделе', 'на этой неделе', 'в '],
+        'es': ['hoy', 'mañana', 'lunes', 'martes', 'miércoles', 'jueves',
+               'viernes', 'sábado', 'domingo', 'próxima semana', 'esta semana'],
+        'he': ['היום', 'מחר', 'יום ראשון', 'יום שני', 'בוקר', 'ערב'],
+    }
+
+    # Check all language anchors (user might mix)
+    for anchors in time_anchors.values():
+        for anchor in anchors:
+            if anchor in text_lower:
+                return True
+
+    # Check for time patterns like "10:00", "2pm", "14:30"
+    if re.search(r'\d{1,2}[:.]\d{2}|\d{1,2}\s*[ap]m', text_lower):
+        return True
+
+    return False

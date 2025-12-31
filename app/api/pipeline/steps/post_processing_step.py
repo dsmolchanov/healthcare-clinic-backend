@@ -183,6 +183,10 @@ class PostProcessingStep(PipelineStep):
 
                 await self._schedule_followup(ctx, response_analysis)
 
+        # 7.5. Phase 5.2: Persist session language for language inertia
+        if self._supabase and ctx.session_id and ctx.session_language:
+            await self._update_session_language(ctx)
+
         # 8. Build final response metadata
         ctx.response_metadata = {
             "message_count": len(ctx.session_messages) + 2,
@@ -262,3 +266,25 @@ class PostProcessingStep(PipelineStep):
                 )
         except Exception as e:
             logger.error(f"Failed to schedule follow-up: {e}")
+
+    async def _update_session_language(self, ctx: PipelineContext):
+        """
+        Persist session language to database for language inertia.
+
+        Phase 5.2: This ensures that the detected language persists
+        across turns, preventing flip-flopping on short messages.
+
+        Args:
+            ctx: Pipeline context with session_id and session_language
+        """
+        if not self._supabase or not ctx.session_id or not ctx.session_language:
+            return
+
+        try:
+            self._supabase.table('conversation_sessions').update({
+                'session_language': ctx.session_language,
+                'updated_at': datetime.utcnow().isoformat()
+            }).eq('id', ctx.session_id).execute()
+            logger.debug(f"[Language] Persisted session_language={ctx.session_language} to session")
+        except Exception as e:
+            logger.warning(f"Failed to persist session language: {e}")

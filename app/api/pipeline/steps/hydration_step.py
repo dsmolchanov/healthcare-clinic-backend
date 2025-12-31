@@ -85,6 +85,19 @@ class ContextHydrationStep(PipelineStep):
             if ctx.patient_name and not ctx.user_preferences.get('preferred_name'):
                 ctx.user_preferences['preferred_name'] = ctx.patient_name
 
+            # Phase 5.2: Fallback for session language from patient profile
+            # Only set if not already loaded from session
+            if not ctx.session_language:
+                # Try hard_preferences.preferred_language first
+                hard_prefs = ctx.patient_profile.get('hard_preferences', {})
+                if isinstance(hard_prefs, dict) and hard_prefs.get('preferred_language'):
+                    ctx.session_language = hard_prefs['preferred_language']
+                    logger.info(f"[Language] Loaded session_language from patient profile: {ctx.session_language}")
+                # Then try language_preference at top level
+                elif ctx.patient_profile.get('language_preference'):
+                    ctx.session_language = ctx.patient_profile['language_preference']
+                    logger.info(f"[Language] Loaded session_language from language_preference: {ctx.session_language}")
+
         # Unpack conversation history
         ctx.conversation_history = context.get('history', [])
 

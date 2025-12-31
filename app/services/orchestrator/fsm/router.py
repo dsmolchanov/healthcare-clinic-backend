@@ -7,6 +7,7 @@ Key principles:
 - Use proper system+user role separation
 - Return raw date strings (not ISO) - LLMs are bad at calendar math
 - Fall back to keyword-based routing on failure
+- Phase 5.2: Fuzzy matching for typos like "Impalnts" → "implants"
 """
 
 import json
@@ -15,6 +16,7 @@ import re
 from typing import Any
 
 from .types import RouterOutput
+from .text_utils import fuzzy_match_service
 
 logger = logging.getLogger(__name__)
 
@@ -40,42 +42,64 @@ for service, keywords in SERVICE_KEYWORDS.items():
 
 
 def _extract_service_from_keyword(word: str) -> str | None:
-    """Extract service type from a single keyword.
+    """Extract service type from a single keyword with fuzzy matching.
+
+    Phase 5.2: Added fuzzy matching as Priority 3 fallback.
 
     Args:
         word: Single word to match
 
     Returns:
-        Service name or the original word if no match
+        Service name or None if no match
     """
     word_lower = word.lower()
 
-    # Direct lookup
+    # Priority 1: Direct lookup
     if word_lower in KEYWORD_TO_SERVICE:
         return KEYWORD_TO_SERVICE[word_lower]
 
-    # Partial match for Russian suffixes (чистк → cleaning)
+    # Priority 2: Partial match for Russian suffixes (чистк → cleaning)
     for kw, service in KEYWORD_TO_SERVICE.items():
         if kw in word_lower or word_lower in kw:
             return service
 
-    # Return original word if no match
-    return word
+    # Priority 3: Fuzzy match (Levenshtein distance <= 2)
+    fuzzy_result = fuzzy_match_service(word)
+    if fuzzy_result:
+        logger.info(f"[Router] Fuzzy matched '{word}' → '{fuzzy_result}'")
+        return fuzzy_result
+
+    return None  # Changed from returning original word
 
 
 def _extract_service_from_message(message: str) -> str | None:
-    """Extract service type from message using keyword matching.
+    """Extract service type from message using keyword + fuzzy matching.
+
+    Phase 5.2: Added fuzzy matching as Priority 2 fallback.
 
     Args:
-        message: Full message text (lowercase)
+        message: Full message text
 
     Returns:
         Service type or None
     """
+    message_lower = message.lower()
+
+    # Priority 1: Exact keyword match
     for service, keywords in SERVICE_KEYWORDS.items():
         for kw in keywords:
-            if kw in message:
+            if kw in message_lower:
                 return service
+
+    # Priority 2: Fuzzy match each word
+    words = message.split()
+    for word in words:
+        if len(word) >= 4:  # Only fuzzy match substantial words
+            fuzzy_result = fuzzy_match_service(word)
+            if fuzzy_result:
+                logger.info(f"[Router] Fuzzy matched word '{word}' → '{fuzzy_result}'")
+                return fuzzy_result
+
     return None
 
 
