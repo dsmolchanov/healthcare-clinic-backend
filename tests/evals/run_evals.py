@@ -138,10 +138,17 @@ async def run_evals():
         if not args.real_data:
             print("  - Mocking Database, Tools, and Session State")
             
-            # Memory Manager
+            # Memory Manager - with session_language persistence for multi-turn language inertia
             mock_mm = MagicMock()
-            mock_mm.get_or_create_session = AsyncMock(return_value={'id': 'test-session', 'metadata': {}})
-            mock_mm.get_session_by_id = AsyncMock(return_value={'id': 'test-session', 'metadata': {}})
+            # Track session state including session_language across turns
+            session_state = {'id': 'test-session', 'metadata': {}, 'session_language': None}
+
+            async def get_session_with_language(*args, **kwargs):
+                """Return session with persisted session_language for multi-turn language inertia."""
+                return dict(session_state)  # Return copy to avoid mutation issues
+
+            mock_mm.get_or_create_session = AsyncMock(side_effect=get_session_with_language)
+            mock_mm.get_session_by_id = AsyncMock(side_effect=get_session_with_language)
             mock_mm.store_message = AsyncMock()
             mock_mm.get_user_preferences = AsyncMock(return_value={})
             mock_mm.get_memory_context = AsyncMock(return_value=[])
@@ -250,7 +257,37 @@ async def run_evals():
             stack.enter_context(patch('app.config.get_redis_client', return_value=mock_redis))
 
             # Supabase Client (used in multiple places)
+            # Enhanced to capture session_language updates for multi-turn language inertia
             mock_supabase = MagicMock()
+
+            # Intercept conversation_sessions updates to persist session_language
+            def capture_session_update(update_data):
+                """Capture session_language from PostProcessingStep updates."""
+                if 'session_language' in update_data:
+                    session_state['session_language'] = update_data['session_language']
+                    # print(f"  [DEBUG] Persisted session_language: {update_data['session_language']}")
+                mock_update = MagicMock()
+                mock_update.eq.return_value.execute.return_value = MagicMock(data=[])
+                return mock_update
+
+            # Make table('conversation_sessions').update() capture the language
+            mock_table = MagicMock()
+            mock_table.update.side_effect = capture_session_update
+            mock_table.select.return_value.eq.return_value.single.return_value.execute.return_value = MagicMock(data=None)
+            mock_table.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+            mock_table.insert.return_value.execute.return_value = MagicMock(data=[])
+
+            def get_table(table_name):
+                if table_name == 'conversation_sessions':
+                    return mock_table
+                # Default mock for other tables
+                default_table = MagicMock()
+                default_table.select.return_value.eq.return_value.single.return_value.execute.return_value = MagicMock(data=None)
+                default_table.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+                return default_table
+
+            mock_supabase.table.side_effect = get_table
+
             stack.enter_context(patch('app.database.get_healthcare_client', return_value=mock_supabase))
             stack.enter_context(patch('app.database.get_main_client', return_value=mock_supabase))
             stack.enter_context(patch('app.database.create_supabase_client', return_value=mock_supabase))
@@ -798,7 +835,11 @@ async def run_evals():
 
             # Clear Redis storage between scenarios to reset session state
             redis_storage.clear()
-            
+
+            # Reset session_language for new scenario (multi-turn language inertia fix)
+            if not args.real_data:
+                session_state['session_language'] = None
+
             conversation_history = []
             last_agent_response = None
             
@@ -878,6 +919,12 @@ async def run_evals():
                                 internal_tools_failed = response_meta.get('internal_tools_failed', [])
                                 validation_errors = response_meta.get('executor_validation_errors', [])
                                 hallucination_blocked = response_meta.get('hallucination_blocked', False)
+
+                                # Language inertia fix: Capture detected_language for next turn
+                                if not args.real_data:
+                                    detected_lang = getattr(response, 'detected_language', 'unknown')
+                                    if detected_lang and detected_lang != 'unknown':
+                                        session_state['session_language'] = detected_lang
 
                                 print(f"  Agent says: {agent_response_text}")
                                 if captured_tool_calls:
@@ -1007,6 +1054,12 @@ async def run_evals():
                             internal_tools_failed = response_meta.get('internal_tools_failed', [])
                             validation_errors = response_meta.get('executor_validation_errors', [])
                             hallucination_blocked = response_meta.get('hallucination_blocked', False)
+
+                            # Language inertia fix: Capture detected_language for next turn
+                            if not args.real_data:
+                                detected_lang = getattr(response, 'detected_language', 'unknown')
+                                if detected_lang and detected_lang != 'unknown':
+                                    session_state['session_language'] = detected_lang
 
                             print(f"  Agent says: {agent_response_text}")
                             if captured_tool_calls:
