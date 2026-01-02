@@ -329,6 +329,16 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
             lang=lang,
         )
 
+    # === HANDLE FAQ ROUTE (Tangent) ===
+    # This handles "Расскажите о процедуре" / "Tell me about the procedure"
+    # regardless of current stage - user can ask for info mid-booking
+    if event.router.route == "faq":
+        return handle_faq_tangent(
+            state=state,
+            service_type=event.router.service_type,
+            lang=lang,
+        )
+
     # === HANDLE CONTEXTUAL "YES" BASED ON pending_action ===
     # Only trigger special logic if we're awaiting specific confirmation
     if _is_affirmative(event.text, lang):
@@ -706,6 +716,48 @@ def handle_tool_result(state: BookingState, event: ToolResultEvent) -> Tuple[Boo
             error = event.result.get('error', 'Unknown error')
             msg = get_msg('booking_failed', lang).format(error=error)
             return state, [Respond(text=msg)]
+
+    # ==========================================
+    # Handle query_faq result
+    # ==========================================
+    if event.tool_name == "query_faq":
+        # Get the FAQ answer or a fallback message
+        if event.success and event.result:
+            faq_answer = event.result.get('answer', event.result.get('text', ''))
+            if not faq_answer and isinstance(event.result, str):
+                faq_answer = event.result
+        else:
+            # Fallback if no FAQ found
+            service = state.service_type or ''
+            faq_templates = {
+                'en': f"I don't have detailed information about {service} right now. Would you like to schedule an appointment to discuss this with a doctor?",
+                'ru': f"У меня нет подробной информации о {service} прямо сейчас. Хотите записаться на консультацию к врачу?",
+                'es': f"No tengo información detallada sobre {service} en este momento. ¿Le gustaría programar una cita para discutirlo con un doctor?",
+            }
+            faq_answer = faq_templates.get(lang, faq_templates['en'])
+
+        # After FAQ, offer to continue booking
+        continue_templates = {
+            'en': "Would you like to proceed with booking?",
+            'ru': "Хотите записаться?",
+            'es': "¿Le gustaría proceder con la reserva?",
+        }
+        continue_prompt = continue_templates.get(lang, continue_templates['en'])
+
+        # Clear the pending action and set up for booking confirmation
+        new_state = replace(
+            state,
+            pending_action={'type': 'start_booking'},
+            awaiting_field='booking_confirmation',
+        )
+
+        # Combine FAQ answer with booking prompt
+        full_response = f"{faq_answer}\n\n{continue_prompt}"
+
+        return new_state, [AskUser(
+            text=full_response,
+            field_awaiting='booking_confirmation'
+        )]
 
     # Unknown tool
     return state, [Respond(text="Something went wrong. Please try again.")]
@@ -1136,6 +1188,63 @@ def _names_match(query_name: str, doctor_name: str) -> bool:
                     return True
 
     return False
+
+
+def handle_faq_tangent(
+    state: BookingState,
+    service_type: Optional[str],
+    lang: str,
+) -> Tuple[BookingState, List[Action]]:
+    """
+    Handle FAQ/procedure info questions as tangents.
+
+    This handles questions like:
+    - "Расскажите о процедуре" (Tell me about the procedure)
+    - "What does whitening involve?"
+    - "How does a root canal work?"
+
+    After answering, user can continue with booking flow.
+
+    Args:
+        state: Current booking state
+        service_type: Service type from router (if any)
+        lang: Language code
+
+    Returns:
+        Tuple of (new_state, actions) with CallTool to query FAQ
+    """
+    # Determine the service to query about
+    query_service = service_type or state.service_type
+
+    if not query_service:
+        # No service specified - ask what they want to know about
+        templates = {
+            'en': "What procedure would you like to know about?",
+            'ru': "О какой процедуре вы хотите узнать?",
+            'es': "¿Sobre qué procedimiento le gustaría saber?",
+            'he': "על איזה הליך תרצה לדעת?",
+        }
+        new_state = replace(state, awaiting_field='faq_service')
+        return new_state, [AskUser(
+            text=templates.get(lang, templates['en']),
+            field_awaiting='faq_service'
+        )]
+
+    # Have a service - call FAQ tool
+    # Store the return stage so we can go back after FAQ
+    new_state = replace(
+        state,
+        pending_action={'type': 'faq_query', 'return_stage': state.stage.value},
+    )
+
+    return new_state, [CallTool(
+        name="query_faq",
+        args={
+            "query": f"What is {query_service}? How does the procedure work?",
+            "service_type": query_service,
+            "language": lang,
+        }
+    )]
 
 
 def handle_doctor_info_tangent(

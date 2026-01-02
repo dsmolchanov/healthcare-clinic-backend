@@ -68,7 +68,7 @@ class TangentResolver:
     """
 
     # Routes that should be handled as tangents (don't modify booking state)
-    TANGENT_ROUTES = {'doctor_info', 'pricing', 'info'}
+    TANGENT_ROUTES = {'doctor_info', 'pricing', 'info', 'faq'}
 
     def should_handle_as_tangent(
         self,
@@ -371,6 +371,16 @@ class FSMOrchestrator:
                 logger.info(f"[FSM] Handled pricing as tangent (stage={fsm_state.stage.name})")
             return result
 
+        # Handle FAQ queries (tangent or standalone) - "расскажите о процедуре"
+        if router_output.route == "faq":
+            result = await self._handle_faq(message, router_output, fsm_state, language)
+            # Phase 5.2: If tangent, preserve booking state
+            if is_tangent:
+                result["state"] = self._serialize_state(fsm_state)
+                result["is_tangent"] = True
+                logger.info(f"[FSM] Handled faq as tangent (stage={fsm_state.stage.name})")
+            return result
+
         if router_output.route == "cancel":
             # Pass serialized state for appointment_id lookup
             serialized_state = self._serialize_state(fsm_state) if fsm_state else None
@@ -535,6 +545,94 @@ class FSMOrchestrator:
             "state": None,  # Pricing is single-turn
             "tools_called": tools_called,
             "route": "pricing",
+            "guardrail_triggered": False,
+        }
+
+    async def _handle_faq(
+        self,
+        message: str,
+        router_output: RouterOutput,
+        state: BookingState,
+        language: str,
+    ) -> Dict[str, Any]:
+        """Handle FAQ/procedure info queries.
+
+        Provides information about dental procedures and services.
+        After answering, offers to continue with booking flow.
+
+        Args:
+            message: User message
+            router_output: Router output with service_type
+            state: Current booking state
+            language: Language code
+        """
+        service_type = router_output.service_type or state.service_type
+
+        # Try to get FAQ info from database
+        faq_answer = None
+        try:
+            from app.tools.faq_query_tool import FAQQueryTool
+            faq_tool = FAQQueryTool(self.clinic_id)
+            query = f"What is {service_type}? How does the procedure work?" if service_type else message
+            results = await faq_tool.search_faqs(
+                query=query,
+                language=language,
+                category='services',
+                limit=1
+            )
+            if results and len(results) > 0:
+                faq_answer = results[0].get('answer', '')
+        except Exception as e:
+            logger.warning(f"FAQ query failed: {e}")
+
+        # Build response
+        if faq_answer:
+            response = faq_answer
+        else:
+            # Fallback responses about procedures
+            service = service_type or 'this procedure'
+            fallback_responses = {
+                'whitening': {
+                    'en': "Teeth whitening is a cosmetic procedure that lightens teeth and removes stains. Our professional whitening takes about 1 hour and can brighten teeth by several shades.",
+                    'ru': "Отбеливание зубов — это косметическая процедура, которая осветляет зубы и удаляет пятна. Профессиональное отбеливание занимает около 1 часа и может осветлить зубы на несколько тонов.",
+                    'es': "El blanqueamiento dental es un procedimiento cosmético que aclara los dientes y elimina manchas. Nuestro blanqueamiento profesional toma aproximadamente 1 hora y puede aclarar los dientes varios tonos.",
+                },
+                'cleaning': {
+                    'en': "A dental cleaning removes plaque and tartar buildup. The procedure takes about 30-45 minutes and includes scaling, polishing, and flossing.",
+                    'ru': "Чистка зубов удаляет зубной налёт и камень. Процедура занимает около 30-45 минут и включает удаление камня, полировку и очистку межзубных промежутков.",
+                    'es': "Una limpieza dental elimina la placa y el sarro. El procedimiento toma unos 30-45 minutos e incluye raspado, pulido e hilo dental.",
+                },
+                'implants': {
+                    'en': "Dental implants are titanium posts surgically placed in the jawbone to replace missing teeth. The procedure involves multiple visits over several months.",
+                    'ru': "Зубные импланты — это титановые стержни, хирургически установленные в челюстную кость для замены отсутствующих зубов. Процедура включает несколько визитов в течение нескольких месяцев.",
+                    'es': "Los implantes dentales son postes de titanio colocados quirúrgicamente en el hueso de la mandíbula para reemplazar dientes faltantes. El procedimiento implica varias visitas durante varios meses.",
+                },
+            }
+
+            # Get specific procedure info or generic response
+            if service_type and service_type in fallback_responses:
+                response = fallback_responses[service_type].get(language, fallback_responses[service_type]['en'])
+            else:
+                generic_responses = {
+                    'en': f"I'd be happy to tell you more about {service}. Would you like to schedule a consultation with our doctor to discuss the details?",
+                    'ru': f"Я с удовольствием расскажу вам подробнее о {service}. Хотите записаться на консультацию к врачу, чтобы обсудить детали?",
+                    'es': f"Estaré encantado de contarle más sobre {service}. ¿Le gustaría programar una consulta con nuestro doctor para discutir los detalles?",
+                }
+                response = generic_responses.get(language, generic_responses['en'])
+
+        # Add booking prompt
+        booking_prompts = {
+            'en': "\n\nWould you like to book an appointment?",
+            'ru': "\n\nХотите записаться на приём?",
+            'es': "\n\n¿Le gustaría programar una cita?",
+        }
+        response += booking_prompts.get(language, booking_prompts['en'])
+
+        return {
+            "response": response,
+            "state": self._serialize_state(state),
+            "tools_called": [],
+            "route": "faq",
             "guardrail_triggered": False,
         }
 

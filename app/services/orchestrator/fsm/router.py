@@ -110,10 +110,17 @@ ROUTING RULES:
 - "scheduling": Booking, rescheduling, visiting, "come in", availability requests WITH DATES/TIMES, pain/symptoms
 - "pricing": Cost, price, how much, fee questions
 - "doctor_info": Questions about if a doctor works here, who they are, recommendations (NOT availability with dates)
+- "faq": Questions about procedures, treatments, what a service involves, "tell me about X", "how does X work", "what is X procedure"
 - "cancel": Cancel, void, remove appointment
 - "info": Hours, location, address, phone, parking, current time questions, timezone questions, "what time is it"
 - "exit": Goodbye, thanks bye, done
 - "irrelevant": General knowledge (history, geography, math), politics, jokes, non-clinic topics, anything NOT about dental/medical appointments
+
+IMPORTANT - FAQ vs SCHEDULING:
+- "Tell me about whitening" / "Расскажите об отбеливании" → faq (asking for info about procedure)
+- "I want to book whitening" / "Хочу записаться на отбеливание" → scheduling (booking intent)
+- "First tell me about the procedure" / "Сначала расскажите о процедуре" → faq (asking for info before booking)
+- If user says "now" or "сейчас" after asking for info, it likely means "tell me now", NOT a time for appointment
 
 IMPORTANT - DOCTOR QUESTIONS:
 - "Does Dr. X work here?" / "Доктор X у вас работает?" (no date) → doctor_info (existence check)
@@ -201,6 +208,27 @@ User: "Which doctor do you recommend?"
 
 User: "К какому врачу вы мне порекомендуете?"
 → {"route": "doctor_info", "doctor_info_kind": "recommend"}
+
+User: "Tell me about the whitening procedure"
+→ {"route": "faq", "service_type": "whitening"}
+
+User: "Расскажите об отбеливании"
+→ {"route": "faq", "service_type": "whitening"}
+
+User: "First tell me about the procedure"
+→ {"route": "faq"}
+
+User: "Сначала расскажите о процедуре"
+→ {"route": "faq"}
+
+User: "How does a root canal work?"
+→ {"route": "faq", "service_type": "root canal"}
+
+User: "What does a cleaning involve?"
+→ {"route": "faq", "service_type": "cleaning"}
+
+User: "Что такое виниры?"
+→ {"route": "faq", "service_type": "veneers"}
 
 Respond with JSON only. Include all fields you can extract."""
 
@@ -433,6 +461,22 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
                     extracted_service = _extract_service_from_keyword(word)
                     logger.info(f"'Meant' pattern detected: routing to pricing with service '{extracted_service}'")
                     return RouterOutput(route='pricing', service_type=extracted_service, language=language)
+
+    # FAQ keywords (multilingual) - asking about procedures/treatments
+    # IMPORTANT: Check FAQ BEFORE pricing to catch "tell me about X" patterns
+    faq_keywords = [
+        'tell me about', 'what is', 'what does', 'how does', 'explain',
+        'what happens during', 'describe', 'information about',
+        'расскажите', 'расскажи', 'что такое', 'как проходит', 'как делается',
+        'опишите', 'объясните', 'информация о', 'о процедуре', 'про процедуру',
+        'сначала расскажите', 'сначала объясните',  # "first tell me" pattern
+        'cuéntame sobre', 'qué es', 'cómo funciona', 'explica',
+        'información sobre', 'describe', 'cómo se hace',
+    ]
+    if any(kw in m for kw in faq_keywords):
+        # Try to extract service type for FAQ
+        service_type = _extract_service_from_message(m)
+        return RouterOutput(route='faq', service_type=service_type, language=language)
 
     # Pricing keywords (multilingual) - expanded Russian list
     pricing_keywords = [
