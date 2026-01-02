@@ -107,9 +107,18 @@ def _extract_service_from_message(message: str) -> str | None:
 ROUTER_SYSTEM_PROMPT = """You are a medical clinic receptionist assistant router. Parse user messages and extract structured information.
 
 ROUTING RULES:
+- "greeting": User says hello, hi, good morning, привет, здравствуйте, hola, שלום - respond warmly and offer help
 - "scheduling": Booking, rescheduling, visiting, "come in", availability requests WITH DATES/TIMES, pain/symptoms
 - "pricing": Cost, price, how much, fee questions
-- "doctor_info": Questions about if a doctor works here, who they are, recommendations (NOT availability with dates)
+- "doctor_info": ANY question about doctors WITHOUT a date/time. Examples:
+  - "Какие доктора у вас работают?" (What doctors do you have?)
+  - "Какие врачи их ставят?" (Who performs these procedures?)
+  - "Есть ли у вас ортодонт?" (Do you have an orthodontist?)
+  - "Who are your dentists?"
+  - "Does Dr. X work here?"
+  - "Who is the best for implants?"
+  NOTE: If user asks "Is Dr. X available TOMORROW?" → scheduling (has date)
+        If user asks "Does Dr. X work here?" → doctor_info (no date)
 - "faq": Questions about procedures, treatments, what a service involves, "tell me about X", "how does X work", "what is X procedure"
 - "cancel": Cancel, void, remove appointment
 - "info": Hours, location, address, phone, parking, current time questions, timezone questions, "what time is it"
@@ -140,6 +149,21 @@ Return the EXACT STRING the user said for dates and times. DO NOT calculate ISO 
 Python tools will resolve these to actual datetimes. LLMs are bad at calendar math.
 
 EXAMPLES:
+User: "Привет"
+→ {"route": "greeting"}
+
+User: "Hello"
+→ {"route": "greeting"}
+
+User: "Добрый день"
+→ {"route": "greeting"}
+
+User: "Hola"
+→ {"route": "greeting"}
+
+User: "שלום"
+→ {"route": "greeting"}
+
 User: "I'd like to book a cleaning for tomorrow"
 → {"route": "scheduling", "service_type": "cleaning", "target_date": "tomorrow"}
 
@@ -229,6 +253,24 @@ User: "What does a cleaning involve?"
 
 User: "Что такое виниры?"
 → {"route": "faq", "service_type": "veneers"}
+
+User: "Какие доктора у вас работают?"
+→ {"route": "doctor_info", "doctor_info_kind": "list"}
+
+User: "What doctors do you have?"
+→ {"route": "doctor_info", "doctor_info_kind": "list"}
+
+User: "А какие врачи их ставят?"
+→ {"route": "doctor_info", "doctor_info_kind": "list"}
+
+User: "Who performs implants at your clinic?"
+→ {"route": "doctor_info", "doctor_info_kind": "list"}
+
+User: "Есть ли у вас ортодонт?"
+→ {"route": "doctor_info", "doctor_info_kind": "exists"}
+
+User: "Do you have an orthodontist?"
+→ {"route": "doctor_info", "doctor_info_kind": "exists"}
 
 Respond with JSON only. Include all fields you can extract."""
 
@@ -333,6 +375,8 @@ def detect_doctor_info_intent(text: str) -> str | None:
     """
     Detect if user is asking about a doctor's existence/info, not availability.
 
+    Phase 2: Enhanced patterns for doctor info questions.
+
     IMPORTANT: If text contains temporal tokens, return None (→ scheduling).
 
     Args:
@@ -347,30 +391,45 @@ def detect_doctor_info_intent(text: str) -> str | None:
     if has_temporal_tokens(text_lower):
         return None  # "работает завтра?" → scheduling
 
-    # === EXISTENCE patterns ===
-    existence_patterns = [
-        r'работает\s*(\?|$)',           # "работает?" at end (no date)
-        r'у вас работает',               # "у вас работает"
-        r'кто такой',                    # "кто такой доктор"
-        r'work here\??',                 # "does X work here?"
-        r'works? at.*clinic',            # "works at your clinic?"
-        r'trabaja aquí',                 # Spanish
-    ]
-    for pattern in existence_patterns:
-        if re.search(pattern, text_lower):
-            return "exists"
-
-    # === LIST patterns ===
+    # === LIST patterns - Phase 2: Expanded (check FIRST for plural doctor queries) ===
     list_patterns = [
         r'какие.*врач',                  # "какие у вас врачи?"
+        r'какие.*доктор',                # "какие доктора?"
         r'кто.*работает',                # "кто у вас работает?" (no specific doctor)
+        r'какие врачи их',               # "какие врачи их ставят?"
+        r'а какие врачи',                # "а какие врачи ставят импланты?"
+        r'кто.*ставит',                  # "кто ставит импланты?"
+        r'кто.*делает',                  # "кто делает виниры?"
         r'who are.*doctor',              # "who are your doctors?"
+        r'what doctors',                 # "what doctors do you have?"
+        r'which doctors',                # "which doctors work here?" - MUST check before "work here"
+        r'who performs',                 # "who performs implants?"
+        r'who does',                     # "who does veneers?"
         r'list.*doctor',
         r'cuáles.*doctor',               # Spanish
     ]
     for pattern in list_patterns:
         if re.search(pattern, text_lower):
             return "list"
+
+    # === EXISTENCE patterns (checked AFTER list patterns) ===
+    existence_patterns = [
+        r'работает\s*(\?|$)',           # "работает?" at end (no date)
+        r'у вас работает',               # "у вас работает"
+        r'кто такой',                    # "кто такой доктор"
+        r'(?:does|dr\.?).*work here',    # "does X work here?" - specific doctor
+        r'works? at.*clinic',            # "works at your clinic?"
+        r'trabaja aquí',                 # Spanish
+        r'есть.*ортодонт',               # "Есть ли у вас ортодонт?"
+        r'есть.*хирург',                 # "Есть ли у вас хирург?"
+        r'есть.*терапевт',               # "Есть ли у вас терапевт?"
+        r'do you have.*dentist',         # "Do you have a dentist for..."
+        r'do you have.*specialist',      # "Do you have a specialist?"
+        r'do you have.*orthodont',       # "Do you have an orthodontist?"
+    ]
+    for pattern in existence_patterns:
+        if re.search(pattern, text_lower):
+            return "exists"
 
     # === RECOMMEND patterns ===
     recommend_patterns = [

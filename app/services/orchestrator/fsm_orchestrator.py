@@ -2,18 +2,19 @@
 
 This orchestrator uses a simple architecture:
 1. Pre-FSM guardrails (emergency/PHI detection)
-2. One-shot router (single LLM call)
-3. FSM.step() for business logic (no LLM)
-4. Tool execution for actions
-5. Post-FSM guardrails (PHI redaction)
-6. Response formatting
+2. Pre-router fast-path (Phase 0: greeting/frustration detection)
+3. One-shot router (single LLM call)
+4. FSM.step() for business logic (no LLM)
+5. Tool execution for actions
+6. Post-FSM guardrails (PHI redaction)
+7. Response formatting
 
 Key principle: LLMs understand; Code decides.
 """
 
 import logging
 import re
-from typing import Dict, Any, Optional, Callable, Awaitable, Union
+from typing import Dict, Any, Optional, Callable, Awaitable, Union, Set
 from dataclasses import asdict
 
 try:
@@ -45,6 +46,68 @@ from app.services.orchestrator.templates.handlers.phi_handler import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# Phase 0: Pre-Router Fast-Path Detection
+# ==========================================
+
+# Greeting patterns by language (checked before LLM router)
+GREETING_PATTERNS: Dict[str, Set[str]] = {
+    'ru': {'привет', 'здравствуйте', 'здравствуй', 'добрый день', 'добрый вечер',
+           'доброе утро', 'приветствую', 'хай', 'хелло'},
+    'en': {'hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening',
+           'greetings', 'howdy'},
+    'es': {'hola', 'buenos días', 'buenas tardes', 'buenas noches', 'saludos'},
+    'he': {'שלום', 'היי', 'בוקר טוב', 'ערב טוב'},
+}
+
+# Frustration patterns by language (user confusion/annoyance)
+FRUSTRATION_PATTERNS: Dict[str, Set[str]] = {
+    'ru': {'зачем', 'почему ты', 'не понимаю', 'что ты', 'ты что', 'какого'},
+    'en': {'why are you', 'what are you', "don't understand", 'confused', 'what the'},
+    'es': {'por qué', 'no entiendo', 'qué haces', 'no comprendo'},
+}
+
+
+def detect_greeting_or_frustration(text: str) -> Optional[str]:
+    """
+    Fast-path detection for greetings and frustration before LLM router.
+
+    Phase 0: Deterministic detection for short inputs that are highest
+    risk for LLM misclassification. This is more robust than relying
+    on the LLM for inputs like "Привет" which have highest misclassification risk.
+
+    Args:
+        text: User's message text
+
+    Returns:
+        'greeting' | 'frustration' | None
+
+    Examples:
+        >>> detect_greeting_or_frustration("Привет")
+        'greeting'
+        >>> detect_greeting_or_frustration("Зачем ты это пишешь?")
+        'frustration'
+        >>> detect_greeting_or_frustration("Хочу записаться на чистку")
+        None
+    """
+    if not text:
+        return None
+
+    text_lower = text.lower().strip()
+
+    # Check greetings (exact match for short inputs)
+    for lang_patterns in GREETING_PATTERNS.values():
+        if text_lower in lang_patterns:
+            return 'greeting'
+
+    # Check frustration patterns (substring match)
+    for lang_patterns in FRUSTRATION_PATTERNS.values():
+        if any(pattern in text_lower for pattern in lang_patterns):
+            return 'frustration'
+
+    return None
 
 
 # ==========================================
@@ -311,6 +374,24 @@ class FSMOrchestrator:
         fsm_state = self._load_state(state, user_phone=user_phone, user_name=user_name)
 
         # ==========================================
+        # STEP 1.5: Pre-Router Fast-Path (Phase 0)
+        # ==========================================
+        # Check for greeting/frustration BEFORE calling LLM router
+        # This is more robust for short inputs like "Привет"
+        fast_path = detect_greeting_or_frustration(message)
+        if fast_path == 'greeting':
+            logger.info(f"[FSM] Fast-path: greeting detected for '{message[:30]}'")
+            return await self._handle_greeting(
+                language=language,
+                user_phone=user_phone,
+                user_name=user_name,
+            )
+        elif fast_path == 'frustration':
+            logger.info(f"[FSM] Fast-path: frustration detected for '{message[:30]}'")
+            # Pass current state to preserve booking context
+            return await self._handle_irrelevant(message, language, state=fsm_state)
+
+        # ==========================================
         # STEP 2: Route message (one LLM call)
         # ==========================================
         try:
@@ -332,6 +413,15 @@ class FSMOrchestrator:
                 "route": "exit",
                 "guardrail_triggered": False,
             }
+
+        # Phase 1: Handle greeting from LLM router (backup to fast-path in Phase 0)
+        if router_output.route == "greeting":
+            logger.info(f"[FSM] LLM router returned 'greeting' for '{message[:30]}'")
+            return await self._handle_greeting(
+                language=language,
+                user_phone=user_phone,
+                user_name=user_name,
+            )
 
         # Phase 5.2: Check if this route should be handled as a tangent
         # Tangents preserve booking state while answering side questions
@@ -399,7 +489,8 @@ class FSMOrchestrator:
                     return await self._handle_scheduling(
                         message, router_output, fsm_state, language, tools_called
                     )
-            return await self._handle_irrelevant(message, language)
+            # Phase 0/1: Pass state to preserve booking context
+            return await self._handle_irrelevant(message, language, state=fsm_state)
 
         # Default: scheduling (booking)
         return await self._handle_scheduling(
@@ -822,26 +913,180 @@ class FSMOrchestrator:
         self,
         message: str,
         language: str,
+        state: Optional[BookingState] = None,
     ) -> Dict[str, Any]:
-        """Handle out-of-scope/irrelevant queries.
+        """Handle out-of-scope queries with helpful redirection.
 
-        Politely redirects user back to dental/clinic topics.
+        Phase 0/1: Preserves booking state if user is mid-flow.
+        A "soft reset" re-orients the user without wiping context.
+
+        Args:
+            message: User's message
+            language: Language code
+            state: Current booking state to preserve (optional)
         """
-        responses = {
-            'en': "I can only help with dental appointments and clinic-related questions. "
-                  "Would you like to schedule an appointment or ask about our services?",
-            'ru': "Я могу помочь только с вопросами о стоматологических приёмах и услугах клиники. "
-                  "Хотите записаться на приём или узнать о наших услугах?",
-            'es': "Solo puedo ayudar con citas dentales y preguntas relacionadas con la clínica. "
-                  "¿Le gustaría programar una cita o preguntar sobre nuestros servicios?",
+        # Check if this looks like frustration/confusion
+        frustration_patterns = {
+            'ru': ['зачем', 'почему', 'не понимаю', 'что ты'],
+            'en': ['why are you', 'what are you', "don't understand", 'confused'],
+            'es': ['por qué', 'no entiendo', 'qué haces'],
         }
+
+        is_frustration = any(
+            pattern in message.lower()
+            for patterns in frustration_patterns.values()
+            for pattern in patterns
+        )
+
+        # Check if user is mid-booking (has active state)
+        is_mid_booking = (
+            state is not None and
+            state.stage not in (BookingStage.INTENT, BookingStage.COMPLETE)
+        )
+
+        if is_frustration:
+            if is_mid_booking:
+                # Soft reset: apologize but remind where we were
+                responses = {
+                    'en': "I apologize for any confusion. We were working on your appointment. "
+                          "Would you like to continue, or would you prefer to start over?",
+                    'ru': "Прошу прощения за путаницу. Мы работали над вашей записью. "
+                          "Хотите продолжить или начать заново?",
+                    'es': "Disculpe la confusión. Estábamos trabajando en su cita. "
+                          "¿Desea continuar o prefiere empezar de nuevo?",
+                    'he': "מתנצל על הבלבול. עבדנו על התור שלך. "
+                          "האם תרצה להמשיך או להתחיל מחדש?",
+                }
+            else:
+                responses = {
+                    'en': "I apologize for any confusion. I'm a dental clinic assistant. "
+                          "I can help you book appointments, check prices, or answer questions about our services. "
+                          "How can I help you today?",
+                    'ru': "Прошу прощения за путаницу. Я ассистент стоматологической клиники. "
+                          "Могу помочь записаться на приём, узнать цены или ответить на вопросы об услугах. "
+                          "Чем могу помочь?",
+                    'es': "Disculpe cualquier confusión. Soy un asistente de la clínica dental. "
+                          "Puedo ayudarle a programar citas, consultar precios o responder preguntas sobre nuestros servicios. "
+                          "¿En qué puedo ayudarle hoy?",
+                    'he': "מתנצל על כל בלבול. אני עוזר של מרפאת שיניים. "
+                          "אני יכול לעזור לך לקבוע תורים, לבדוק מחירים או לענות על שאלות לגבי השירותים שלנו. "
+                          "איך אוכל לעזור לך היום?",
+                }
+        else:
+            responses = {
+                'en': "I specialize in dental appointments and services. "
+                      "Would you like to book an appointment, check prices, or ask about our services?",
+                'ru': "Я специализируюсь на стоматологических услугах. "
+                      "Хотите записаться на приём, узнать цены или спросить о наших услугах?",
+                'es': "Me especializo en citas dentales y servicios. "
+                      "¿Le gustaría programar una cita, consultar precios o preguntar sobre nuestros servicios?",
+                'he': "אני מתמחה בתורים לשיניים ושירותים. "
+                      "האם תרצה לקבוע תור, לבדוק מחירים או לשאול על השירותים שלנו?",
+            }
 
         return {
             "response": responses.get(language, responses['en']),
-            "state": None,
+            "state": self._serialize_state(state) if state else None,  # PRESERVE STATE!
             "tools_called": [],
             "route": "irrelevant",
             "guardrail_triggered": False,
+        }
+
+    async def _handle_greeting(
+        self,
+        language: str,
+        user_phone: Optional[str] = None,
+        user_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Handle greetings with personalized, warm response.
+
+        Phase 0/1: Personalization priority:
+        1. Existing patient: Use hydrated name (from HydrationStep - already from DB)
+        2. New patient with pushName: Use pushName (welcome new patient)
+        3. Unknown: Generic warm greeting
+
+        NOTE: We do NOT query DB here - HydrationStep already did that.
+        The user_name param IS the patient's first_name from DB (or pushName for new).
+
+        Args:
+            language: Detected language code
+            user_phone: WhatsApp phone number (for analytics, not lookup)
+            user_name: Patient name from HydrationStep (DB first_name or pushName)
+        """
+        patient_name = None
+        is_returning_patient = False
+
+        # Use hydrated name (already came from DB via HydrationStep)
+        # HydrationStep sets ctx.patient_name = patient_profile.first_name
+        # For new patients, it's set from WhatsApp pushName
+        if user_name:
+            # Filter generic/emoji-heavy names
+            generic_names = {'whatsapp', 'unknown', 'user', 'пользователь', '+'}
+            clean_name = user_name.split()[0] if user_name else ""  # First word only
+            # Remove emoji and check if valid name remains
+            clean_name = re.sub(r'[^\w\s]', '', clean_name, flags=re.UNICODE).strip()
+            if clean_name and clean_name.lower() not in generic_names and len(clean_name) >= 2:
+                patient_name = clean_name
+                # For simplicity, treat any valid name as potentially returning
+                is_returning_patient = True
+                logger.info(f"[Greeting] Using hydrated patient name: {patient_name}")
+
+        # Build personalized greeting
+        if patient_name and is_returning_patient:
+            # Returning patient - warm, familiar greeting
+            greetings = {
+                'en': f"Hello, {patient_name}! Great to see you again. "
+                      "How can I help you today? Would you like to book an appointment, "
+                      "check prices, or ask about our services?",
+                'ru': f"Здравствуйте, {patient_name}! Рады видеть вас снова. "
+                      "Чем могу помочь сегодня? Хотите записаться на приём, "
+                      "узнать цены или получить информацию об услугах?",
+                'es': f"¡Hola, {patient_name}! Qué gusto verte de nuevo. "
+                      "¿En qué puedo ayudarte hoy? ¿Te gustaría programar una cita, "
+                      "consultar precios o preguntar sobre nuestros servicios?",
+                'he': f"שלום, {patient_name}! שמחים לראות אותך שוב. "
+                      "איך אפשר לעזור לך היום?",
+            }
+        elif patient_name:
+            # New patient with known name - welcoming introduction
+            greetings = {
+                'en': f"Hello, {patient_name}! Welcome to our clinic. "
+                      "I'm here to help you with dental appointments. "
+                      "Would you like to book an appointment, ask about prices, or learn about our services?",
+                'ru': f"Здравствуйте, {patient_name}! Добро пожаловать в нашу клинику. "
+                      "Я помогу вам с записью на приём. "
+                      "Хотите записаться, узнать цены или получить информацию об услугах?",
+                'es': f"¡Hola, {patient_name}! Bienvenido/a a nuestra clínica. "
+                      "Estoy aquí para ayudarte con citas dentales. "
+                      "¿Te gustaría programar una cita, preguntar sobre precios o conocer nuestros servicios?",
+                'he': f"שלום, {patient_name}! ברוכים הבאים למרפאה שלנו. "
+                      "אני כאן לעזור לך עם תורים. "
+                      "האם תרצה לקבוע תור, לשאול על מחירים או ללמוד על השירותים שלנו?",
+            }
+        else:
+            # Unknown patient - generic warm greeting
+            greetings = {
+                'en': "Hello! Welcome to our dental clinic. "
+                      "I'm here to help you with appointments. "
+                      "Would you like to book an appointment, ask about prices, or learn about our services?",
+                'ru': "Здравствуйте! Добро пожаловать в нашу стоматологическую клинику. "
+                      "Я помогу вам с записью на приём. "
+                      "Хотите записаться, узнать цены или получить информацию об услугах?",
+                'es': "¡Hola! Bienvenido/a a nuestra clínica dental. "
+                      "Estoy aquí para ayudarte con citas. "
+                      "¿Te gustaría programar una cita, preguntar sobre precios o conocer nuestros servicios?",
+                'he': "שלום! ברוכים הבאים למרפאת השיניים שלנו. "
+                      "אני כאן לעזור לך עם תורים. "
+                      "האם תרצה לקבוע תור, לשאול על מחירים או ללמוד על השירותים שלנו?",
+            }
+
+        return {
+            "response": greetings.get(language, greetings['en']),
+            "state": None,
+            "tools_called": [],
+            "route": "greeting",
+            "guardrail_triggered": False,
+            "patient_recognized": is_returning_patient,  # For analytics
         }
 
     def _load_state(

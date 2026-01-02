@@ -5,17 +5,44 @@ Extracted from process_message() lines 489-580.
 
 Phase 2A of the Agentic Flow Architecture Refactor.
 Phase 5.2: Added language inertia to prevent flip-flopping on short messages.
+Phase 3: Enhanced with STRONG_LANGUAGE_INDICATORS for robust language detection.
 """
 
 import logging
 import re
-from typing import Tuple
+from typing import Tuple, Dict, Set
 
 from ..base import PipelineStep
 from ..context import PipelineContext
 from app.services.language_fallback_service import LanguageFallbackService
 
 logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# Phase 3: Strong Language Indicators
+# ==========================================
+# These words are STRONG signals of language intent and can override
+# session inertia even for short messages. Expanded to cover common
+# affirmatives/negatives and booking-related terms in all target languages.
+
+STRONG_LANGUAGE_INDICATORS: Dict[str, Set[str]] = {
+    'ru': {'привет', 'здравствуйте', 'здравствуй', 'хочу', 'нужно', 'записаться',
+           'да', 'нет', 'хорошо', 'ладно', 'спасибо', 'пожалуйста', 'конечно',
+           'чистка', 'отбеливание', 'виниры', 'импланты', 'коронка',
+           'доктор', 'врач', 'зуб', 'боль', 'болит'},
+    'en': {'hello', 'hi', 'want', 'need', 'book', 'appointment', 'yes', 'no', 'ok',
+           'okay', 'thanks', 'please', 'sure', 'great', 'cleaning', 'whitening',
+           'veneers', 'implants', 'crown', 'doctor', 'dentist', 'tooth', 'pain'},
+    'es': {'hola', 'quiero', 'necesito', 'cita', 'sí', 'si', 'no', 'gracias',
+           'por favor', 'bueno', 'vale', 'claro', 'limpieza', 'blanqueamiento',
+           'carillas', 'implantes', 'corona', 'doctor', 'dentista', 'diente', 'dolor'},
+    'he': {'שלום', 'היי', 'רוצה', 'צריך', 'תור', 'כן', 'לא', 'תודה', 'בבקשה',
+           'טוב', 'בסדר', 'שיניים', 'כאב', 'רופא'},
+    # Edge case languages (for users who switch)
+    'fr': {'bonjour', 'oui', 'non', 'merci', 's\'il vous plaît'},
+    'pt': {'olá', 'sim', 'não', 'obrigado', 'obrigada'},
+}
 
 
 class RoutingStep(PipelineStep):
@@ -169,16 +196,20 @@ class RoutingStep(PipelineStep):
         Detect language with session inertia for short/ambiguous messages.
 
         Phase 5.2: Language Inertia Implementation
+        Phase 3: Enhanced with STRONG_LANGUAGE_INDICATORS
 
-        Rules:
-        1. If message < 4 words OR < 20 chars → use session_language (bypass detector)
-        2. If detector confidence < 80% → use session_language
-        3. Otherwise → update session_language with new detection
+        Enhanced Rules:
+        1. If message < 4 words OR < 20 chars:
+           a. Check for STRONG language indicators (like "привет", "hola")
+           b. If found → allow language switch even for short text
+           c. If not found → preserve session_language (inertia)
+        2. For longer text → detect and update session_language
 
         This prevents language flip-flopping on:
         - Short responses ("да", "ok", "yse")
         - Typos that look like other languages ("Impalnts")
         - Confirmations with minimal text
+        - But ALLOWS legitimate switches like "Привет" → Russian
 
         Args:
             ctx: Pipeline context with message and session_language
@@ -189,32 +220,69 @@ class RoutingStep(PipelineStep):
         message = ctx.message.strip()
         word_count = len(message.split())
         char_count = len(message)
+        message_lower = message.lower()
 
-        # Rule 1: Short text bypass - don't trust detector on minimal input
+        # Rule 1: Short text handling with strong indicator override
         if word_count < 4 or char_count < 20:
             if ctx.session_language:
+                # Phase 3: Check for strong language indicators that override inertia
+                detected_lang = self._check_strong_indicators(message_lower)
+                if detected_lang:
+                    if detected_lang != ctx.session_language:
+                        logger.info(
+                            f"[Language] Strong indicator detected: switching "
+                            f"{ctx.session_language} → {detected_lang} for '{message[:30]}'"
+                        )
+                        ctx.session_language = detected_lang
+                        return detected_lang
+                    else:
+                        # Same language, just confirm
+                        return ctx.session_language
+
+                # No strong indicator found - preserve session language (inertia)
                 logger.info(
                     f"[Language] Short text bypass: keeping session_language={ctx.session_language} "
-                    f"(words={word_count}, chars={char_count})"
+                    f"(words={word_count}, chars={char_count}, no strong indicator)"
                 )
                 return ctx.session_language
 
-        # Detect fresh using language service or fallback
+        # Detect fresh for substantial text using language service or fallback
         if self._language_service:
             detected = self._language_service.detect_sync(message)
         else:
             detected = self._detect_language_fallback(message)
 
-        # Rule 2: Low confidence check (if service supports it)
-        # For now, trust detection on substantial text
-
-        # Rule 3: Update session language on substantial text
+        # Update session language on substantial text
         if word_count >= 4 and char_count >= 20:
             if ctx.session_language != detected:
                 logger.info(f"[Language] Updating session_language: {ctx.session_language} → {detected}")
             ctx.session_language = detected
 
         return detected
+
+    def _check_strong_indicators(self, message_lower: str) -> str | None:
+        """
+        Check if message contains strong language indicators.
+
+        Phase 3: Returns the detected language if a strong indicator is found,
+        otherwise None. Strong indicators are words that clearly signal
+        the user's intended language.
+
+        Args:
+            message_lower: Lowercased message text
+
+        Returns:
+            Language code if strong indicator found, else None
+        """
+        # Split into words for token-level matching
+        words = set(message_lower.split())
+
+        for lang, indicators in STRONG_LANGUAGE_INDICATORS.items():
+            # Check for any word match
+            if words & indicators:
+                return lang
+
+        return None
 
     def _build_router_context(self, ctx: PipelineContext) -> dict:
         """Build context dictionary for router service."""

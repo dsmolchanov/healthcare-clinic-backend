@@ -81,6 +81,12 @@ class ContextHydrationStep(PipelineStep):
             ctx.patient_id = ctx.patient_profile.get('id')
             ctx.patient_name = self._extract_patient_name(ctx.patient_profile)
 
+            # Phase 1B: Update profile_name with DB patient name for personalized greetings
+            # This ensures FSM orchestrator receives proper patient name, not just WhatsApp pushName
+            if ctx.patient_name:
+                ctx.profile_name = ctx.patient_name
+                logger.debug(f"[Hydration] Updated profile_name from DB: {ctx.profile_name}")
+
             # Add to preferences if not already set
             if ctx.patient_name and not ctx.user_preferences.get('preferred_name'):
                 ctx.user_preferences['preferred_name'] = ctx.patient_name

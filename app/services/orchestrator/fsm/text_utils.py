@@ -13,7 +13,7 @@ Key improvements over naive split()/strip():
 """
 import re
 import unicodedata
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Dict
 
 
 # ==========================================
@@ -455,5 +455,79 @@ def has_time_anchor(text: str, lang: str = "en") -> bool:
     # Check for time patterns like "10:00", "2pm", "14:30"
     if re.search(r'\d{1,2}[:.]\d{2}|\d{1,2}\s*[ap]m', text_lower):
         return True
+
+    return False
+
+
+# ==========================================
+# Phase 4: Explicit Booking Intent Detection
+# ==========================================
+
+BOOKING_INTENT_PHRASES: Dict[str, Set[str]] = {
+    'ru': {
+        'запиши', 'записаться', 'хочу записаться', 'давай запишусь',
+        'забронируй', 'забронировать', 'хочу на приём', 'хочу к врачу',
+        'да, запиши', 'да, хочу', 'да, конечно', 'записать меня',
+        'хочу прийти', 'можно записаться', 'запишите меня',
+    },
+    'en': {
+        'book', 'book it', 'schedule', 'make appointment', 'book me',
+        'yes book', 'yes please book', 'yes, i want', 'sign me up',
+        'i want to book', 'can i book', 'schedule me', 'make an appointment',
+    },
+    'es': {
+        'reservar', 'agendar', 'programar cita', 'quiero cita',
+        'sí, reservar', 'sí, agendar', 'hacer cita', 'programar',
+    },
+    'he': {
+        'לקבוע', 'לקבוע תור', 'כן, לקבוע', 'רוצה תור', 'אני רוצה תור',
+    },
+}
+
+
+def has_explicit_booking_intent(text: str, lang: str = "en") -> bool:
+    """
+    Check if user explicitly wants to book an appointment.
+
+    Phase 4: Guards against premature booking mode entry.
+    Only returns True if user is clearly requesting to book,
+    not just saying "да" after pricing info.
+
+    Args:
+        text: User's message
+        lang: Language code
+
+    Returns:
+        True if user is explicitly requesting to book
+
+    Examples:
+        >>> has_explicit_booking_intent("Да, запиши меня", "ru")
+        True
+        >>> has_explicit_booking_intent("А какие врачи работают?", "ru")
+        False  # Question, not booking intent
+        >>> has_explicit_booking_intent("Book an appointment please", "en")
+        True
+        >>> has_explicit_booking_intent("Ok", "en")
+        False  # Ambiguous without explicit booking keyword
+    """
+    if not text:
+        return False
+
+    text_lower = text.lower().strip()
+
+    # Get phrases for current language + English fallback
+    phrases = BOOKING_INTENT_PHRASES.get(lang, set()) | BOOKING_INTENT_PHRASES.get('en', set())
+
+    # Check for any booking intent phrase
+    for phrase in phrases:
+        if phrase in text_lower:
+            return True
+
+    # Also check if affirmative AND contains booking keywords
+    if is_affirmative(text, lang):
+        booking_keywords = {'book', 'запис', 'cita', 'תור', 'appointment', 'schedule',
+                           'забронир', 'приём', 'врач'}
+        if any(kw in text_lower for kw in booking_keywords):
+            return True
 
     return False

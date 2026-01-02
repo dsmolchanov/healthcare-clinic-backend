@@ -284,3 +284,114 @@ scenarios:
       - "Either finds veneer prices OR explains veneers not in system"
       - "Offers consultation as alternative if no exact price"
       - "Maintains professional, apologetic tone"
+
+  # ==========================================
+  # Phase 5: Regression Prevention Scenarios
+  # ==========================================
+
+  - name: "Greeting - Russian"
+    description: "User sends simple greeting in Russian"
+    messages:
+      - role: "user"
+        content: "Привет"
+    expected_behavior: |
+      Agent should respond warmly and offer help, NOT reject as irrelevant.
+      Response should be in Russian and offer to help with dental services.
+    criteria:
+      - "Response is warm and welcoming"
+      - "Offers to help with dental services"
+      - "Does NOT reject or refuse to help"
+      - "Response is in Russian"
+
+  - name: "Greeting - English"
+    description: "User sends simple greeting in English"
+    messages:
+      - role: "user"
+        content: "Hello"
+    expected_behavior: |
+      Agent should respond warmly and offer help with dental services.
+    criteria:
+      - "Response is warm and welcoming"
+      - "Offers to help with dental services"
+      - "Does NOT reject or refuse to help"
+      - "Response is in English"
+
+  - name: "Doctor List Query - Russian"
+    description: "User asks what doctors work at the clinic"
+    messages:
+      - role: "user"
+        content: "Какие доктора у вас работают?"
+    expected_behavior: |
+      Agent should list doctors from database, NOT ask about appointment type.
+    criteria:
+      - "Lists actual doctor names OR explains doctors are available"
+      - "Does NOT ask 'Какой тип приёма вам нужен?'"
+      - "Offers to book with listed doctors"
+      - "Response is in Russian"
+
+  - name: "Follow-up Doctor Query After Pricing"
+    description: "User asks who performs implants after pricing question"
+    messages:
+      - role: "user"
+        content: "Сколько стоит один имплант?"
+      - role: "assistant"
+        content: "Вот наши цены на импланты..."
+        evaluate: false
+      - role: "user"
+        content: "А какие врачи их ставят?"
+    expected_behavior: |
+      Agent should answer about doctors for implants, using prior context.
+    criteria:
+      - "Mentions doctors OR specialists for implants"
+      - "Does NOT ask 'Какой тип приёма?'"
+      - "Uses context from prior implant pricing question"
+      - "Response is in Russian"
+
+  - name: "Language Stability on Typo"
+    description: "Session in Russian, user sends typo that looks like another language"
+    messages:
+      - role: "user"
+        content: "Привет, хочу почистить зубы"
+      - role: "assistant"
+        content: "Отлично! На какой день вы хотите записаться?"
+        evaluate: false
+      - role: "user"
+        content: "Impalnts"
+    expected_behavior: |
+      Agent should stay in Russian, treating "Impalnts" as a typo for implants.
+    criteria:
+      - "Response remains in Russian"
+      - "Recognizes 'Impalnts' as implants or asks for clarification in Russian"
+      - "Does NOT switch to Spanish or English"
+
+  - name: "No Premature Booking After Info"
+    description: "User asks questions but doesn't want to book yet"
+    messages:
+      - role: "user"
+        content: "Сколько стоит чистка?"
+      - role: "assistant"
+        content: "Чистка зубов стоит 100 USD. Хотите записаться на консультацию?"
+        evaluate: false
+      - role: "user"
+        content: "А какие у вас часы работы?"
+    expected_behavior: |
+      Agent should answer hours question, NOT force booking flow.
+    criteria:
+      - "Provides clinic hours OR offers to help with hours question"
+      - "Does NOT ask 'Какой тип приёма?'"
+      - "Does NOT assume user wants to book immediately"
+      - "Response is in Russian"
+
+  - name: "Frustration Handling"
+    description: "User expresses confusion or frustration"
+    messages:
+      - role: "user"
+        content: "Зачем ты это все мне пишешь? Я просто спросил про врачей"
+    expected_behavior: |
+      Agent should apologize and reset helpfully, NOT reject.
+    criteria:
+      - "Apologizes for confusion"
+      - "Explains what it can help with"
+      - "Offers clear path forward"
+      - "Does NOT give hard rejection"
+      - "Response is in Russian"
