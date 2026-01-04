@@ -395,3 +395,58 @@ scenarios:
       - "Offers clear path forward"
       - "Does NOT give hard rejection"
       - "Response is in Russian"
+
+  - name: "FAQ Comparative Question - Russian"
+    description: "User asks about difference between services after seeing prices"
+    messages:
+      - role: "user"
+        content: "Сколько стоит чистка?"
+      - role: "assistant"
+        content: "Вот наши цены:\n• Dental Cleaning: 120.0 USD\n• Aquacare Dental Cleaning: 190.0 USD\n\nХотите записаться?"
+        evaluate: false
+      - role: "user"
+        content: "А в чем между ними разница?"
+    expected_behavior: |
+      Agent should recognize this as a FAQ question about the difference between services
+      and provide information about how the cleaning types differ.
+      Should NOT ignore the question and ask for appointment type.
+    criteria:
+      - "Attempts to explain the difference between cleaning types OR uses FAQ tool"
+      - "Does NOT ask 'Какой тип приёма?' ignoring the question"
+      - "Does NOT immediately try to book without answering"
+      - "Response is in Russian"
+
+  - name: "Russian Day + Time-of-Day Parsing"
+    description: "User specifies day and time-of-day in Russian without exact hour"
+    messages:
+      - role: "user"
+        content: "Хочу записаться на чистку"
+      - role: "assistant"
+        content: "Когда вы хотели бы прийти?"
+        evaluate: false
+      - role: "user"
+        content: "Во вторник утром"
+    expected_behavior: |
+      Agent should understand 'во вторник утром' (Tuesday morning) and either:
+      1. Check availability for next Tuesday morning hours (9-12), OR
+      2. Offer morning slots for Tuesday
+      Should NOT repeatedly ask 'Когда?' failing to parse the input.
+    criteria:
+      - "Understands 'вторник' as Tuesday"
+      - "Understands 'утром' as morning preference"
+      - "Either checks availability OR offers slots"
+      - "Does NOT ask 'Когда?' again (unless confirming specific hour)"
+      - "Response is in Russian"
+
+  - name: "Russian Time with Hour"
+    description: "User specifies exact time in Russian format"
+    messages:
+      - role: "user"
+        content: "Можно записаться на завтра в 11 утра?"
+    expected_behavior: |
+      Agent should parse 'завтра в 11 утра' (tomorrow at 11am) and check availability.
+    criteria:
+      - "Understands 'завтра' as tomorrow"
+      - "Understands '11 утра' as 11:00 AM"
+      - "Checks availability using tool"
+      - "Response is in Russian"

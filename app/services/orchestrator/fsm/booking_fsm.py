@@ -439,7 +439,17 @@ def step(state: BookingState, event: Event) -> Tuple[BookingState, List[Action]]
             state = replace(state, has_pain=False)
 
             # Use adaptive prompt verbosity based on ask count
-            if date_ask_count >= 2:
+            # FIX: On 3+ attempts, provide explicit format examples to help user succeed
+            if date_ask_count >= 3:
+                # User is stuck - provide explicit format examples
+                date_prompt = {
+                    'en': "I couldn't understand the time. Please write like: 'January 7 at 10:00' or 'tomorrow at 2pm'.",
+                    'ru': "Я не смог понять время. Пожалуйста, напишите так: '7 января в 10:00' или 'завтра в 14:00'.",
+                    'es': "No pude entender la hora. Por favor escriba así: '7 de enero a las 10:00' o 'mañana a las 2pm'.",
+                    'he': "לא הצלחתי להבין את הזמן. אנא כתוב כך: '7 בינואר ב-10:00' או 'מחר ב-14:00'.",
+                }.get(lang, "I couldn't understand the time. Please write like: 'January 7 at 10:00' or 'tomorrow at 2pm'.")
+                logger.warning(f"[FSM] User stuck in date loop (attempt {date_ask_count}), providing format help")
+            elif date_ask_count == 2:
                 date_prompt = {'en': "When?", 'ru': "Когда?", 'es': "¿Cuándo?", 'he': "מתי?"}.get(lang, "When?")
             elif date_ask_count == 1:
                 date_prompt = get_msg('ask_date', lang)  # Medium verbosity
@@ -1109,12 +1119,20 @@ def get_date_prompt(lang: str, field_ask_count: int, user_prefers_concise: bool 
             'es': "¿Qué día le conviene?",
             'he': "איזה יום מתאים לך?",
         }
-    else:
+    elif field_ask_count == 2:
         prompts = {
             'en': "When?",
             'ru': "Когда?",
             'es': "¿Cuándo?",
             'he': "מתי?",
+        }
+    else:
+        # FIX: On 3+ attempts, provide explicit format examples to help user succeed
+        prompts = {
+            'en': "I couldn't understand the time. Please write like: 'January 7 at 10:00' or 'tomorrow at 2pm'.",
+            'ru': "Я не смог понять время. Пожалуйста, напишите так: '7 января в 10:00' или 'завтра в 14:00'.",
+            'es': "No pude entender la hora. Por favor escriba así: '7 de enero a las 10:00' o 'mañana a las 2pm'.",
+            'he': "לא הצלחתי להבין את הזמן. אנא כתוב כך: '7 בינואר ב-10:00' או 'מחר ב-14:00'.",
         }
 
     return prompts.get(lang, prompts['en'])

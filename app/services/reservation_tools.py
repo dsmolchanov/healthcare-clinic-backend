@@ -183,6 +183,93 @@ class ReservationTools:
                 return service
         return None
 
+    def _parse_natural_date(self, date_str: str) -> Optional[datetime]:
+        """
+        Parse natural language date to datetime object.
+
+        Supports:
+        - ISO format: "2026-01-07"
+        - English: "tomorrow", "next tuesday", "next week"
+        - Russian: "завтра", "вторник", "следующий понедельник"
+        - Spanish: "mañana", "próximo lunes"
+
+        Returns:
+            datetime object or None if parsing fails
+        """
+        if not date_str:
+            return None
+
+        date_str = date_str.strip()
+
+        # Try ISO format first (fast path)
+        try:
+            return datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            pass
+
+        # Try dateparser for natural language
+        try:
+            import dateparser
+            parsed = dateparser.parse(
+                date_str,
+                settings={
+                    'PREFER_DATES_FROM': 'future',
+                    'LANGUAGES': ['en', 'ru', 'es'],
+                }
+            )
+            if parsed:
+                logger.info(f"Parsed natural date '{date_str}' -> {parsed.strftime('%Y-%m-%d')}")
+                return parsed
+        except ImportError:
+            logger.warning("dateparser not installed, falling back to manual parsing")
+        except Exception as e:
+            logger.warning(f"dateparser failed for '{date_str}': {e}")
+
+        # Manual fallback for common patterns
+        date_lower = date_str.lower()
+        now = datetime.now()
+
+        # Tomorrow
+        if any(w in date_lower for w in ['tomorrow', 'завтра', 'mañana']):
+            return now + timedelta(days=1)
+
+        # Today
+        if any(w in date_lower for w in ['today', 'сегодня', 'hoy']):
+            return now
+
+        # Day of week mapping
+        day_map = {
+            'monday': 0, 'понедельник': 0, 'lunes': 0,
+            'tuesday': 1, 'вторник': 1, 'martes': 1,
+            'wednesday': 2, 'среда': 2, 'среду': 2, 'miércoles': 2,
+            'thursday': 3, 'четверг': 3, 'jueves': 3,
+            'friday': 4, 'пятница': 4, 'пятницу': 4, 'viernes': 4,
+            'saturday': 5, 'суббота': 5, 'субботу': 5, 'sábado': 5,
+            'sunday': 6, 'воскресенье': 6, 'domingo': 6,
+        }
+
+        # Find which day was mentioned
+        target_weekday = None
+        for day_name, weekday_num in day_map.items():
+            if day_name in date_lower:
+                target_weekday = weekday_num
+                break
+
+        if target_weekday is not None:
+            # Calculate days until target weekday
+            current_weekday = now.weekday()
+            days_ahead = target_weekday - current_weekday
+            if days_ahead <= 0:  # Target day already happened this week
+                days_ahead += 7
+            return now + timedelta(days=days_ahead)
+
+        # Next week
+        if any(w in date_lower for w in ['next week', 'следующей неделе', 'próxima semana']):
+            return now + timedelta(days=7)
+
+        logger.warning(f"Could not parse date: '{date_str}'")
+        return None
+
     async def check_availability_tool(
         self,
         service_name: str,
@@ -263,11 +350,11 @@ class ReservationTools:
                     }
 
         try:
-            # Parse preferred date
+            # Parse preferred date - FIX: Support natural language dates
             if preferred_date:
-                try:
-                    start_date = datetime.strptime(preferred_date, "%Y-%m-%d")
-                except ValueError:
+                start_date = self._parse_natural_date(preferred_date)
+                if start_date is None:
+                    logger.warning(f"Could not parse date '{preferred_date}', using today")
                     start_date = datetime.now()
             else:
                 start_date = datetime.now()

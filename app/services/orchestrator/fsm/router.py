@@ -526,11 +526,22 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
     faq_keywords = [
         'tell me about', 'what is', 'what does', 'how does', 'explain',
         'what happens during', 'describe', 'information about',
+        # English comparative questions
+        'difference', 'what is the difference', 'compare', 'which is better',
+        'how are they different', 'what\'s the difference',
+        # Russian informational
         'расскажите', 'расскажи', 'что такое', 'как проходит', 'как делается',
         'опишите', 'объясните', 'информация о', 'о процедуре', 'про процедуру',
         'сначала расскажите', 'сначала объясните',  # "first tell me" pattern
+        # Russian comparative questions - FIX: Added for "в чем разница?" patterns
+        'разница', 'в чем разница', 'какая разница', 'чем отличается', 'чем отличаются',
+        'отличие', 'отличия', 'сравните', 'что лучше', 'какой лучше', 'какая лучше',
+        'между ними', 'чем они отличаются',
+        # Spanish
         'cuéntame sobre', 'qué es', 'cómo funciona', 'explica',
         'información sobre', 'describe', 'cómo se hace',
+        # Spanish comparative
+        'diferencia', 'cuál es la diferencia', 'comparar', 'cuál es mejor',
     ]
     if any(kw in m for kw in faq_keywords):
         # Try to extract service type for FAQ
@@ -635,6 +646,27 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
         if this_day_match:
             target_date = f"this {this_day_match.group(1)}"
 
+    # FIX: Extract Russian day names (во вторник, в понедельник, etc.)
+    # Maps Russian day names to English for consistent downstream processing
+    if not target_date:
+        russian_day_map = {
+            'понедельник': 'monday',
+            'вторник': 'tuesday',
+            'среду': 'wednesday',      # accusative case
+            'среда': 'wednesday',
+            'четверг': 'thursday',
+            'пятницу': 'friday',       # accusative case
+            'пятница': 'friday',
+            'субботу': 'saturday',     # accusative case
+            'суббота': 'saturday',
+            'воскресенье': 'sunday',
+        }
+        for ru_day, en_day in russian_day_map.items():
+            if ru_day in m:
+                target_date = f"next {en_day}"
+                logger.info(f"Extracted Russian day '{ru_day}' -> 'next {en_day}'")
+                break
+
     # FIX: Check for time patterns like "at 3 AM" which imply scheduling
     if not target_date:
         time_match = re.search(r'(?:at\s+)?(\d{1,2})\s*(am|pm|AM|PM)', m)
@@ -645,6 +677,23 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
                 if day in m:
                     target_date = f"this {day}" if 'this' in m or 'this' not in m else day
                     break
+
+    # FIX: Extract time-of-day preference (утром/днём/вечером without specific hour)
+    # This handles "во вторник утром" where user doesn't specify exact time
+    time_of_day = None
+    morning_words = ['утром', 'с утра', 'утро', 'morning', 'por la mañana', 'in the morning']
+    afternoon_words = ['днём', 'днем', 'после обеда', 'afternoon', 'por la tarde', 'in the afternoon']
+    evening_words = ['вечером', 'вечер', 'evening', 'por la noche', 'in the evening']
+
+    if any(w in m for w in morning_words):
+        time_of_day = "morning"
+        logger.info(f"Extracted time-of-day preference: morning")
+    elif any(w in m for w in afternoon_words):
+        time_of_day = "afternoon"
+        logger.info(f"Extracted time-of-day preference: afternoon")
+    elif any(w in m for w in evening_words):
+        time_of_day = "evening"
+        logger.info(f"Extracted time-of-day preference: evening")
 
     # Extract patient name from patterns like "I'm Sarah Miller", "My name is John"
     patient_name = None
@@ -684,6 +733,7 @@ def fallback_router(message: str, language: str = "en") -> RouterOutput:
         route='scheduling',
         service_type=service_type,
         target_date=target_date,
+        time_of_day=time_of_day,  # FIX: Include time-of-day preference (morning/afternoon/evening)
         doctor_name=doctor_name,
         patient_name=patient_name,
         patient_phone=patient_phone,
