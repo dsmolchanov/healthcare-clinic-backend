@@ -30,6 +30,163 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks/evolution", tags=["webhooks"])
 
+# =============================================================================
+# DEPRECATED: FSM/LangGraph webhook processing
+# Messages now route to claude-agent-prod.fly.dev instead
+# Set USE_FSM_WEBHOOK=true to re-enable this fallback
+# =============================================================================
+USE_FSM_WEBHOOK = os.getenv("USE_FSM_WEBHOOK", "false").lower() == "true"
+
+
+# ============================================================================
+# HITL Helper Functions
+# ============================================================================
+
+async def _check_if_agent_message(message_id: str, message_text: str, remote_jid: str) -> bool:
+    """
+    Check if a fromMe message was sent by the agent (not human staff).
+
+    Uses two lookup strategies:
+    1. Primary: Match by provider_message_id
+    2. Fallback: Match by text_hash + remote_jid (for messages where provider_id wasn't captured)
+
+    Args:
+        message_id: WhatsApp message ID from webhook
+        message_text: Message text content
+        remote_jid: WhatsApp JID of recipient
+
+    Returns:
+        True if this message was sent by the agent, False if it's a human-sent message
+    """
+    import hashlib
+    from app.db.supabase_client import get_supabase_client
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        supabase = get_supabase_client()
+
+        # Strategy 1: Look up by provider_message_id (exact match)
+        if message_id:
+            result = supabase.table('outbound_messages').select('id').eq(
+                'provider_message_id', message_id
+            ).limit(1).execute()
+
+            if result.data:
+                logger.debug(f"Agent message confirmed via provider_message_id: {message_id}")
+                return True
+
+        # Strategy 2: Fallback - look up by text_hash + remote_jid (within last 5 minutes)
+        if message_text and remote_jid:
+            text_hash = hashlib.sha256(message_text.strip().lower().encode()).hexdigest()[:32]
+            five_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+
+            result = supabase.table('outbound_messages').select('id').eq(
+                'text_hash', text_hash
+            ).eq(
+                'remote_jid', remote_jid
+            ).gte(
+                'created_at', five_minutes_ago
+            ).limit(1).execute()
+
+            if result.data:
+                logger.debug(f"Agent message confirmed via text_hash fallback: {text_hash[:8]}...")
+                return True
+
+        # Not found in outbound_messages - this is a human-sent message
+        logger.info(f"Message not found in outbound_messages - classified as HUMAN message")
+        return False
+
+    except Exception as e:
+        logger.error(f"Error checking agent message: {e}")
+        # On error, assume it's an agent message to avoid false positives
+        # (Better to miss a human takeover than to incorrectly switch modes)
+        return True
+
+
+async def _switch_session_to_human_control(
+    remote_jid: str,
+    instance_name: str,
+    message_text: str
+) -> None:
+    """
+    Switch a session to human control mode.
+
+    Called when a human staff member sends a message from WhatsApp app.
+
+    Args:
+        remote_jid: WhatsApp JID of the patient
+        instance_name: WhatsApp instance name
+        message_text: The message sent by human staff
+    """
+    from datetime import datetime, timezone
+    from app.db.supabase_client import get_supabase_client
+
+    try:
+        supabase = get_supabase_client()
+
+        # Extract phone number from JID
+        phone_number = remote_jid.split("@")[0] if "@" in remote_jid else remote_jid
+
+        # Find the session for this phone/instance combination
+        # Sessions are stored in healthcare.conversation_sessions
+        result = supabase.schema('healthcare').table('conversation_sessions').select(
+            'id, control_mode'
+        ).eq(
+            'phone_number', phone_number
+        ).order(
+            'created_at', desc=True
+        ).limit(1).execute()
+
+        if not result.data:
+            logger.warning(
+                f"No session found for phone {phone_number} to switch to human control"
+            )
+            return
+
+        session_id = result.data[0]['id']
+        current_mode = result.data[0].get('control_mode', 'agent')
+
+        if current_mode == 'human':
+            logger.info(f"Session {session_id[:8]}... already in human control mode")
+            return
+
+        # Update session to human control mode
+        update_data = {
+            'control_mode': 'human',
+            'locked_at': datetime.now(timezone.utc).isoformat(),
+            'lock_reason': 'Human staff replied via WhatsApp',
+            'lock_source': 'whatsapp_human',
+            'unread_for_human_count': 0  # Reset unread count since human is responding
+        }
+
+        supabase.schema('healthcare').table('conversation_sessions').update(
+            update_data
+        ).eq('id', session_id).execute()
+
+        logger.info(
+            f"✅ Session {session_id[:8]}... switched to HUMAN control mode "
+            f"(triggered by staff message)"
+        )
+
+        # Store the human's message in conversation logs
+        try:
+            supabase.schema('healthcare').table('conversation_logs').insert({
+                'session_id': session_id,
+                'role': 'assistant',  # From patient's perspective, staff is the assistant
+                'message_content': message_text,
+                'metadata': {
+                    'source': 'human_staff',
+                    'control_mode': 'human',
+                    'instance_name': instance_name
+                }
+            }).execute()
+            logger.debug(f"Stored human staff message in conversation logs")
+        except Exception as log_error:
+            logger.warning(f"Failed to store human message: {log_error}")
+
+    except Exception as e:
+        logger.error(f"Error switching session to human control: {e}", exc_info=True)
+
 # Evolution API URL
 EVOLUTION_API_URL = os.getenv("EVOLUTION_SERVER_URL", "https://evolution-api-prod.fly.dev")
 
@@ -60,7 +217,15 @@ async def whatsapp_webhook_v2(
     - Single indexed query on cache miss
 
     CRITICAL: Must return IMMEDIATELY to avoid Evolution timeout
+
+    NOTE: DEPRECATED - Messages now route to claude-agent-prod.fly.dev
+    Set USE_FSM_WEBHOOK=true to re-enable FSM/LangGraph processing
     """
+    # DEPRECATED: FSM webhook disabled - messages go to claude-agent instead
+    if not USE_FSM_WEBHOOK:
+        logger.info(f"[WhatsApp Webhook V2] FSM disabled - messages should go to claude-agent")
+        return {"status": "ok", "message": "FSM webhook disabled - use claude-agent"}
+
     import datetime
     timestamp = datetime.datetime.now().isoformat()
 
@@ -351,10 +516,34 @@ async def process_evolution_message(instance_name: str, body_bytes: bytes):
         print(f"[Background] From number: {from_number}")
         print(f"[Background] Is from me: {is_from_me}")
 
-        # Skip our own messages
+        # HITL Phase 3: Check if fromMe message is agent-sent or human-sent
         if is_from_me:
-            print(f"[Background] ⏭️ Ignoring own message")
-            return
+            # Check if this message was sent by the agent
+            message_text = nested_message.get("conversation", "") or nested_message.get("extendedTextMessage", {}).get("text", "")
+            is_agent_message = await _check_if_agent_message(
+                message_id=message_id,
+                message_text=message_text,
+                remote_jid=key.get("remoteJid", "")
+            )
+
+            if is_agent_message:
+                # This is an echo of agent's message - skip processing
+                print(f"[Background] ⏭️ Ignoring agent message echo (id: {message_id})")
+                return
+            else:
+                # This is a human-sent message from WhatsApp app!
+                print(f"[Background] 👤 HUMAN MESSAGE DETECTED from clinic staff")
+                print(f"[Background] Switching session to human control mode")
+
+                # Get session and switch control mode
+                await _switch_session_to_human_control(
+                    remote_jid=key.get("remoteJid", ""),
+                    instance_name=actual_instance if 'actual_instance' in dir() else instance_name,
+                    message_text=message_text
+                )
+
+                # Don't process human messages through LLM - they're from staff
+                return
 
         # Extract push name (sender's name)
         push_name = message_data.get("pushName", "WhatsApp User")
@@ -906,7 +1095,15 @@ async def evolution_webhook_legacy(
 
     To migrate: Update Evolution API instance webhook URL to use token-based format:
     /webhooks/evolution/whatsapp/{webhook_token}
+
+    NOTE: DEPRECATED - Messages now route to claude-agent-prod.fly.dev
+    Set USE_FSM_WEBHOOK=true to re-enable FSM/LangGraph processing
     """
+    # DEPRECATED: FSM webhook disabled - messages go to claude-agent instead
+    if not USE_FSM_WEBHOOK:
+        logger.info(f"[Legacy Webhook] FSM disabled - messages should go to claude-agent")
+        return {"status": "ok", "message": "FSM webhook disabled - use claude-agent"}
+
     import datetime
     timestamp = datetime.datetime.now().isoformat()
 
