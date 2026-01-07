@@ -57,15 +57,16 @@ DATE_TIME_CONTEXT = """CURRENT DATE/TIME:
 # DATE RULES (HALLUCINATION GUARD)
 # =============================================================================
 
-DATE_RULES = """DATE CALCULATION RULES:
-- "Tomorrow" = {tomorrow_date} ({tomorrow_day})
-- "Next Tuesday" = The first Tuesday AFTER today ({current_date}).
-- "This Tuesday" = The Tuesday of the current week.
+DATE_RULES = """DATE HANDLING RULES:
+- Do NOT compute ISO dates from weekdays or relative phrases.
+- Pass the user's date phrase verbatim to preferred_date.
+- Tool output (date/weekday_local/display_date_local) is the ONLY source of truth.
+- If the tool requests clarification, ask a concrete follow-up question.
 
 HALLUCINATION GUARD:
 - You must ONLY use dates returned by the tool.
 - If the tool returns NO slots, say "No slots available" and offer alternatives.
-- NEVER invent availability.
+- NEVER invent availability or reasons not in tool output.
 """
 
 
@@ -88,6 +89,7 @@ TOOL USAGE (CRITICAL - YOU MUST FOLLOW):
 ⚠️ You DO NOT know any prices. You MUST call query_service_prices for ANY price question.
 ⚠️ You DO NOT know availability. You MUST call check_availability for ANY booking request.
 ⚠️ If you answer a price question without calling query_service_prices, you are WRONG.
+⚠️ Never compute ISO dates yourself. Pass the user's date phrase to preferred_date.
 
 MANDATORY TOOL CALLS:
 - "how much", "price", "cost", "сколько", "цена", "стоимость" → query_service_prices

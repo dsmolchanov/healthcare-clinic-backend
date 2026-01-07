@@ -115,7 +115,11 @@ def get_tool_schemas(clinic_id: str) -> List[Dict[str, Any]]:
                         },
                         "preferred_date": {
                             "type": "string",
-                            "description": "Preferred date in YYYY-MM-DD format or relative (e.g., 'tomorrow', 'next Monday'). Optional."
+                            "description": "Raw user date phrase (e.g., 'tomorrow', 'next Monday'). Optional."
+                        },
+                        "user_date_phrase": {
+                            "type": "string",
+                            "description": "Original user phrase for guardrails. Optional."
                         },
                         "time_preference": {
                             "type": "string",

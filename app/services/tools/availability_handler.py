@@ -40,7 +40,9 @@ class AvailabilityHandler(ToolHandler):
 
         result = await reservation_tools.check_availability_tool(**args)
 
-        if result.get('success'):
+        if result.get("status") == "needs_clarification" or result.get("requires_clarification"):
+            result_text = result.get("message") or "Could you clarify the date you prefer?"
+        elif result.get('success'):
             slots = result.get('available_slots', [])
             if slots:
                 result_text = self._format_clustered_slots(slots, result)

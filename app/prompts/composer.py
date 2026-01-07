@@ -10,6 +10,7 @@ Composes system prompts using simple .format() - no Jinja2.
 
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional
 
 from .components import (
@@ -320,8 +321,16 @@ class PromptComposer:
         saturday_hours = hours.get('saturday') or "Not provided"
         sunday_hours = hours.get('sunday') or "Not provided"
 
-        # Current date/time
-        now = datetime.now()
+        # Current date/time in clinic timezone
+        tz_name = clinic_profile.get('timezone') or 'UTC'
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            logger.warning(f"Invalid timezone '{tz_name}', falling back to UTC")
+            tz_name = 'UTC'
+            tz = ZoneInfo(tz_name)
+
+        now = datetime.now(tz)
         current_date = now.strftime('%Y-%m-%d')
         current_day = now.strftime('%A')
         current_time = now.strftime('%H:%M')

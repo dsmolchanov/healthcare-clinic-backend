@@ -8,6 +8,8 @@ integrating with existing calendar systems and appointment services.
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import re
 import asyncio
 import json
 from enum import Enum
@@ -28,6 +30,19 @@ from app.database import create_supabase_client
 from app.config import get_redis_client
 
 logger = logging.getLogger(__name__)
+
+MORNING_CUTOFF_HOUR = 12
+WEEKDAY_TOKENS = {
+    0: ["monday", "понедельник", "понед", "ponedel"],
+    1: ["tuesday", "вторник", "втор", "vtorn"],
+    2: ["wednesday", "среда", "сред", "sred"],
+    3: ["thursday", "четверг", "четвер", "chetver"],
+    4: ["friday", "пятница", "пятниц", "pyatn"],
+    5: ["saturday", "суббота", "суббот", "subbot"],
+    6: ["sunday", "воскресенье", "воскрес", "voskres"]
+}
+NEXT_WEEK_TOKENS = ["next week", "следующей неделе", "следующую неделю", "proxima semana", "próxima semana"]
+NEXT_TOKENS = ["next", "следующ", "proximo", "próximo"]
 
 class ReservationStatus(Enum):
     """Status of a reservation"""
@@ -183,31 +198,99 @@ class ReservationTools:
                 return service
         return None
 
-    def _parse_natural_date(self, date_str: str) -> Optional[datetime]:
+    def _get_clinic_tzinfo(self) -> ZoneInfo:
+        """Return clinic timezone info, falling back to UTC."""
+        tz_name = self.clinic_timezone or 'UTC'
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            logger.warning(f"Invalid timezone '{tz_name}', falling back to UTC")
+            return ZoneInfo('UTC')
+
+    def _extract_weekday(self, date_str: str) -> Optional[int]:
+        """Detect weekday mention in a date phrase."""
+        lowered = date_str.lower()
+        for weekday, tokens in WEEKDAY_TOKENS.items():
+            for token in tokens:
+                if token in lowered:
+                    return weekday
+        return None
+
+    def _has_next_marker(self, date_str: str) -> bool:
+        """Detect 'next' markers in multiple languages."""
+        lowered = date_str.lower()
+        return any(token in lowered for token in NEXT_TOKENS)
+
+    def _resolve_weekday_target(
+        self,
+        target_weekday: int,
+        now_local: datetime,
+        force_next_week: bool
+    ) -> datetime.date:
+        """Resolve weekday to a concrete date with cutoff handling."""
+        current_weekday = now_local.weekday()
+        days_ahead = (target_weekday - current_weekday) % 7
+
+        if force_next_week:
+            if days_ahead == 0:
+                days_ahead = 7
+            elif target_weekday > current_weekday:
+                days_ahead += 7
+        elif days_ahead == 0 and now_local.hour >= MORNING_CUTOFF_HOUR:
+            days_ahead = 7
+
+        return now_local.date() + timedelta(days=days_ahead)
+
+    def _parse_natural_date(
+        self,
+        date_str: str,
+        now_local: Optional[datetime] = None
+    ) -> Optional[datetime]:
         """
-        Parse natural language date to datetime object.
+        Parse natural language date to datetime object in clinic timezone.
 
         Supports:
         - ISO format: "2026-01-07"
-        - English: "tomorrow", "next tuesday", "next week"
-        - Russian: "завтра", "вторник", "следующий понедельник"
-        - Spanish: "mañana", "próximo lunes"
-
-        Returns:
-            datetime object or None if parsing fails
+        - English/Russian/Spanish weekdays
+        - Relative phrases like "tomorrow", "next week"
         """
         if not date_str:
             return None
 
-        date_str = date_str.strip()
+        date_lower = date_str.strip().lower()
+        now_local = now_local or datetime.now(self._get_clinic_tzinfo())
+        today = now_local.date()
 
-        # Try ISO format first (fast path)
+        # ISO format fast path
         try:
-            return datetime.strptime(date_str, "%Y-%m-%d")
+            parsed_date = datetime.strptime(date_lower.split('T')[0], "%Y-%m-%d").date()
+            return datetime.combine(parsed_date, datetime.min.time(), tzinfo=now_local.tzinfo)
         except ValueError:
             pass
 
-        # Try dateparser for natural language
+        iso_match = re.search(r"\d{4}-\d{2}-\d{2}", date_lower)
+        if iso_match:
+            try:
+                parsed_date = datetime.strptime(iso_match.group(0), "%Y-%m-%d").date()
+                return datetime.combine(parsed_date, datetime.min.time(), tzinfo=now_local.tzinfo)
+            except ValueError:
+                pass
+
+        if any(token in date_lower for token in ['today', 'сегодня', 'hoy', 'hoje']):
+            return now_local
+        if any(token in date_lower for token in ['tomorrow', 'завтра', 'mañana', 'amanhã']):
+            return now_local + timedelta(days=1)
+
+        matched_weekday = self._extract_weekday(date_lower)
+        if matched_weekday is not None:
+            force_next_week = self._has_next_marker(date_lower)
+            target_date = self._resolve_weekday_target(matched_weekday, now_local, force_next_week)
+            return datetime.combine(target_date, now_local.time(), tzinfo=now_local.tzinfo)
+
+        if any(token in date_lower for token in NEXT_WEEK_TOKENS):
+            return now_local + timedelta(days=7)
+
+        # Fallback to dateparser if installed
         try:
             import dateparser
             parsed = dateparser.parse(
@@ -215,9 +298,14 @@ class ReservationTools:
                 settings={
                     'PREFER_DATES_FROM': 'future',
                     'LANGUAGES': ['en', 'ru', 'es'],
+                    'RELATIVE_BASE': now_local,
+                    'TIMEZONE': self.clinic_timezone or 'UTC',
+                    'RETURN_AS_TIMEZONE_AWARE': True
                 }
             )
             if parsed:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=now_local.tzinfo)
                 logger.info(f"Parsed natural date '{date_str}' -> {parsed.strftime('%Y-%m-%d')}")
                 return parsed
         except ImportError:
@@ -225,55 +313,39 @@ class ReservationTools:
         except Exception as e:
             logger.warning(f"dateparser failed for '{date_str}': {e}")
 
-        # Manual fallback for common patterns
-        date_lower = date_str.lower()
-        now = datetime.now()
-
-        # Tomorrow
-        if any(w in date_lower for w in ['tomorrow', 'завтра', 'mañana']):
-            return now + timedelta(days=1)
-
-        # Today
-        if any(w in date_lower for w in ['today', 'сегодня', 'hoy']):
-            return now
-
-        # Day of week mapping
-        day_map = {
-            'monday': 0, 'понедельник': 0, 'lunes': 0,
-            'tuesday': 1, 'вторник': 1, 'martes': 1,
-            'wednesday': 2, 'среда': 2, 'среду': 2, 'miércoles': 2,
-            'thursday': 3, 'четверг': 3, 'jueves': 3,
-            'friday': 4, 'пятница': 4, 'пятницу': 4, 'viernes': 4,
-            'saturday': 5, 'суббота': 5, 'субботу': 5, 'sábado': 5,
-            'sunday': 6, 'воскресенье': 6, 'domingo': 6,
-        }
-
-        # Find which day was mentioned
-        target_weekday = None
-        for day_name, weekday_num in day_map.items():
-            if day_name in date_lower:
-                target_weekday = weekday_num
-                break
-
-        if target_weekday is not None:
-            # Calculate days until target weekday
-            current_weekday = now.weekday()
-            days_ahead = target_weekday - current_weekday
-            if days_ahead <= 0:  # Target day already happened this week
-                days_ahead += 7
-            return now + timedelta(days=days_ahead)
-
-        # Next week
-        if any(w in date_lower for w in ['next week', 'следующей неделе', 'próxima semana']):
-            return now + timedelta(days=7)
-
         logger.warning(f"Could not parse date: '{date_str}'")
         return None
+
+    def _build_clarification_response(
+        self,
+        message: str,
+        preferred_date: Optional[str],
+        user_date_phrase: Optional[str],
+        computed_date: Optional[datetime.date],
+        timezone_name: str
+    ) -> Dict[str, Any]:
+        """Return a stable envelope requiring clarification."""
+        resolved_date = computed_date or datetime.now(self._get_clinic_tzinfo()).date()
+        return {
+            "success": False,
+            "status": "needs_clarification",
+            "requires_clarification": True,
+            "message": message,
+            "preferred_date": preferred_date,
+            "user_date_phrase": user_date_phrase,
+            "computed_date": resolved_date.isoformat(),
+            "date": resolved_date.isoformat(),
+            "timezone": timezone_name,
+            "weekday_local": resolved_date.strftime("%A"),
+            "display_date_local": resolved_date.strftime("%B %d, %Y"),
+            "available_slots": []
+        }
 
     async def check_availability_tool(
         self,
         service_name: str,
         preferred_date: Optional[str] = None,
+        user_date_phrase: Optional[str] = None,
         time_preference: Optional[str] = None,
         doctor_id: Optional[str] = None,
         flexibility_days: Optional[int] = None
@@ -284,6 +356,7 @@ class ReservationTools:
         Args:
             service_name: Name or type of service
             preferred_date: Preferred date (YYYY-MM-DD format)
+            user_date_phrase: Original user date phrase for guardrails
             time_preference: Time preference (morning/afternoon/evening)
             doctor_id: Specific doctor ID if requested
             flexibility_days: Number of days to search for availability
@@ -309,6 +382,11 @@ class ReservationTools:
                 # No specific date - use wider search
                 flexibility_days = 7
                 logger.info(f"No date preference, using flexibility_days=7")
+
+        tzinfo = self._get_clinic_tzinfo()
+        now_local = datetime.now(tzinfo)
+        timezone_name = getattr(tzinfo, "key", None) or self.clinic_timezone or 'UTC'
+        user_date_phrase = user_date_phrase or preferred_date
         # P0 GUARD: Fail fast if doctor_id is None or "None" string
         if doctor_id is not None and (doctor_id == "None" or str(doctor_id).strip() == ""):
             logger.warning(
@@ -352,12 +430,27 @@ class ReservationTools:
         try:
             # Parse preferred date - FIX: Support natural language dates
             if preferred_date:
-                start_date = self._parse_natural_date(preferred_date)
+                matched_weekday = self._extract_weekday(preferred_date)
+                start_date = self._parse_natural_date(preferred_date, now_local=now_local)
                 if start_date is None:
-                    logger.warning(f"Could not parse date '{preferred_date}', using today")
-                    start_date = datetime.now()
+                    logger.warning(f"Could not parse date '{preferred_date}'")
+                    return self._build_clarification_response(
+                        message="I couldn't understand the date. Which day should I check?",
+                        preferred_date=preferred_date,
+                        user_date_phrase=user_date_phrase,
+                        computed_date=None,
+                        timezone_name=timezone_name
+                    )
+                if matched_weekday is not None and start_date.weekday() != matched_weekday:
+                    return self._build_clarification_response(
+                        message="Just to confirm, which day do you mean?",
+                        preferred_date=preferred_date,
+                        user_date_phrase=user_date_phrase,
+                        computed_date=start_date.date(),
+                        timezone_name=timezone_name
+                    )
             else:
-                start_date = datetime.now()
+                start_date = now_local
 
             end_date = start_date + timedelta(days=flexibility_days)
 
@@ -520,6 +613,7 @@ class ReservationTools:
             # Format response
             response = {
                 "success": True,
+                "status": "ok",
                 "service": {
                     "id": service['id'],
                     "name": service['name'],
@@ -530,6 +624,12 @@ class ReservationTools:
                 },
                 "available_slots": verified_slots,
                 "total_slots_found": len(slots),
+                "date": start_date.date().isoformat(),
+                "timezone": timezone_name,
+                "weekday_local": start_date.strftime("%A"),
+                "display_date_local": start_date.strftime("%B %d, %Y"),
+                "preferred_date": preferred_date,
+                "user_date_phrase": user_date_phrase,
                 "search_parameters": {
                     "start_date": start_date.isoformat(),
                     "end_date": end_date.isoformat(),
