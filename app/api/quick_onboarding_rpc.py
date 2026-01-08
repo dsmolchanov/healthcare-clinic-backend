@@ -155,6 +155,7 @@ class ParseWebsiteResponse(BaseModel):
     state: Optional[str] = None
     zip_code: Optional[str] = None
     timezone: Optional[str] = None
+    business_hours: Optional[dict] = None
 
 
 class QuickWhatsApp(BaseModel):
@@ -453,14 +454,18 @@ async def parse_website(data: ParseWebsiteRequest):
 
         logger.info(f"Parsing website: {data.url}")
 
-        # Use a lightweight crawl - only homepage, no deep crawling
-        crawler = EnhancedWebCrawler(max_depth=1, max_pages=3, timeout=15)
+        # Use a lightweight crawl - homepage + important pages like /contact, /about, /hours
+        crawler = EnhancedWebCrawler(max_depth=1, max_pages=5, timeout=20)
         result = await crawler.crawl(data.url)
 
         # Extract structured data
         structured = result.get('structured_data', {})
         contact = structured.get('contact', {})
         clinic_info = structured.get('clinic_info', {})
+        hours_raw = structured.get('hours', {})
+
+        # Also check raw pages for additional data
+        raw_pages = result.get('raw_pages', [])
 
         # Get clinic name from title or extracted info
         name = clinic_info.get('name', '')
@@ -468,9 +473,20 @@ async def parse_website(data: ParseWebsiteRequest):
         if name:
             name = re.sub(r'\s*[\|\-–—]\s*.*$', '', name).strip()
 
-        # Get phone - first valid one
+        # Get phone - first valid one, format it nicely
         phones = contact.get('phones', [])
-        phone = phones[0] if phones else None
+        phone = None
+        if phones:
+            # Get the first phone and format it
+            raw_phone = phones[0]
+            # Clean and format: extract digits only
+            digits = re.sub(r'\D', '', raw_phone)
+            if len(digits) == 10:
+                phone = f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+            elif len(digits) == 11 and digits[0] == '1':
+                phone = f"({digits[1:4]}) {digits[4:7]}-{digits[7:]}"
+            else:
+                phone = raw_phone
 
         # Get email - first valid one
         emails = contact.get('emails', [])
@@ -516,6 +532,45 @@ async def parse_website(data: ParseWebsiteRequest):
                     state = state_zip_match.group(1)
                     zip_code = state_zip_match.group(2)
 
+        # Extract business hours from structured data and raw pages
+        business_hours = {}
+
+        # First try the structured hours from the crawler
+        if hours_raw:
+            business_hours = hours_raw
+
+        # If no structured hours, try to extract from raw pages
+        if not business_hours:
+            for page in raw_pages:
+                page_hours = page.get('business_hours', {})
+                if page_hours:
+                    business_hours = page_hours
+                    break
+
+        # Normalize business hours format
+        normalized_hours = {}
+        days_map = {
+            'monday': 'monday', 'mon': 'monday',
+            'tuesday': 'tuesday', 'tue': 'tuesday', 'tues': 'tuesday',
+            'wednesday': 'wednesday', 'wed': 'wednesday',
+            'thursday': 'thursday', 'thu': 'thursday', 'thur': 'thursday', 'thurs': 'thursday',
+            'friday': 'friday', 'fri': 'friday',
+            'saturday': 'saturday', 'sat': 'saturday',
+            'sunday': 'sunday', 'sun': 'sunday'
+        }
+
+        for key, value in business_hours.items():
+            normalized_key = days_map.get(key.lower(), key.lower())
+            if value and normalized_key in ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']:
+                # Clean up the hours string
+                if isinstance(value, str):
+                    value = value.strip()
+                    # Check if it indicates closed
+                    if re.search(r'(?i)closed|off', value):
+                        normalized_hours[normalized_key] = 'Closed'
+                    else:
+                        normalized_hours[normalized_key] = value
+
         # Determine timezone from state (US states only for now)
         timezone = ''
         state_timezones = {
@@ -551,6 +606,7 @@ async def parse_website(data: ParseWebsiteRequest):
             'state': state or None,
             'zip_code': zip_code or None,
             'timezone': timezone or None,
+            'business_hours': normalized_hours if normalized_hours else None,
         }
 
         logger.info(f"Parsed website result: {response}")
