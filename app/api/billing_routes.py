@@ -13,6 +13,11 @@ from pydantic import BaseModel
 import stripe
 
 from app.database import get_core_client, get_healthcare_client
+from app.services.billing_sync_service import (
+    execute_doctor_sync,
+    get_organization_doctor_count,
+    sync_doctor_count_for_clinic
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/billing", tags=["billing"])
@@ -27,11 +32,11 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 # ==============================================================================
 
 class CheckoutSessionRequest(BaseModel):
-    tier_name: str
+    tier_name: str = "per_doctor"  # Default to per_doctor, but accept legacy tiers
     return_url: str
     cancel_url: str
     organization_id: Optional[str] = None  # If not provided, get from auth
-    specialist_count: int = 1  # Number of specialists for per-seat pricing
+    specialist_count: Optional[int] = None  # Keep for backwards compatibility with legacy tiers
 
 
 class CheckoutSessionResponse(BaseModel):
@@ -54,6 +59,10 @@ class SubscriptionStatus(BaseModel):
     current_period_end: Optional[str] = None
     trial_ends_at: Optional[str] = None
     stripe_subscription_id: Optional[str] = None
+    doctor_count: int = 0
+    price_per_doctor: float = 29.0
+    monthly_total: float = 0.0
+    is_per_doctor_billing: bool = False  # Helps frontend show appropriate UI
 
 
 # ==============================================================================
@@ -160,15 +169,14 @@ async def log_billing_event(
 @router.post("/create-checkout-session", response_model=CheckoutSessionResponse)
 async def create_checkout_session(request: CheckoutSessionRequest):
     """
-    Create a Stripe Checkout session for subscription purchase/upgrade.
+    Create a Stripe Checkout session for subscription purchase.
 
-    The user will be redirected to Stripe's hosted checkout page.
+    For per_doctor tier: Doctor count is automatically calculated from the database.
+    For legacy tiers: Uses provided specialist_count or defaults to 1.
     """
     if not stripe.api_key:
         raise HTTPException(status_code=500, detail="Stripe is not configured")
 
-    # For now, require organization_id in request
-    # TODO: Get from authenticated user's JWT
     if not request.organization_id:
         raise HTTPException(status_code=400, detail="organization_id is required")
 
@@ -177,19 +185,39 @@ async def create_checkout_session(request: CheckoutSessionRequest):
         customer_id = await get_or_create_stripe_customer(request.organization_id)
 
         # Get price ID for requested tier
-        price_id, product_id = await get_tier_price_id(request.tier_name)
+        price_id, _ = await get_tier_price_id(request.tier_name)
 
-        # Check if customer already has an active subscription
-        # If so, they should use the customer portal for upgrades
-        existing_subs = stripe.Subscription.list(customer=customer_id, status='active', limit=1)
-        if existing_subs.data:
+        # Check if customer already has an active or trialing subscription
+        # IMPORTANT: Include 'trialing' to prevent duplicate subscriptions
+        existing_subs = stripe.Subscription.list(customer=customer_id, limit=10)
+        active_or_trialing = [
+            s for s in existing_subs.data
+            if s.status in ('active', 'trialing', 'past_due', 'incomplete')
+        ]
+        if active_or_trialing:
             raise HTTPException(
                 status_code=400,
-                detail="You already have an active subscription. Use 'Manage Billing' to upgrade."
+                detail="You already have an active subscription. Use 'Manage Billing' to update."
             )
 
-        # Use specialist count for quantity (per-seat pricing model)
-        quantity = max(1, request.specialist_count)
+        # Determine quantity based on tier type
+        if request.tier_name == "per_doctor":
+            # Auto-calculate doctor count for per-doctor tier
+            doctor_count = await get_organization_doctor_count(request.organization_id)
+
+            # Require at least 1 active doctor to subscribe
+            if doctor_count < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="You must have at least 1 active doctor to subscribe. Please add a doctor first."
+                )
+
+            quantity = doctor_count  # No max(1, ...) needed - we check above
+            trial_days = 15
+        else:
+            # Legacy tier - use provided specialist_count or default to 1
+            quantity = request.specialist_count or 1
+            trial_days = 14  # Legacy tiers use 14-day trial
 
         # Create Checkout Session
         session = stripe.checkout.Session.create(
@@ -197,34 +225,31 @@ async def create_checkout_session(request: CheckoutSessionRequest):
             customer=customer_id,
             line_items=[{
                 "price": price_id,
-                "quantity": quantity  # Number of specialists
+                "quantity": quantity
             }],
             success_url=request.return_url + "?session_id={CHECKOUT_SESSION_ID}&status=success",
             cancel_url=request.cancel_url + "?status=cancelled",
             subscription_data={
+                "trial_period_days": trial_days,
                 "metadata": {
                     "organization_id": request.organization_id,
                     "tier_name": request.tier_name,
-                    "specialist_count": str(quantity)
+                    "doctor_count": str(quantity)
                 }
             },
             metadata={
                 "organization_id": request.organization_id,
                 "tier_name": request.tier_name,
-                "specialist_count": str(quantity)
+                "doctor_count": str(quantity)
             },
-            # Enable automatic tax if configured in Stripe
-            # automatic_tax={"enabled": True},
-            # Allow promotion codes
             allow_promotion_codes=True,
-            # Collect billing address for tax purposes
             billing_address_collection="required"
         )
 
-        logger.info(f"Created checkout session {session.id} for org {request.organization_id}")
+        logger.info(f"Created checkout session {session.id} for org {request.organization_id}, tier {request.tier_name}, quantity {quantity}")
 
         return CheckoutSessionResponse(
-            url=session.url,
+            url=session.url or "",
             session_id=session.id
         )
 
@@ -284,43 +309,139 @@ async def create_portal_session(request: PortalSessionRequest):
 
 
 @router.get("/subscription-status", response_model=SubscriptionStatus)
-async def get_subscription_status(organization_id: str):
+async def get_subscription_status_endpoint(organization_id: str):
     """Get current subscription status for an organization."""
     healthcare_client = get_healthcare_client()
 
-    # Get the first clinic for this organization
+    # Try organization_subscriptions first (new table)
+    org_sub_result = healthcare_client.table("organization_subscriptions").select(
+        "tier, status, current_period_end, trial_ends_at, stripe_subscription_id, doctor_count_cached, price_per_doctor"
+    ).eq("organization_id", organization_id).limit(1).execute()
+
+    if org_sub_result.data and len(org_sub_result.data) > 0:
+        sub = org_sub_result.data[0]  # Get first result
+        doctor_count = sub.get("doctor_count_cached", 0)
+        price_per_doctor = sub.get("price_per_doctor", 29.0)
+        tier = sub.get("tier", "per_doctor")
+
+        return SubscriptionStatus(
+            tier=tier,
+            status=sub.get("status", "inactive"),
+            current_period_end=sub.get("current_period_end"),
+            trial_ends_at=sub.get("trial_ends_at"),
+            stripe_subscription_id=sub.get("stripe_subscription_id"),
+            doctor_count=doctor_count,
+            price_per_doctor=price_per_doctor,
+            monthly_total=doctor_count * price_per_doctor if tier == "per_doctor" else 0,
+            is_per_doctor_billing=(tier == "per_doctor")
+        )
+
+    # Fallback to clinic_subscriptions for legacy data
     clinic_result = healthcare_client.table("clinics").select(
         "id"
     ).eq("organization_id", organization_id).limit(1).execute()
 
     if not clinic_result.data:
-        # Return default status if no clinic
+        # No clinic yet - show preview of per-doctor pricing
+        doctor_count = await get_organization_doctor_count(organization_id)
         return SubscriptionStatus(
-            tier="starter",
-            status="inactive"
+            tier="per_doctor",
+            status="inactive",
+            doctor_count=doctor_count,
+            price_per_doctor=29.0,
+            monthly_total=max(1, doctor_count) * 29.0,
+            is_per_doctor_billing=True
         )
 
     clinic_id = clinic_result.data[0]["id"]
 
-    # Get subscription for this clinic
     sub_result = healthcare_client.table("clinic_subscriptions").select(
         "tier, status, current_period_end, trial_ends_at, stripe_subscription_id"
-    ).eq("clinic_id", clinic_id).single().execute()
+    ).eq("clinic_id", clinic_id).limit(1).execute()
 
-    if not sub_result.data:
+    if not sub_result.data or len(sub_result.data) == 0:
+        doctor_count = await get_organization_doctor_count(organization_id)
         return SubscriptionStatus(
-            tier="starter",
-            status="inactive"
+            tier="per_doctor",
+            status="inactive",
+            doctor_count=doctor_count,
+            price_per_doctor=29.0,
+            monthly_total=max(1, doctor_count) * 29.0,
+            is_per_doctor_billing=True
         )
 
-    sub = sub_result.data
+    sub = sub_result.data[0]
+    tier = sub.get("tier", "starter")
+
+    # For legacy tiers, don't show per-doctor pricing
+    if tier != "per_doctor":
+        return SubscriptionStatus(
+            tier=tier,
+            status=sub.get("status", "inactive"),
+            current_period_end=sub.get("current_period_end"),
+            trial_ends_at=sub.get("trial_ends_at"),
+            stripe_subscription_id=sub.get("stripe_subscription_id"),
+            doctor_count=0,
+            price_per_doctor=0,
+            monthly_total=0,
+            is_per_doctor_billing=False
+        )
+
+    doctor_count = await get_organization_doctor_count(organization_id)
     return SubscriptionStatus(
-        tier=sub.get("tier", "starter"),
+        tier=tier,
         status=sub.get("status", "inactive"),
         current_period_end=sub.get("current_period_end"),
         trial_ends_at=sub.get("trial_ends_at"),
-        stripe_subscription_id=sub.get("stripe_subscription_id")
+        stripe_subscription_id=sub.get("stripe_subscription_id"),
+        doctor_count=doctor_count,
+        price_per_doctor=29.0,
+        monthly_total=doctor_count * 29.0,
+        is_per_doctor_billing=True
     )
+
+
+# ==============================================================================
+# Doctor Sync Endpoints
+# ==============================================================================
+
+@router.post("/sync-doctor-count")
+async def sync_doctor_count(organization_id: str):
+    """
+    Sync the current doctor count to Stripe subscription.
+    Called when doctors are added, removed, or deactivated.
+
+    SAFETY: Only syncs for 'per_doctor' tier subscriptions.
+    """
+    result = await execute_doctor_sync(organization_id)
+
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("message"))
+
+    # Log billing event for audit trail
+    if result.get("status") == "success":
+        await log_billing_event(
+            organization_id=organization_id,
+            event_type="doctor_count_synced",
+            stripe_subscription_id=result.get("subscription_id"),
+            metadata={
+                "doctor_count": result.get("doctor_count"),
+                "billable_count": result.get("billable_count"),
+                "previous_quantity": result.get("previous_quantity")
+            }
+        )
+
+    return result
+
+
+@router.post("/doctor-changed")
+async def doctor_changed_webhook(clinic_id: str):
+    """
+    Webhook called after doctor add/remove/deactivate operations.
+    Triggers billing sync for the clinic's organization.
+    """
+    result = await sync_doctor_count_for_clinic(clinic_id)
+    return result
 
 
 # ==============================================================================
@@ -393,14 +514,13 @@ async def handle_checkout_completed(event):
     """Handle successful checkout - activate subscription."""
     session = event["data"]["object"]
 
-    # Extract metadata
     organization_id = session.get("metadata", {}).get("organization_id")
-    tier_name = session.get("metadata", {}).get("tier_name")
+    tier_name = session.get("metadata", {}).get("tier_name", "per_doctor")
     subscription_id = session.get("subscription")
     customer_id = session.get("customer")
 
-    if not organization_id or not tier_name:
-        logger.error(f"Missing metadata in checkout session: {session.get('id')}")
+    if not organization_id:
+        logger.error(f"Missing organization_id in checkout session: {session.get('id')}")
         return
 
     logger.info(f"Checkout completed for org {organization_id}, tier {tier_name}")
@@ -411,21 +531,53 @@ async def handle_checkout_completed(event):
     healthcare_client = get_healthcare_client()
     core_client = get_core_client()
 
-    # Get all clinics for this organization
+    # Get the price ID from the subscription
+    price_id = None
+    if subscription.get("items", {}).get("data"):
+        price_id = subscription["items"]["data"][0].get("price", {}).get("id")
+
+    # Get current doctor count
+    doctor_count = await get_organization_doctor_count(organization_id)
+
+    # Determine status
+    sub_status = "trialing" if subscription.status == "trialing" else "active"
+
+    # Create/update organization_subscriptions record (new authoritative source)
+    healthcare_client.table("organization_subscriptions").upsert({
+        "organization_id": organization_id,
+        "tier": tier_name,
+        "status": sub_status,
+        "stripe_subscription_id": subscription_id,
+        "stripe_price_id": price_id,
+        "doctor_count_cached": doctor_count,
+        "trial_ends_at": datetime.fromtimestamp(
+            subscription.trial_end, tz=timezone.utc
+        ).isoformat() if subscription.trial_end else None,
+        "current_period_start": datetime.fromtimestamp(
+            subscription.current_period_start, tz=timezone.utc
+        ).isoformat(),
+        "current_period_end": datetime.fromtimestamp(
+            subscription.current_period_end, tz=timezone.utc
+        ).isoformat(),
+        "last_synced_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }, on_conflict="organization_id").execute()
+
+    # Also update clinic_subscriptions for backwards compatibility
     clinics_result = healthcare_client.table("clinics").select(
         "id"
     ).eq("organization_id", organization_id).execute()
 
-    # Update each clinic's subscription
     for clinic in clinics_result.data or []:
         clinic_id = clinic["id"]
-
-        # Upsert clinic subscription
         healthcare_client.table("clinic_subscriptions").upsert({
             "clinic_id": clinic_id,
             "tier": tier_name,
-            "status": "active",
+            "status": sub_status,
             "stripe_subscription_id": subscription_id,
+            "trial_ends_at": datetime.fromtimestamp(
+                subscription.trial_end, tz=timezone.utc
+            ).isoformat() if subscription.trial_end else None,
             "current_period_start": datetime.fromtimestamp(
                 subscription.current_period_start, tz=timezone.utc
             ).isoformat(),
@@ -434,8 +586,6 @@ async def handle_checkout_completed(event):
             ).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat()
         }, on_conflict="clinic_id").execute()
-
-        logger.info(f"Activated subscription for clinic {clinic_id}")
 
     # Update organization's subscription_tier
     core_client.table("organizations").update({
@@ -452,13 +602,14 @@ async def handle_checkout_completed(event):
         status="success",
         metadata={
             "tier_name": tier_name,
-            "session_id": session.get("id")
+            "session_id": session.get("id"),
+            "doctor_count": doctor_count
         }
     )
 
 
 async def handle_subscription_updated(event):
-    """Handle subscription updates (upgrades/downgrades)."""
+    """Handle subscription updates (upgrades/downgrades, trial-to-active, etc)."""
     subscription = event["data"]["object"]
     subscription_id = subscription.get("id")
     customer_id = subscription.get("customer")
@@ -477,14 +628,14 @@ async def handle_subscription_updated(event):
 
     organization_id = org_result.data["id"]
 
-    # Get the new tier from the subscription items
-    # Assuming single product subscription
+    # Get the tier from the subscription items
     items = subscription.get("items", {}).get("data", [])
     if not items:
         logger.error(f"No items in subscription {subscription_id}")
         return
 
     price_id = items[0].get("price", {}).get("id")
+    quantity = items[0].get("quantity", 1)
 
     # Look up tier by price ID
     tier_result = healthcare_client.table("subscription_tiers").select(
@@ -492,8 +643,8 @@ async def handle_subscription_updated(event):
     ).eq("stripe_price_id", price_id).single().execute()
 
     if not tier_result.data:
-        logger.warning(f"Unknown price ID: {price_id}")
-        tier_name = "unknown"
+        logger.warning(f"Unknown price ID: {price_id}, defaulting to per_doctor")
+        tier_name = "per_doctor"
     else:
         tier_name = tier_result.data["tier_name"]
 
@@ -503,11 +654,33 @@ async def handle_subscription_updated(event):
         "past_due": "past_due",
         "canceled": "cancelled",
         "unpaid": "suspended",
-        "trialing": "trial"
+        "trialing": "trialing",  # Keep consistent with our constraint
+        "incomplete": "incomplete"
     }
     status = status_map.get(subscription.get("status"), "inactive")
 
-    # Update all clinic subscriptions for this organization
+    # Update organization_subscriptions (new authoritative source)
+    healthcare_client.table("organization_subscriptions").upsert({
+        "organization_id": organization_id,
+        "tier": tier_name,
+        "status": status,
+        "stripe_subscription_id": subscription_id,
+        "stripe_price_id": price_id,
+        "doctor_count_cached": quantity,  # Update cached count from Stripe quantity
+        "trial_ends_at": datetime.fromtimestamp(
+            subscription.trial_end, tz=timezone.utc
+        ).isoformat() if subscription.get("trial_end") else None,
+        "current_period_start": datetime.fromtimestamp(
+            subscription.current_period_start, tz=timezone.utc
+        ).isoformat(),
+        "current_period_end": datetime.fromtimestamp(
+            subscription.current_period_end, tz=timezone.utc
+        ).isoformat(),
+        "last_synced_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }, on_conflict="organization_id").execute()
+
+    # Also update clinic_subscriptions for backwards compatibility
     clinics_result = healthcare_client.table("clinics").select(
         "id"
     ).eq("organization_id", organization_id).execute()
@@ -530,7 +703,7 @@ async def handle_subscription_updated(event):
         "subscription_tier": tier_name
     }).eq("id", organization_id).execute()
 
-    logger.info(f"Updated subscription {subscription_id} to tier {tier_name}, status {status}")
+    logger.info(f"Updated subscription {subscription_id} to tier {tier_name}, status {status}, quantity {quantity}")
 
     # Log billing event
     await log_billing_event(
@@ -678,6 +851,25 @@ async def handle_invoice_failed(event):
         currency=invoice.get("currency", "usd"),
         status="failed"
     )
+
+
+# ==============================================================================
+# Admin Endpoints
+# ==============================================================================
+
+@router.post("/admin/run-reconciliation")
+async def run_billing_reconciliation():
+    """
+    Admin endpoint to manually trigger billing reconciliation.
+    Useful for debugging or after system maintenance.
+    """
+    try:
+        from app.workers.billing_reconciliation import run_reconciliation_now
+        result = await run_reconciliation_now()
+        return result
+    except Exception as e:
+        logger.error(f"Manual reconciliation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # Also expose webhook at /api/webhooks/stripe for consistency with other webhooks
