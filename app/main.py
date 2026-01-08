@@ -410,8 +410,12 @@ app.include_router(quick_onboarding_rpc.router)
 # Include onboarding readiness and templates API for enhanced onboarding
 from app.api import onboarding_readiness
 from app.api import clinic_templates
+from app.api import agent_simulation
+from app.api import analytics_events
 app.include_router(onboarding_readiness.router)
 app.include_router(clinic_templates.router)
+app.include_router(agent_simulation.router)
+app.include_router(analytics_events.router)
 
 # Include webhooks router for real-time updates
 from app.api import webhooks

@@ -140,6 +140,23 @@ class QuickRegistration(BaseModel):
     primary_language: Optional[str] = "en"
     country: Optional[str] = "US"
 
+class ParseWebsiteRequest(BaseModel):
+    """Request to parse a clinic website"""
+    url: str
+
+
+class ParseWebsiteResponse(BaseModel):
+    """Extracted clinic information from website"""
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip_code: Optional[str] = None
+    timezone: Optional[str] = None
+
+
 class QuickWhatsApp(BaseModel):
     """Simple WhatsApp setup"""
     phone_number: str
@@ -425,6 +442,124 @@ async def health_check():
         "version": "1.0",
         "features": ["rpc", "cross-schema"]
     }
+
+
+@router.post("/parse-website")
+async def parse_website(data: ParseWebsiteRequest):
+    """Parse a clinic website and extract information for auto-fill"""
+    try:
+        from app.knowledge.web_crawler import EnhancedWebCrawler
+        import re
+
+        logger.info(f"Parsing website: {data.url}")
+
+        # Use a lightweight crawl - only homepage, no deep crawling
+        crawler = EnhancedWebCrawler(max_depth=1, max_pages=3, timeout=15)
+        result = await crawler.crawl(data.url)
+
+        # Extract structured data
+        structured = result.get('structured_data', {})
+        contact = structured.get('contact', {})
+        clinic_info = structured.get('clinic_info', {})
+
+        # Get clinic name from title or extracted info
+        name = clinic_info.get('name', '')
+        # Clean up common title suffixes
+        if name:
+            name = re.sub(r'\s*[\|\-–—]\s*.*$', '', name).strip()
+
+        # Get phone - first valid one
+        phones = contact.get('phones', [])
+        phone = phones[0] if phones else None
+
+        # Get email - first valid one
+        emails = contact.get('emails', [])
+        email = emails[0] if emails else None
+
+        # Get address and try to parse city/state/zip
+        address_raw = contact.get('address', '')
+        address = ''
+        city = ''
+        state = ''
+        zip_code = ''
+
+        if address_raw:
+            # Try to parse address components
+            # Common patterns: "123 Main St, City, ST 12345" or "123 Main St City ST 12345"
+            address_parts = address_raw.split(',')
+
+            if len(address_parts) >= 3:
+                address = address_parts[0].strip()
+                city = address_parts[1].strip()
+                # Last part might have state and zip
+                last_part = address_parts[-1].strip()
+                state_zip_match = re.search(r'([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?', last_part)
+                if state_zip_match:
+                    state = state_zip_match.group(1)
+                    zip_code = state_zip_match.group(2) or ''
+            elif len(address_parts) == 2:
+                address = address_parts[0].strip()
+                # Second part might be "City, ST 12345" or "City ST 12345"
+                second_part = address_parts[1].strip()
+                city_state_zip = re.match(r'(.+?)\s+([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?', second_part)
+                if city_state_zip:
+                    city = city_state_zip.group(1).strip()
+                    state = city_state_zip.group(2)
+                    zip_code = city_state_zip.group(3) or ''
+                else:
+                    city = second_part
+            else:
+                # Try to parse single line address
+                address = address_raw
+                state_zip_match = re.search(r'([A-Z]{2})\s*(\d{5}(?:-\d{4})?)', address_raw)
+                if state_zip_match:
+                    state = state_zip_match.group(1)
+                    zip_code = state_zip_match.group(2)
+
+        # Determine timezone from state (US states only for now)
+        timezone = ''
+        state_timezones = {
+            'CA': 'America/Los_Angeles', 'WA': 'America/Los_Angeles', 'OR': 'America/Los_Angeles',
+            'NV': 'America/Los_Angeles', 'AZ': 'America/Phoenix',
+            'MT': 'America/Denver', 'ID': 'America/Denver', 'WY': 'America/Denver',
+            'CO': 'America/Denver', 'NM': 'America/Denver', 'UT': 'America/Denver',
+            'TX': 'America/Chicago', 'OK': 'America/Chicago', 'KS': 'America/Chicago',
+            'NE': 'America/Chicago', 'SD': 'America/Chicago', 'ND': 'America/Chicago',
+            'MN': 'America/Chicago', 'IA': 'America/Chicago', 'MO': 'America/Chicago',
+            'AR': 'America/Chicago', 'LA': 'America/Chicago', 'WI': 'America/Chicago',
+            'IL': 'America/Chicago', 'MS': 'America/Chicago', 'AL': 'America/Chicago',
+            'TN': 'America/Chicago',
+            'NY': 'America/New_York', 'NJ': 'America/New_York', 'PA': 'America/New_York',
+            'CT': 'America/New_York', 'MA': 'America/New_York', 'RI': 'America/New_York',
+            'VT': 'America/New_York', 'NH': 'America/New_York', 'ME': 'America/New_York',
+            'MD': 'America/New_York', 'DE': 'America/New_York', 'DC': 'America/New_York',
+            'VA': 'America/New_York', 'WV': 'America/New_York', 'NC': 'America/New_York',
+            'SC': 'America/New_York', 'GA': 'America/New_York', 'FL': 'America/New_York',
+            'OH': 'America/New_York', 'MI': 'America/New_York', 'IN': 'America/New_York',
+            'KY': 'America/New_York',
+            'HI': 'Pacific/Honolulu', 'AK': 'America/Anchorage',
+        }
+        if state:
+            timezone = state_timezones.get(state.upper(), '')
+
+        response = {
+            'name': name or None,
+            'phone': phone,
+            'email': email,
+            'address': address or None,
+            'city': city or None,
+            'state': state or None,
+            'zip_code': zip_code or None,
+            'timezone': timezone or None,
+        }
+
+        logger.info(f"Parsed website result: {response}")
+        return response
+
+    except Exception as e:
+        logger.error(f"Failed to parse website {data.url}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse website: {str(e)}")
+
 
 @router.post("/{clinic_id}/whatsapp-simple")
 async def setup_whatsapp(clinic_id: str, data: QuickWhatsApp):
