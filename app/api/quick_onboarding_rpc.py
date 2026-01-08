@@ -134,6 +134,11 @@ class QuickRegistration(BaseModel):
     city: Optional[str] = "City"
     address: Optional[str] = "123 Main St"
     zip_code: Optional[str] = "00000"
+    # NEW FIELDS for enhanced onboarding
+    business_hours: Optional[Dict[str, Any]] = None  # JSONB structure
+    currency: Optional[str] = "USD"
+    primary_language: Optional[str] = "en"
+    country: Optional[str] = "US"
 
 class QuickWhatsApp(BaseModel):
     """Simple WhatsApp setup"""
@@ -157,6 +162,12 @@ class QuickOnboardingRPCService:
     async def quick_register(self, data: QuickRegistration) -> Dict[str, Any]:
         """Quick registration using RPC function"""
         try:
+            import json
+            # Prepare business_hours - use default if not provided
+            business_hours_json = None
+            if data.business_hours:
+                business_hours_json = json.dumps(data.business_hours)
+
             # If user_email is provided, use the new RPC function that associates the user
             if data.user_email:
                 result = self.supabase.rpc('quick_register_clinic_with_user', {
@@ -168,7 +179,11 @@ class QuickOnboardingRPCService:
                     'p_state': data.state,
                     'p_city': data.city,
                     'p_address': data.address,
-                    'p_zip_code': data.zip_code
+                    'p_zip_code': data.zip_code,
+                    # NEW: Pass enhanced onboarding fields
+                    'p_business_hours': business_hours_json,
+                    'p_currency': data.currency,
+                    'p_primary_language': data.primary_language
                 }).execute()
             else:
                 # Fall back to original RPC function

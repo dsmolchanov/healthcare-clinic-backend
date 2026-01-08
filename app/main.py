@@ -170,6 +170,26 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to start message plan worker: {str(e)}")
         # Don't fail startup, but log the issue
 
+    # Start billing listener for per-doctor subscription sync
+    try:
+        from app.services.billing_listener import start_billing_listener
+        if await start_billing_listener():
+            logger.info("✅ Billing listener started (per-doctor sync)")
+        else:
+            logger.warning("⚠️ Billing listener not started (DB URL not configured)")
+    except Exception as e:
+        logger.error(f"Failed to start billing listener: {str(e)}")
+        # Don't fail startup, billing sync can be done manually
+
+    # Start billing reconciliation worker (runs nightly at 3 AM UTC)
+    try:
+        from app.workers.billing_reconciliation import start_reconciliation_worker
+        await start_reconciliation_worker()
+        logger.info("✅ Billing reconciliation worker started (runs nightly)")
+    except Exception as e:
+        logger.error(f"Failed to start billing reconciliation worker: {str(e)}")
+        # Don't fail startup, reconciliation can be triggered manually
+
     # FSM system removed in Phase 1.3 cleanup - all message processing
     # now goes through PipelineMessageProcessor -> LangGraph orchestrator
 
@@ -255,6 +275,22 @@ async def lifespan(app: FastAPI):
             logger.info("✅ Message plan worker stopped")
     except Exception as e:
         logger.error(f"Error stopping message plan worker: {str(e)}")
+
+    # Stop billing listener
+    try:
+        from app.services.billing_listener import stop_billing_listener
+        await stop_billing_listener()
+        logger.info("✅ Billing listener stopped")
+    except Exception as e:
+        logger.error(f"Error stopping billing listener: {str(e)}")
+
+    # Stop billing reconciliation worker
+    try:
+        from app.workers.billing_reconciliation import stop_reconciliation_worker
+        await stop_reconciliation_worker()
+        logger.info("✅ Billing reconciliation worker stopped")
+    except Exception as e:
+        logger.error(f"Error stopping billing reconciliation worker: {str(e)}")
 
     if hasattr(app.state, 'http_client') and app.state.http_client:
         await app.state.http_client.aclose()
@@ -370,6 +406,12 @@ app.add_middleware(HIPAAAuditMiddleware)
 # Include routers
 # app.include_router(quick_onboarding_router)  # Disabled - using RPC version instead
 app.include_router(quick_onboarding_rpc.router)
+
+# Include onboarding readiness and templates API for enhanced onboarding
+from app.api import onboarding_readiness
+from app.api import clinic_templates
+app.include_router(onboarding_readiness.router)
+app.include_router(clinic_templates.router)
 
 # Include webhooks router for real-time updates
 from app.api import webhooks
