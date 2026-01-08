@@ -233,14 +233,37 @@ async def add_provider(request: AddProviderRequest):
             "sunday": None
         }
 
+        # Parse name into first_name and last_name
+        # Handle formats like "Dr. John Smith", "John Smith", "John"
+        name_parts = request.name.strip().split()
+        title = None
+        first_name = ""
+        last_name = ""
+
+        if name_parts:
+            # Check if first part is a title (Dr., Dr, etc.)
+            if name_parts[0].lower().rstrip('.') in ['dr', 'doctor', 'mr', 'mrs', 'ms']:
+                title = name_parts[0]
+                name_parts = name_parts[1:]
+
+            if len(name_parts) >= 2:
+                first_name = name_parts[0]
+                last_name = " ".join(name_parts[1:])
+            elif len(name_parts) == 1:
+                first_name = name_parts[0]
+                last_name = ""
+
         doctor_data = {
             "clinic_id": request.clinic_id,
-            "name": request.name,
+            "title": title,
+            "first_name": first_name,
+            "last_name": last_name,
             "email": request.email,
             "phone": request.phone,
             "specialization": request.specialization,
             "working_hours": default_working_hours,
-            "active": True
+            "active": True,
+            "accepting_new_patients": True
         }
 
         result = healthcare_client.table("doctors").insert(doctor_data).execute()
