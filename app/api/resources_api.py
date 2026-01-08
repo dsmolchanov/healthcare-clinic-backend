@@ -3,16 +3,18 @@ Resources API - Efficient endpoints for clinic resource management
 Provides both RPC-based data fetching and real-time WebSocket subscriptions
 """
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Depends
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Depends, Query
 from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any, List
 import asyncio
 import json
 import logging
-from datetime import datetime, date
+from datetime import datetime, date as date_type
 from supabase import create_client, Client
 import os
 from pydantic import BaseModel
+
+from ..services.appointment_enrichment_service import AppointmentEnrichmentService
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -102,23 +104,47 @@ async def get_dashboard_data(request: DashboardRequest):
 # ============================================================================
 
 @router.get("/appointments/{clinic_id}")
-async def get_appointments(clinic_id: str, date: Optional[str] = None):
-    """Get appointments for a specific clinic and date"""
+async def get_appointments(
+    clinic_id: str,
+    date: Optional[str] = None,
+    enrich: bool = Query(True, description="Include reminder and HITL status enrichment")
+):
+    """
+    Get appointments for a specific clinic and date.
+
+    When enrich=true (default), each appointment includes:
+    - reminder_status: 'pending', 'sent', 'confirmed', 'no_response', 'failed'
+    - hitl_status: { needs_attention, control_mode, reason, unread_count }
+    """
     try:
         supabase = get_supabase_client()
-        
+
         params = {'p_clinic_id': clinic_id}
         if date:
             params['p_date'] = date
-            
+
         result = supabase.rpc('get_appointments_realtime', params).execute()
-        
+
+        appointments = result.data or []
+
+        # Enrich appointments with reminder and HITL status
+        if enrich and appointments:
+            try:
+                enrichment_service = AppointmentEnrichmentService(supabase)
+                appointments = await enrichment_service.enrich_appointments(
+                    appointments,
+                    clinic_id
+                )
+            except Exception as enrich_error:
+                logger.warning(f"Appointment enrichment failed, returning without enrichment: {enrich_error}")
+                # Continue without enrichment rather than failing the request
+
         return {
             "clinic_id": clinic_id,
-            "date": date or str(date.today()),
-            "appointments": result.data or []
+            "date": date if date else str(date_type.today()),
+            "appointments": appointments
         }
-        
+
     except Exception as e:
         logger.error(f"Error fetching appointments: {e}")
         raise HTTPException(status_code=500, detail=str(e))
