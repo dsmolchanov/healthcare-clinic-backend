@@ -1,4 +1,7 @@
-"""Healthcare conversation state models."""
-from .conversation_state import HealthcareConversationState
+"""
+State models - Phase 6
 
-__all__ = ['HealthcareConversationState']
+Legacy HealthcareConversationState removed. FSM uses its own state in fsm/state.py
+"""
+
+__all__ = []

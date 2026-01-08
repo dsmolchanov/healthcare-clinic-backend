@@ -1,7 +1,9 @@
 """
-Orchestrator module for LangGraph-based conversation management
+Orchestrator module for FSM-based conversation management
+
+Phase 6: Uses pure FSM orchestrator (legacy LangGraph removed).
 """
 
-from .base_langgraph import BaseLangGraphOrchestrator
+from .fsm_orchestrator import FSMOrchestrator
 
-__all__ = ['BaseLangGraphOrchestrator']
+__all__ = ['FSMOrchestrator']

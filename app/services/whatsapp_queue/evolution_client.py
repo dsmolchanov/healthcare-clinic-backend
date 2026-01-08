@@ -3,7 +3,7 @@ Evolution API Client
 Handles communication with Evolution WhatsApp API
 """
 import httpx
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from .config import EVOLUTION_API_URL, EVOLUTION_API_KEY, EVOLUTION_HTTP_TIMEOUT, logger
 from .e164 import to_jid
 
@@ -46,7 +46,7 @@ async def is_connected(instance: str) -> bool:
         return False
 
 
-async def send_text(instance: str, to_number: str, text: str) -> bool:
+async def send_text(instance: str, to_number: str, text: str) -> dict:
     """
     Send text message via Evolution API
 
@@ -56,7 +56,8 @@ async def send_text(instance: str, to_number: str, text: str) -> bool:
         text: Message text content
 
     Returns:
-        True if message sent successfully, False otherwise
+        Dict with 'success' bool and 'provider_message_id' if available.
+        For backwards compatibility, the dict can be used in boolean context.
     """
     url = f"{EVOLUTION_API_URL}/message/sendText/{instance}"
     headers = {
@@ -80,19 +81,38 @@ async def send_text(instance: str, to_number: str, text: str) -> bool:
 
             # Evolution API returns 2xx for success
             if response.status_code < 400:
-                logger.info(f"✅ Message sent successfully (status {response.status_code})")
-                return True
+                # Extract provider message ID from response
+                # Evolution API returns message key in response
+                provider_message_id = None
+                try:
+                    data = response.json()
+                    if isinstance(data, dict):
+                        key = data.get('key', {})
+                        provider_message_id = key.get('id')
+                except Exception:
+                    pass
+
+                logger.info(
+                    f"✅ Message sent successfully "
+                    f"(status {response.status_code}, provider_id: {provider_message_id})"
+                )
+
+                return {
+                    'success': True,
+                    'provider_message_id': provider_message_id,
+                    'response': data if 'data' in dir() else None
+                }
             else:
                 logger.error(f"❌ Failed to send message: HTTP {response.status_code}")
                 logger.error(f"Response: {response.text}")
-                return False
+                return {'success': False, 'error': f"HTTP {response.status_code}"}
 
     except httpx.TimeoutException:
         logger.error(f"❌ Send message timed out after {EVOLUTION_HTTP_TIMEOUT}s")
-        return False
+        return {'success': False, 'error': 'timeout'}
     except Exception as e:
         logger.error(f"❌ Send error: {e}")
-        return False
+        return {'success': False, 'error': str(e)}
 
 
 async def send_typing_indicator(instance: str, to_number: str) -> bool:
@@ -214,3 +234,341 @@ async def get_instance_info(instance: str) -> Optional[dict]:
     except Exception as e:
         logger.error(f"Failed to get instance info: {e}")
         return None
+
+
+async def mark_chat_unread(instance: str, to_number: str) -> bool:
+    """
+    Mark a chat as unread in WhatsApp (HITL Phase 5 - best effort).
+
+    This function asks Evolution API to mark a chat as unread, so the human
+    operator sees an unread badge on their WhatsApp app. This provides a
+    visual cue that a patient message needs attention.
+
+    Note: This is a best-effort operation. If it fails, the system continues
+    normally - the human can still see messages in the dashboard.
+
+    Args:
+        instance: WhatsApp instance name
+        to_number: Phone number of the chat to mark unread
+
+    Returns:
+        True if chat was marked unread successfully, False otherwise
+    """
+    # Convert to WhatsApp JID format
+    jid_number = to_jid(to_number)
+
+    # Evolution API endpoint for marking chat unread
+    # Note: This endpoint may not exist in all Evolution API versions
+    url = f"{EVOLUTION_API_URL}/chat/markChatUnread/{instance}"
+    headers = {
+        "apikey": EVOLUTION_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "number": jid_number,
+        "lastMessage": {
+            "key": {
+                "fromMe": False  # Mark as if we received a message
+            }
+        }
+    }
+
+    try:
+        logger.debug(f"Marking chat as unread: {jid_number}")
+        async with httpx.AsyncClient(timeout=EVOLUTION_HTTP_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+            if response.status_code < 400:
+                logger.info(f"✅ Chat marked as unread for {jid_number}")
+                return True
+            else:
+                # This is best-effort - don't log as error if endpoint doesn't exist
+                logger.debug(
+                    f"⚠️ Could not mark chat unread: HTTP {response.status_code} "
+                    f"(best-effort operation)"
+                )
+                return False
+
+    except Exception as e:
+        # Best-effort - log at debug level only
+        logger.debug(f"⚠️ Mark unread failed (best-effort): {e}")
+        return False
+
+
+async def send_presence_unavailable(instance: str, to_number: str) -> bool:
+    """
+    Set presence to unavailable (shows the agent is not active).
+
+    This can be used when a session is under human control to indicate
+    that the automated agent is not responding.
+
+    Args:
+        instance: WhatsApp instance name
+        to_number: Recipient phone number
+
+    Returns:
+        True if presence was set successfully, False otherwise
+    """
+    url = f"{EVOLUTION_API_URL}/chat/presence/{instance}"
+    headers = {
+        "apikey": EVOLUTION_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    # Convert to WhatsApp JID format
+    jid_number = to_jid(to_number)
+
+    payload = {
+        "number": jid_number,
+        "presence": "unavailable",
+        "delay": 0
+    }
+
+    try:
+        logger.debug(f"Setting presence to unavailable for {jid_number}")
+        async with httpx.AsyncClient(timeout=EVOLUTION_HTTP_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+            if response.status_code < 400:
+                logger.debug(f"✅ Presence set to unavailable")
+                return True
+            else:
+                logger.debug(f"⚠️ Failed to set presence: HTTP {response.status_code}")
+                return False
+
+    except Exception as e:
+        logger.debug(f"⚠️ Set presence error (non-critical): {e}")
+        return False
+
+
+async def send_location(
+    instance: str,
+    to_number: str,
+    lat: float,
+    lng: float,
+    name: Optional[str] = None,
+    address: Optional[str] = None
+) -> dict:
+    """
+    Send location pin via Evolution API.
+
+    Evolution API Docs: https://doc.evolution-api.com/v2/pt/messages/send-location
+
+    Args:
+        instance: WhatsApp instance name
+        to_number: Recipient phone number
+        lat: Latitude coordinate
+        lng: Longitude coordinate
+        name: Location name (e.g., "Plaintalk Dental Clinic")
+        address: Full address string
+
+    Returns:
+        Dict with 'success' bool and 'provider_message_id' if available.
+    """
+    url = f"{EVOLUTION_API_URL}/message/sendLocation/{instance}"
+    headers = {
+        "apikey": EVOLUTION_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    jid_number = to_jid(to_number)
+
+    payload = {
+        "number": jid_number,
+        "name": name or "Clinic Location",
+        "address": address or "",
+        "latitude": lat,
+        "longitude": lng,
+        "delay": 1000
+    }
+
+    try:
+        logger.info(f"Sending location to {jid_number} via {instance}")
+        async with httpx.AsyncClient(timeout=EVOLUTION_HTTP_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+            if response.status_code < 400:
+                provider_message_id = None
+                try:
+                    data = response.json()
+                    if isinstance(data, dict):
+                        provider_message_id = data.get('key', {}).get('id')
+                except Exception:
+                    pass
+
+                logger.info(f"✅ Location sent (provider_id: {provider_message_id})")
+                return {
+                    'success': True,
+                    'provider_message_id': provider_message_id
+                }
+            else:
+                logger.error(f"❌ Failed to send location: HTTP {response.status_code}")
+                return {'success': False, 'error': f"HTTP {response.status_code}"}
+
+    except httpx.TimeoutException:
+        logger.error(f"❌ Send location timed out")
+        return {'success': False, 'error': 'timeout'}
+    except Exception as e:
+        logger.error(f"❌ Send location error: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+async def send_buttons(
+    instance: str,
+    to_number: str,
+    text: str,
+    buttons: List[Dict[str, str]],
+    title: Optional[str] = None,
+    footer: Optional[str] = None
+) -> dict:
+    """
+    Send interactive button message via Evolution API.
+
+    Evolution API Docs: https://doc.evolution-api.com/v2/pt/messages/send-buttons
+
+    Args:
+        instance: WhatsApp instance name
+        to_number: Recipient phone number
+        text: Message body text
+        buttons: List of button dicts, each with 'buttonId' and 'buttonText'
+                 Example: [{"buttonId": "confirm", "buttonText": {"displayText": "Confirm"}}]
+        title: Optional message title
+        footer: Optional footer text
+
+    Returns:
+        Dict with 'success' bool and 'provider_message_id' if available.
+    """
+    url = f"{EVOLUTION_API_URL}/message/sendButtons/{instance}"
+    headers = {
+        "apikey": EVOLUTION_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    jid_number = to_jid(to_number)
+
+    # Build buttons in Evolution API format
+    formatted_buttons = []
+    for btn in buttons:
+        if isinstance(btn.get('buttonText'), dict):
+            formatted_buttons.append(btn)
+        else:
+            # Simple format: {"id": "confirm", "text": "Confirm"}
+            formatted_buttons.append({
+                "buttonId": btn.get('id') or btn.get('buttonId'),
+                "buttonText": {"displayText": btn.get('text') or btn.get('displayText')}
+            })
+
+    payload = {
+        "number": jid_number,
+        "title": title or "",
+        "description": text,
+        "footer": footer or "",
+        "buttons": formatted_buttons,
+        "delay": 1000
+    }
+
+    try:
+        logger.info(f"Sending buttons to {jid_number} via {instance}")
+        async with httpx.AsyncClient(timeout=EVOLUTION_HTTP_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+            if response.status_code < 400:
+                provider_message_id = None
+                try:
+                    data = response.json()
+                    if isinstance(data, dict):
+                        provider_message_id = data.get('key', {}).get('id')
+                except Exception:
+                    pass
+
+                logger.info(f"✅ Buttons sent (provider_id: {provider_message_id})")
+                return {
+                    'success': True,
+                    'provider_message_id': provider_message_id
+                }
+            else:
+                logger.error(f"❌ Failed to send buttons: HTTP {response.status_code}")
+                logger.error(f"Response: {response.text}")
+                return {'success': False, 'error': f"HTTP {response.status_code}"}
+
+    except httpx.TimeoutException:
+        logger.error(f"❌ Send buttons timed out")
+        return {'success': False, 'error': 'timeout'}
+    except Exception as e:
+        logger.error(f"❌ Send buttons error: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+async def send_template(
+    instance: str,
+    to_number: str,
+    template_name: str,
+    language: str = "en",
+    components: Optional[List[Dict[str, Any]]] = None
+) -> dict:
+    """
+    Send WhatsApp template message via Evolution API.
+
+    Templates must be pre-approved by Meta. This is for Business API compliance.
+
+    Evolution API Docs: https://doc.evolution-api.com/v2/pt/messages/send-template
+
+    Args:
+        instance: WhatsApp instance name
+        to_number: Recipient phone number
+        template_name: Approved template name (e.g., "appointment_reminder")
+        language: Language code (e.g., "en", "ru", "es")
+        components: Optional template components for variable substitution
+
+    Returns:
+        Dict with 'success' bool and 'provider_message_id' if available.
+    """
+    url = f"{EVOLUTION_API_URL}/message/sendTemplate/{instance}"
+    headers = {
+        "apikey": EVOLUTION_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    jid_number = to_jid(to_number)
+
+    payload = {
+        "number": jid_number,
+        "name": template_name,
+        "language": language,
+        "delay": 1000
+    }
+
+    if components:
+        payload["components"] = components
+
+    try:
+        logger.info(f"Sending template '{template_name}' to {jid_number} via {instance}")
+        async with httpx.AsyncClient(timeout=EVOLUTION_HTTP_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+            if response.status_code < 400:
+                provider_message_id = None
+                try:
+                    data = response.json()
+                    if isinstance(data, dict):
+                        provider_message_id = data.get('key', {}).get('id')
+                except Exception:
+                    pass
+
+                logger.info(f"✅ Template sent (provider_id: {provider_message_id})")
+                return {
+                    'success': True,
+                    'provider_message_id': provider_message_id
+                }
+            else:
+                logger.error(f"❌ Failed to send template: HTTP {response.status_code}")
+                logger.error(f"Response: {response.text}")
+                return {'success': False, 'error': f"HTTP {response.status_code}"}
+
+    except httpx.TimeoutException:
+        logger.error(f"❌ Send template timed out")
+        return {'success': False, 'error': 'timeout'}
+    except Exception as e:
+        logger.error(f"❌ Send template error: {e}")
+        return {'success': False, 'error': str(e)}

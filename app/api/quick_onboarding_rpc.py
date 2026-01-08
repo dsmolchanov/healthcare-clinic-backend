@@ -7,9 +7,13 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import os
 import uuid
-from datetime import datetime, timedelta
+import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
 import aiohttp
 from supabase import create_client, Client
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/onboarding", tags=["quick-onboarding"])
 
@@ -71,6 +75,53 @@ async def _register_google_webhook(
             }).execute()
 
             return result
+
+async def _geocode_clinic_background(
+    supabase_url: str,
+    supabase_key: str,
+    clinic_id: str,
+    address: str,
+    city: str,
+    state: str,
+    zip_code: Optional[str]
+):
+    """
+    Background task to geocode clinic address after registration completes.
+
+    CRITICAL: This runs async and does NOT block the registration response.
+    """
+    try:
+        from app.utils.geocoding import geocode_address, build_location_data
+        from supabase.client import ClientOptions
+
+        geocode_result = await geocode_address(
+            address=address,
+            city=city,
+            state=state,
+            country="USA",
+            zip_code=zip_code
+        )
+
+        if geocode_result.get('success'):
+            location_data = build_location_data(geocode_result)
+            location_data['geocoded_at'] = datetime.now(timezone.utc).isoformat()
+
+            # Create client with healthcare schema
+            options = ClientOptions(schema='healthcare')
+            supabase = create_client(supabase_url, supabase_key, options=options)
+
+            # Update clinic with location data
+            supabase.table('clinics').update({
+                'location_data': location_data
+            }).eq('id', clinic_id).execute()
+
+            logger.info(f"Geocoded clinic {clinic_id}: {location_data.get('formatted_address')}")
+        else:
+            logger.warning(f"Geocoding failed for clinic {clinic_id}: {geocode_result.get('error')}")
+    except Exception as e:
+        logger.error(f"Geocoding error for clinic {clinic_id}: {e}")
+        # Don't propagate - this is a background task
+
 
 class QuickRegistration(BaseModel):
     """Minimal registration - we'll fill in the rest"""
@@ -148,6 +199,23 @@ class QuickOnboardingRPCService:
                         pass
 
             if result.data:
+                # Trigger background geocoding if registration was successful
+                if result.data.get('success') and result.data.get('clinic_id'):
+                    supabase_url = os.environ.get("SUPABASE_URL")
+                    supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+                    # CRITICAL: Use create_task to NOT block registration response
+                    # Geocoding happens in background after response is sent
+                    asyncio.create_task(_geocode_clinic_background(
+                        supabase_url=supabase_url,
+                        supabase_key=supabase_key,
+                        clinic_id=result.data['clinic_id'],
+                        address=data.address or "123 Main St",
+                        city=data.city or "City",
+                        state=data.state or "CA",
+                        zip_code=data.zip_code
+                    ))
+
                 return result.data
             else:
                 return {

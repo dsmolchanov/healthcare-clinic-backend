@@ -1,40 +1,7 @@
-"""Supervisor routing for healthcare conversations."""
-from .supervisor import (
-    LaneType,
-    CONFIRMATION_WORDS,
-    PAIN_KEYWORDS,
-    SCHEDULING_KEYWORDS_ROUTING,
-    PRICE_KEYWORDS_ROUTING,
-    AVAILABILITY_KEYWORDS,
-    STATIC_KEYWORDS,
-    EXIT_KEYWORDS,
-    determine_lane,
-    get_allowed_tools_for_lane,
-    get_blocked_tools_for_lane,
-    is_short_confirmation,
-    has_pain_keywords,
-    get_out_of_scope_response,
-    get_time_query_response,
-    route_by_keywords,
-    should_route_to_exit,
-)
+"""
+Routing - Phase 6
 
-__all__ = [
-    'LaneType',
-    'CONFIRMATION_WORDS',
-    'PAIN_KEYWORDS',
-    'SCHEDULING_KEYWORDS_ROUTING',
-    'PRICE_KEYWORDS_ROUTING',
-    'AVAILABILITY_KEYWORDS',
-    'STATIC_KEYWORDS',
-    'EXIT_KEYWORDS',
-    'determine_lane',
-    'get_allowed_tools_for_lane',
-    'get_blocked_tools_for_lane',
-    'is_short_confirmation',
-    'has_pain_keywords',
-    'get_out_of_scope_response',
-    'get_time_query_response',
-    'route_by_keywords',
-    'should_route_to_exit',
-]
+Legacy supervisor removed. FSM uses router in fsm/router.py
+"""
+
+__all__ = []

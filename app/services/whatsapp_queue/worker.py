@@ -127,7 +127,12 @@ class WhatsAppWorker:
         # Send message
         logger.info(f"Sending message {message_id} to {to}")
         try:
-            success = await send_text(self.instance, to, text)
+            result = await send_text(self.instance, to, text)
+            # Handle both old (bool) and new (dict) return formats
+            if isinstance(result, dict):
+                success = result.get('success', False)
+            else:
+                success = bool(result)
         except Exception as e:
             logger.error(f"send_text raised {e!r}; will retry")
             success = False

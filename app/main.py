@@ -159,6 +159,17 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to start escalation worker: {str(e)}")
         # Don't fail startup, but log the issue
 
+    # Phase 6: Start message plan worker for SOTA reminders
+    try:
+        from app.workers.message_plan_worker import MessagePlanWorker
+        message_plan_worker = MessagePlanWorker()
+        asyncio.create_task(message_plan_worker.start())
+        app.state.message_plan_worker = message_plan_worker
+        logger.info("✅ Message plan worker started")
+    except Exception as e:
+        logger.error(f"Failed to start message plan worker: {str(e)}")
+        # Don't fail startup, but log the issue
+
     # FSM system removed in Phase 1.3 cleanup - all message processing
     # now goes through PipelineMessageProcessor -> LangGraph orchestrator
 
@@ -236,6 +247,14 @@ async def lifespan(app: FastAPI):
             logger.info("✅ Escalation worker stopped")
     except Exception as e:
         logger.error(f"Error stopping escalation worker: {str(e)}")
+
+    # Stop message plan worker
+    try:
+        if hasattr(app.state, 'message_plan_worker'):
+            await app.state.message_plan_worker.stop()
+            logger.info("✅ Message plan worker stopped")
+    except Exception as e:
+        logger.error(f"Error stopping message plan worker: {str(e)}")
 
     if hasattr(app.state, 'http_client') and app.state.http_client:
         await app.state.http_client.aclose()
@@ -481,6 +500,14 @@ app.include_router(prompt_routes.router)
 # Model Tier Mappings API
 from app.api import tier_mappings_api
 app.include_router(tier_mappings_api.router)
+
+# HITL (Human-in-the-Loop) Control Mode API (Phase 6)
+from app.api import hitl_router
+app.include_router(hitl_router.router)
+
+# Message Plan API (Phase 6 - SOTA Reminders)
+from app.api import message_plan_api
+app.include_router(message_plan_api.router)
 
 # ============================================================================
 # Health Check

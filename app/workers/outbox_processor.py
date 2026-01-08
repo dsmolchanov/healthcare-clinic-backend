@@ -128,28 +128,42 @@ class OutboxProcessor:
             await self._update_status(message_id, 'queued', queued_at=datetime.now(timezone.utc))
 
             # Send via Evolution API through existing infrastructure
-            success = await self._send_via_evolution(
+            # Supports text, location, buttons, and template message types
+            result = await self._send_via_evolution(
                 instance_name=msg['instance_name'],
                 to_number=msg['to_number'],
                 text=msg['message_text'],
-                message_id=msg['message_id']
+                message_id=msg['message_id'],
+                message_type=msg.get('message_type', 'text'),
+                message_payload=msg.get('message_payload')
             )
 
+            success = result.get('success', False)
+            provider_message_id = result.get('provider_message_id')
+            text_hash = result.get('text_hash')
+            remote_jid = result.get('remote_jid')
+
             if success:
-                # Mark delivered
+                # Mark delivered with provider message ID for HITL correlation
                 await self._update_status(
                     message_id,
                     'delivered',
-                    delivered_at=datetime.now(timezone.utc)
+                    delivered_at=datetime.now(timezone.utc),
+                    provider_message_id=provider_message_id,
+                    text_hash=text_hash,
+                    remote_jid=remote_jid
                 )
-                logger.info(f"✅ Outbox message {message_id} delivered successfully")
+                logger.info(
+                    f"✅ Outbox message {message_id} delivered successfully "
+                    f"(provider_id: {provider_message_id})"
+                )
             else:
                 # Mark failed, increment retry
                 await self._update_status(
                     message_id,
                     'failed',
                     failed_at=datetime.now(timezone.utc),
-                    error_message='Send failed - Evolution API error',
+                    error_message=result.get('error', 'Send failed - Evolution API error'),
                     retry_count=msg['retry_count'] + 1
                 )
                 logger.warning(
@@ -174,45 +188,105 @@ class OutboxProcessor:
         instance_name: str,
         to_number: str,
         text: str,
-        message_id: str
-    ) -> bool:
+        message_id: str,
+        message_type: str = 'text',
+        message_payload: Optional[Dict[str, Any]] = None
+    ) -> dict:
         """
         Send message via Evolution API
 
-        Uses existing queue infrastructure for actual delivery.
+        Uses Evolution client directly for actual delivery with provider_message_id capture.
+        Supports text, location, buttons, and template message types.
 
         Args:
             instance_name: WhatsApp instance name
             to_number: Recipient phone number
-            text: Message text
+            text: Message text (fallback for non-text types)
             message_id: Unique message ID
+            message_type: Type of message (text|location|buttons|template)
+            message_payload: JSONB payload with type-specific data
 
         Returns:
-            True if send successful, False otherwise
+            Dict with 'success', 'provider_message_id', 'text_hash', 'remote_jid'
         """
+        import hashlib
+
         try:
-            # Import here to avoid circular dependency
-            from app.services.whatsapp_queue import enqueue_message
-
-            # Queue the message through existing infrastructure
-            # The existing worker will handle rate limiting, circuit breaker, etc.
-            success = await enqueue_message(
-                instance=instance_name,
-                to_number=to_number,
-                text=text,
-                message_id=message_id
+            from app.services.whatsapp_queue.evolution_client import (
+                send_text, send_location, send_buttons, send_template
             )
+            from app.services.whatsapp_queue.e164 import to_jid
 
-            return success
+            result = None
+            payload = message_payload or {}
+
+            if message_type == 'location':
+                result = await send_location(
+                    instance=instance_name,
+                    to_number=to_number,
+                    lat=payload.get('lat', 0),
+                    lng=payload.get('lng', 0),
+                    name=payload.get('name'),
+                    address=payload.get('address')
+                )
+            elif message_type == 'buttons':
+                result = await send_buttons(
+                    instance=instance_name,
+                    to_number=to_number,
+                    text=payload.get('text', text),
+                    buttons=payload.get('buttons', []),
+                    title=payload.get('title'),
+                    footer=payload.get('footer')
+                )
+            elif message_type == 'template':
+                result = await send_template(
+                    instance=instance_name,
+                    to_number=to_number,
+                    template_name=payload.get('template_name', ''),
+                    language=payload.get('language', 'en'),
+                    components=payload.get('components')
+                )
+            else:  # Default to text
+                result = await send_text(
+                    instance=instance_name,
+                    to_number=to_number,
+                    text=text
+                )
+
+            # Compute text hash for fallback matching
+            text_hash = hashlib.sha256(text.strip().lower().encode()).hexdigest()[:32]
+
+            # Get remote JID
+            remote_jid = to_jid(to_number)
+
+            # Handle both old (bool) and new (dict) return formats
+            if isinstance(result, dict):
+                return {
+                    'success': result.get('success', False),
+                    'provider_message_id': result.get('provider_message_id'),
+                    'text_hash': text_hash,
+                    'remote_jid': remote_jid,
+                    'error': result.get('error')
+                }
+            else:
+                return {
+                    'success': bool(result),
+                    'provider_message_id': None,
+                    'text_hash': text_hash,
+                    'remote_jid': remote_jid
+                }
 
         except Exception as e:
             logger.error(f"Failed to send via Evolution: {e}", exc_info=True)
-            return False
+            return {'success': False, 'error': str(e)}
 
     async def _update_status(
         self,
         message_id: str,
         status: str,
+        provider_message_id: str = None,
+        text_hash: str = None,
+        remote_jid: str = None,
         **kwargs
     ):
         """
@@ -221,10 +295,21 @@ class OutboxProcessor:
         Args:
             message_id: Message UUID
             status: New status (pending|queued|delivered|failed)
+            provider_message_id: WhatsApp message ID from Evolution API (for HITL correlation)
+            text_hash: SHA256 hash of message text (for fallback matching)
+            remote_jid: WhatsApp JID of recipient (for fallback matching)
             **kwargs: Additional fields to update (queued_at, delivered_at, etc.)
         """
         try:
             update_data = {'delivery_status': status}
+
+            # Add HITL correlation fields if provided
+            if provider_message_id:
+                update_data['provider_message_id'] = provider_message_id
+            if text_hash:
+                update_data['text_hash'] = text_hash
+            if remote_jid:
+                update_data['remote_jid'] = remote_jid
 
             # Add timestamp fields
             if 'queued_at' in kwargs:

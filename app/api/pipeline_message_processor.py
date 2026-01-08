@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from app.api.pipeline import PipelineContext, MessageProcessingPipeline
 from app.api.pipeline.steps import (
     SessionManagementStep,
+    ControlModeGateStep,
     ContextHydrationStep,
     EscalationCheckStep,
     RoutingStep,
@@ -165,6 +166,11 @@ class PipelineMessageProcessor:
                 profile_manager=self.profile_manager,
                 supabase_client=self._supabase,
                 redis_client=self._redis_client
+            ),
+            # HITL Phase 2: Control mode gate - check if human controls session
+            ControlModeGateStep(
+                supabase_client=self._supabase,
+                memory_manager=self.memory_manager
             ),
             ContextHydrationStep(
                 context_hydrator=self.context_hydrator

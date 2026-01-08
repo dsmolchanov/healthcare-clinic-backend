@@ -1,27 +1,21 @@
 """
-LangGraph Voice Adapter - Bridges LangGraph to LiveKit Agents.
+FSM Voice Adapter - Bridges FSM Orchestrator to LiveKit Agents.
+
+Phase 6: Updated to use FSM orchestrator (legacy LangGraph removed).
 
 This module provides a unified interface for voice services to use the same
-LangGraph-based orchestration as text channels. It uses astream_events for
-real token streaming, which is critical for voice latency (TTFT).
+FSM-based orchestration as text channels.
 
 Usage:
-    # For direct streaming (e.g., from SSE endpoint)
     adapter = LangGraphVoiceAdapter(clinic_id="clinic123")
     async for chunk in adapter.stream_response(message, session_id, metadata):
         yield chunk
-
-    # For LiveKit integration (when livekit-agents is installed)
-    from app.services.voice.livekit_llm import LangGraphLLM
-    llm = LangGraphLLM(clinic_id="clinic123")
-    # Use as LiveKit llm.LLM plugin
 
 Reference: https://docs.livekit.io/agents/models/llm/plugins/langchain/
 """
 
 import asyncio
 import logging
-import uuid
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Dict, Any, Optional, List
 from datetime import datetime, timezone
@@ -32,12 +26,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class StreamingResponse:
     """
-    Streaming response chunk from LangGraph.
+    Streaming response chunk.
 
     Attributes:
         content: Text content of this chunk
         is_final: True if this is the last chunk
-        node_name: Which graph node generated this chunk (for debugging)
+        node_name: Which node generated this chunk (for debugging)
         metadata: Additional metadata
     """
     content: str
@@ -48,18 +42,16 @@ class StreamingResponse:
 
 class LangGraphVoiceAdapter:
     """
-    Adapts HealthcareLangGraph for voice services.
+    Adapts FSM Orchestrator for voice services.
 
-    Key features:
-    - Real token streaming via astream_events (critical for voice TTFT)
-    - Session-scoped thread_id for state continuity
-    - Fallback to full response if streaming fails
-    - Metrics for latency tracking
+    Phase 6: Now uses FSM orchestrator (legacy LangGraph removed).
+    Note: FSM doesn't support token streaming, so this adapter simulates
+    streaming by yielding the complete response as chunks.
 
     Usage:
         adapter = LangGraphVoiceAdapter(clinic_id="clinic123")
 
-        # Stream response tokens
+        # Stream response (yields complete response as chunks)
         async for chunk in adapter.stream_response(message, session_id, metadata):
             send_to_tts(chunk.content)
     """
@@ -81,36 +73,36 @@ class LangGraphVoiceAdapter:
         self.clinic_id = clinic_id
         self._supabase_client = supabase_client
         self._agent_config = agent_config
-        self._graph = None  # Lazy-loaded
+        self._orchestrator = None  # Lazy-loaded
+        self._fsm_states: Dict[str, Dict[str, Any]] = {}  # Session state storage
 
-    async def _get_graph(self):
-        """Lazy-load the HealthcareLangGraph instance."""
-        if self._graph is None:
-            from app.services.orchestrator.templates.healthcare_template import HealthcareLangGraph
+    async def _get_orchestrator(self):
+        """Lazy-load the FSM orchestrator instance."""
+        if self._orchestrator is None:
+            from app.services.orchestrator.fsm_orchestrator import FSMOrchestrator
+            from app.services.llm import LLMFactory
 
             # Get supabase client if not provided
             if self._supabase_client is None:
-                from app.database import get_supabase
-                self._supabase_client = await get_supabase()
+                try:
+                    from app.db.supabase_client import get_supabase_client
+                    self._supabase_client = get_supabase_client()
+                except Exception as e:
+                    logger.warning(f"[voice-adapter] Could not get supabase client: {e}")
 
-            self._graph = HealthcareLangGraph(
+            llm_factory = LLMFactory(supabase_client=self._supabase_client)
+
+            self._orchestrator = FSMOrchestrator(
                 clinic_id=self.clinic_id,
+                llm_factory=llm_factory,
                 supabase_client=self._supabase_client,
-                agent_config=self._agent_config,
+                appointment_tools=None,  # Will be lazy-loaded by orchestrator
+                price_tool=None,
+                clinic_profile={},
             )
-            logger.info(f"[voice-adapter] Initialized HealthcareLangGraph for clinic {self.clinic_id}")
+            logger.info(f"[voice-adapter] Initialized FSM orchestrator for clinic {self.clinic_id}")
 
-        return self._graph
-
-    def _make_thread_id(self, patient_id: str, session_id: str) -> str:
-        """Generate session-scoped thread ID."""
-        from app.services.orchestrator.thread_ids import make_thread_id
-        return make_thread_id(self.clinic_id, patient_id, session_id)
-
-    def _make_checkpoint_ns(self) -> str:
-        """Generate checkpoint namespace for tenant isolation."""
-        from app.services.orchestrator.thread_ids import make_checkpoint_ns
-        return make_checkpoint_ns(self.clinic_id)
+        return self._orchestrator
 
     async def stream_response(
         self,
@@ -120,10 +112,11 @@ class LangGraphVoiceAdapter:
         patient_id: Optional[str] = None,
     ) -> AsyncIterator[StreamingResponse]:
         """
-        Stream LangGraph response tokens.
+        Stream FSM response.
 
-        Uses astream_events to yield tokens from the generate_response node
-        as soon as they're generated - critical for voice TTFT.
+        Note: FSM doesn't support token streaming like LangGraph, so this
+        yields the complete response as a single chunk. For voice applications,
+        consider using TTS streaming on the output side.
 
         Args:
             message: User message text
@@ -146,127 +139,42 @@ class LangGraphVoiceAdapter:
                 session_id
             )
 
-        # Build thread_id for state continuity
-        thread_id = self._make_thread_id(patient_id, session_id)
-        checkpoint_ns = self._make_checkpoint_ns()
-
         logger.info(
-            f"[voice-adapter] Processing message for thread {thread_id[:30]}..."
+            f"[voice-adapter] Processing message for session {session_id}"
         )
 
-        # Get graph instance
-        graph = await self._get_graph()
-
-        # Build graph input state
-        graph_input = {
-            "message": message,
-            "session_id": session_id,
-            "metadata": {
-                "channel": "voice",
-                "thread_id": thread_id,
-                "clinic_id": self.clinic_id,
-                "patient_id": patient_id,
-                **metadata,
-            },
-            # Initialize required state fields
-            "context": {},
-            "contains_phi": False,
-            "is_emergency": False,
-            "detected_language": "es",  # Default, will be detected
-            "fast_path": False,
-            "context_hydrated": False,
-        }
-
-        config = {
-            "configurable": {
-                "thread_id": thread_id,
-                "checkpoint_ns": checkpoint_ns,
-            }
-        }
-
-        tokens_yielded = 0
-        first_token_time = None
-
         try:
-            # Stream events from graph execution
-            # This is the key for voice latency - we get tokens as they're generated
-            async for event in graph.compiled_graph.astream_events(
-                graph_input,
-                config=config,
-                version="v2",  # Use v2 for better event structure
-            ):
-                # Look for streaming tokens from the response generation node
-                if event["event"] == "on_chat_model_stream":
-                    node_name = event.get("metadata", {}).get("langgraph_node", "")
+            # Get response from FSM orchestrator
+            result = await self.get_response(message, session_id, metadata, patient_id)
 
-                    # Only yield tokens from response-generating nodes
-                    if node_name in ("generate_response", "simple_answer", "process"):
-                        chunk_data = event.get("data", {})
-                        chunk = chunk_data.get("chunk")
+            response_text = result.get("response", "")
+            total_time_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
 
-                        if chunk and hasattr(chunk, "content") and chunk.content:
-                            if first_token_time is None:
-                                first_token_time = datetime.now(timezone.utc)
-                                ttft_ms = (first_token_time - start_time).total_seconds() * 1000
-                                logger.info(f"[voice-adapter] TTFT: {ttft_ms:.0f}ms")
+            logger.info(
+                f"[voice-adapter] Completed in {total_time_ms:.0f}ms"
+            )
 
-                            tokens_yielded += 1
-                            yield StreamingResponse(
-                                content=chunk.content,
-                                is_final=False,
-                                node_name=node_name,
-                            )
-
-                # Also check for final response in state updates
-                elif event["event"] == "on_chain_end":
-                    # Graph completed - check if we got any tokens
-                    pass
-
-            # If we didn't stream any tokens, fall back to getting full response
-            if tokens_yielded == 0:
-                logger.warning("[voice-adapter] No streaming tokens - using fallback")
-                result = await self.get_response(message, session_id, metadata, patient_id)
-                yield StreamingResponse(
-                    content=result["response"],
-                    is_final=True,
-                    node_name="fallback",
-                    metadata=result,
-                )
-            else:
-                # Send final chunk marker
-                total_time_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-                yield StreamingResponse(
-                    content="",
-                    is_final=True,
-                    metadata={
-                        "tokens_yielded": tokens_yielded,
-                        "total_time_ms": total_time_ms,
-                        "ttft_ms": (first_token_time - start_time).total_seconds() * 1000 if first_token_time else None,
-                    },
-                )
-
-                logger.info(
-                    f"[voice-adapter] Completed: {tokens_yielded} tokens in {total_time_ms:.0f}ms"
-                )
+            # Yield the complete response
+            # For voice applications, TTS will handle streaming on the output side
+            yield StreamingResponse(
+                content=response_text,
+                is_final=True,
+                node_name="fsm",
+                metadata={
+                    "total_time_ms": total_time_ms,
+                    "route": result.get("route"),
+                    "tools_called": result.get("tools_called", []),
+                },
+            )
 
         except Exception as e:
-            logger.error(f"[voice-adapter] Streaming failed: {e}", exc_info=True)
-            # Fall back to full response
-            try:
-                result = await self.get_response(message, session_id, metadata, patient_id)
-                yield StreamingResponse(
-                    content=result["response"],
-                    is_final=True,
-                    node_name="error_fallback",
-                    metadata={"error": str(e)},
-                )
-            except Exception as fallback_error:
-                yield StreamingResponse(
-                    content="I apologize, but I'm having trouble processing your request. Please try again.",
-                    is_final=True,
-                    node_name="error",
-                    metadata={"error": str(fallback_error)},
-                )
+            logger.error(f"[voice-adapter] Processing failed: {e}", exc_info=True)
+            yield StreamingResponse(
+                content="I apologize, but I'm having trouble processing your request. Please try again.",
+                is_final=True,
+                node_name="error",
+                metadata={"error": str(e)},
+            )
 
     async def get_response(
         self,
@@ -276,12 +184,7 @@ class LangGraphVoiceAdapter:
         patient_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Get full response from LangGraph (non-streaming).
-
-        Use this for:
-        - Fallback when streaming fails
-        - Text channels that don't need streaming
-        - Testing
+        Get full response from FSM orchestrator (non-streaming).
 
         Args:
             message: User message text
@@ -290,7 +193,7 @@ class LangGraphVoiceAdapter:
             patient_id: Optional patient ID
 
         Returns:
-            Dict with response, intent, metadata, etc.
+            Dict with response, route, tools_called, etc.
         """
         metadata = metadata or {}
 
@@ -303,36 +206,34 @@ class LangGraphVoiceAdapter:
                 session_id
             )
 
-        # Build context for graph
-        context = {
-            "clinic_profile": metadata.get("clinic_profile", {}),
-            "patient_profile": metadata.get("patient_profile", {}),
-        }
+        # Get orchestrator instance
+        orchestrator = await self._get_orchestrator()
 
-        # Get graph instance
-        graph = await self._get_graph()
+        # Get FSM state for this session
+        fsm_state = self._fsm_states.get(session_id)
 
-        # Process through graph
-        result = await graph.process(
+        # Detect language from metadata
+        language = metadata.get("language", metadata.get("detected_language", "en"))
+
+        # Process through FSM
+        result = await orchestrator.process(
             message=message,
             session_id=session_id,
-            metadata={
-                "channel": "voice",
-                "clinic_id": self.clinic_id,
-                "patient_id": patient_id,
-                **metadata,
-            },
-            patient_id=patient_id,
-            context=context,
+            state=fsm_state,
+            language=language,
         )
+
+        # Save updated state
+        if result.get("state"):
+            self._fsm_states[session_id] = result["state"]
 
         return result
 
     async def close(self):
         """Clean up resources."""
-        if self._graph is not None:
-            # Close any graph resources if needed
-            self._graph = None
+        if self._orchestrator is not None:
+            self._orchestrator = None
+            self._fsm_states.clear()
             logger.info(f"[voice-adapter] Closed adapter for clinic {self.clinic_id}")
 
 
@@ -355,6 +256,6 @@ async def create_voice_adapter(
         clinic_id=clinic_id,
         supabase_client=supabase_client,
     )
-    # Pre-initialize the graph
-    await adapter._get_graph()
+    # Pre-initialize the orchestrator
+    await adapter._get_orchestrator()
     return adapter

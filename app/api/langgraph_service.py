@@ -1,7 +1,9 @@
 """
-LangGraph Service API Endpoint
-FastAPI service for direct LangGraph processing
+FSM Orchestrator Service API Endpoint
+FastAPI service for FSM-based conversation processing
 Achieves <500ms response times for text messages
+
+Phase 6: Uses pure FSM orchestrator (legacy LangGraph removed).
 """
 
 from fastapi import APIRouter, HTTPException, Request
@@ -11,89 +13,42 @@ import time
 import logging
 import asyncio
 from datetime import datetime
-import os
-import sys
 
 # Initialize logger first
 logger = logging.getLogger(__name__)
 
-# Import orchestrators from the copied location
+# Import FSM orchestrator
 try:
-    from app.services.orchestrator.base_langgraph import BaseLangGraphOrchestrator
-    from app.services.orchestrator.templates.healthcare_template import HealthcareLangGraph
-    from app.services.orchestrator.templates.general_template import GeneralLangGraph
-    langgraph_available = True
+    from app.services.orchestrator.fsm_orchestrator import FSMOrchestrator
+    from app.services.llm import LLMFactory
+    fsm_available = True
 except ImportError as e:
-    logger.warning(f"LangGraph not available: {e}")
-    langgraph_available = False
-    BaseLangGraphOrchestrator = None
-    HealthcareLangGraph = None
-    GeneralLangGraph = None
+    logger.warning(f"FSM Orchestrator not available: {e}")
+    fsm_available = False
+    FSMOrchestrator = None
+    LLMFactory = None
 
 router = APIRouter(prefix="/langgraph", tags=["langgraph"])
 
 
 class MessageRequest(BaseModel):
-    """Request model for LangGraph processing"""
+    """Request model for FSM processing"""
     session_id: str
     text: str
     metadata: Optional[Dict[str, Any]] = {}
-    use_healthcare: bool = True  # Default to healthcare for clinics
-    enable_rag: bool = True
-    enable_memory: bool = True
+    clinic_id: Optional[str] = None
+    language: str = "en"
 
 
 class MessageResponse(BaseModel):
-    """Response model for LangGraph processing"""
+    """Response model for FSM processing"""
     session_id: str
     response: str
     latency_ms: float
     intent: Optional[str] = None
-    routing_path: str = "langgraph_direct"
+    routing_path: str = "fsm_direct"
     metadata: Dict[str, Any] = {}
     audit_trail: Optional[List[Dict[str, Any]]] = None
-
-
-# Initialize orchestrators
-orchestrators = {}
-
-if langgraph_available:
-    # Healthcare orchestrator for medical conversations
-    if HealthcareLangGraph:
-        try:
-            orchestrators["healthcare"] = HealthcareLangGraph(
-                phi_middleware=None,  # Would integrate with actual PHI service
-                appointment_service=None,  # Would integrate with appointment service
-                enable_emergency_detection=True
-            )
-            logger.info("Healthcare orchestrator initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize healthcare orchestrator: {e}")
-
-    # General orchestrator for non-medical conversations
-    if GeneralLangGraph:
-        try:
-            orchestrators["general"] = GeneralLangGraph(
-                llm_client=None,  # Would integrate with LLM service
-                response_style="friendly",
-                enable_suggestions=True
-            )
-            logger.info("General orchestrator initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize general orchestrator: {e}")
-            # Fallback to base
-            if BaseLangGraphOrchestrator:
-                try:
-                    orchestrators["general"] = BaseLangGraphOrchestrator(
-                        compliance_mode=None,
-                        enable_memory=True,
-                        enable_rag=True
-                    )
-                    logger.info("Using base orchestrator as fallback")
-                except Exception as e2:
-                    logger.error(f"Failed to initialize base orchestrator: {e2}")
-else:
-    logger.warning("LangGraph not available - orchestrators disabled")
 
 
 # State manager for session persistence
@@ -103,6 +58,7 @@ class SessionStateManager:
     def __init__(self):
         self.sessions = {}
         self.session_metrics = {}
+        self.fsm_states = {}  # FSM state persistence
 
     async def get_or_create(self, session_id: str) -> Dict[str, Any]:
         """Get or create session state"""
@@ -120,6 +76,14 @@ class SessionStateManager:
         self.sessions[session_id] = state
         self.sessions[session_id]["updated_at"] = datetime.utcnow().isoformat()
 
+    def get_fsm_state(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get FSM state for session"""
+        return self.fsm_states.get(session_id)
+
+    def set_fsm_state(self, session_id: str, fsm_state: Dict[str, Any]):
+        """Set FSM state for session"""
+        self.fsm_states[session_id] = fsm_state
+
     def track_metric(self, session_id: str, latency_ms: float):
         """Track session metrics"""
         if session_id not in self.session_metrics:
@@ -130,11 +94,38 @@ class SessionStateManager:
 # Global state manager
 state_manager = SessionStateManager()
 
+# Orchestrator cache
+_orchestrator_cache: Dict[str, FSMOrchestrator] = {}
+
+
+def get_orchestrator(clinic_id: str) -> Optional[FSMOrchestrator]:
+    """Get or create FSM orchestrator for clinic"""
+    if not fsm_available:
+        return None
+
+    if clinic_id not in _orchestrator_cache:
+        try:
+            llm_factory = LLMFactory()
+            _orchestrator_cache[clinic_id] = FSMOrchestrator(
+                clinic_id=clinic_id,
+                llm_factory=llm_factory,
+                supabase_client=None,
+                appointment_tools=None,
+                price_tool=None,
+                clinic_profile={},
+            )
+            logger.info(f"FSM orchestrator created for clinic {clinic_id}")
+        except Exception as e:
+            logger.error(f"Failed to create FSM orchestrator: {e}")
+            return None
+
+    return _orchestrator_cache[clinic_id]
+
 
 @router.post("/process", response_model=MessageResponse)
 async def process_message(request: MessageRequest):
     """
-    Process message through LangGraph orchestrator
+    Process message through FSM orchestrator
     Target: <500ms response time for text
 
     Args:
@@ -150,56 +141,44 @@ async def process_message(request: MessageRequest):
         session_state = await state_manager.get_or_create(request.session_id)
         session_state["message_count"] += 1
 
-        # Check if orchestrators are available
-        if not orchestrators:
+        # Get orchestrator
+        clinic_id = request.clinic_id or "default"
+        orchestrator = get_orchestrator(clinic_id)
+
+        if not orchestrator:
             return MessageResponse(
                 session_id=request.session_id,
-                response="LangGraph service is currently unavailable. Please try again later.",
+                response="FSM service is currently unavailable. Please try again later.",
                 latency_ms=(time.perf_counter() - start_time) * 1000,
-                routing_path="langgraph_direct",
-                metadata={"error": "LangGraph not installed"}
+                routing_path="fsm_direct",
+                metadata={"error": "FSM orchestrator not available"}
             )
 
-        # Select orchestrator based on request
-        if request.use_healthcare and "healthcare" in orchestrators:
-            orchestrator = orchestrators["healthcare"]
-            logger.debug(f"Using healthcare orchestrator for session {request.session_id}")
-        elif "general" in orchestrators:
-            orchestrator = orchestrators["general"]
-            logger.debug(f"Using general orchestrator for session {request.session_id}")
-        else:
-            return MessageResponse(
-                session_id=request.session_id,
-                response="No orchestrators available. Please check system configuration.",
-                latency_ms=(time.perf_counter() - start_time) * 1000,
-                routing_path="langgraph_direct",
-                metadata={"error": "No orchestrators configured"}
-            )
+        # Get FSM state for multi-turn continuity
+        fsm_state = state_manager.get_fsm_state(request.session_id)
 
-        # Add context from session state
-        enhanced_metadata = {
-            **request.metadata,
-            "message_count": session_state["message_count"],
-            "session_context": session_state.get("context", {})
-        }
-
-        # Process through LangGraph
+        # Process through FSM
         try:
             result = await asyncio.wait_for(
                 orchestrator.process(
                     message=request.text,
                     session_id=request.session_id,
-                    metadata=enhanced_metadata
+                    state=fsm_state,
+                    language=request.language,
                 ),
                 timeout=2.0  # 2 second timeout for fast responses
             )
         except asyncio.TimeoutError:
-            logger.warning(f"LangGraph timeout for session {request.session_id}")
+            logger.warning(f"FSM timeout for session {request.session_id}")
             result = {
                 "session_id": request.session_id,
                 "response": "I'm still processing your request. Please wait a moment.",
                 "error": "timeout"
             }
+
+        # Save FSM state for next turn
+        if result.get("state"):
+            state_manager.set_fsm_state(request.session_id, result["state"])
 
         # Calculate latency
         latency_ms = (time.perf_counter() - start_time) * 1000
@@ -207,10 +186,7 @@ async def process_message(request: MessageRequest):
         # Track metrics
         state_manager.track_metric(request.session_id, latency_ms)
 
-        # Update session state with response context
-        if "context" in result:
-            session_state["context"].update(result["context"])
-
+        # Update session history
         session_state["history"].append({
             "timestamp": datetime.utcnow().isoformat(),
             "message": request.text,
@@ -231,11 +207,12 @@ async def process_message(request: MessageRequest):
             session_id=request.session_id,
             response=result.get("response", "I'm here to help. Please tell me more."),
             latency_ms=latency_ms,
-            intent=result.get("intent"),
-            routing_path="langgraph_direct",
+            intent=result.get("route"),
+            routing_path="fsm_direct",
             metadata={
                 "message_count": session_state["message_count"],
-                "orchestrator": "healthcare" if request.use_healthcare else "general"
+                "tools_called": result.get("tools_called", []),
+                "route": result.get("route"),
             },
             audit_trail=result.get("audit_trail", [])
         )
@@ -250,25 +227,25 @@ async def process_message(request: MessageRequest):
             session_id=request.session_id,
             response="I encountered an error processing your message. Please try again.",
             latency_ms=latency_ms,
-            routing_path="langgraph_direct",
+            routing_path="fsm_direct",
             metadata={"error": str(e)}
         )
 
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint for LangGraph service"""
+    """Health check endpoint for FSM service"""
     return {
         "status": "healthy",
-        "service": "langgraph",
-        "orchestrators": list(orchestrators.keys()),
+        "service": "fsm",
+        "orchestrators": list(_orchestrator_cache.keys()),
         "sessions_active": len(state_manager.sessions)
     }
 
 
 @router.get("/metrics")
 async def get_metrics():
-    """Get performance metrics for LangGraph service"""
+    """Get performance metrics for FSM service"""
     all_latencies = []
     for session_latencies in state_manager.session_metrics.values():
         all_latencies.extend(session_latencies)
@@ -321,6 +298,9 @@ async def clear_session(session_id: str):
     if session_id in state_manager.session_metrics:
         del state_manager.session_metrics[session_id]
 
+    if session_id in state_manager.fsm_states:
+        del state_manager.fsm_states[session_id]
+
     return {"status": "cleared", "session_id": session_id}
 
 
@@ -351,7 +331,7 @@ async def process_batch(messages: List[MessageRequest]):
                 session_id=messages[i].session_id,
                 response="Error processing message",
                 latency_ms=0,
-                routing_path="langgraph_direct",
+                routing_path="fsm_direct",
                 metadata={"error": str(response)}
             ))
         else:

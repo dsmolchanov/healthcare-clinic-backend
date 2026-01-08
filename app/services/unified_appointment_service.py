@@ -7,7 +7,7 @@ Implements direct replacement strategy with ask-hold-reserve pattern
 import os
 import uuid
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -610,6 +610,9 @@ class UnifiedAppointmentService:
                 .eq('id', appointment_id)\
                 .execute()
 
+            # Phase 5: Cancel scheduled reminder messages
+            await self.cancel_appointment_messages(appointment_id)
+
             # Cancel external calendar events
             if appointment.get('reservation_id'):
                 await self._cancel_calendar_events(appointment['reservation_id'])
@@ -708,6 +711,9 @@ class UnifiedAppointmentService:
 
             new_reservation_id = hold_result.get('reservation_id')
 
+            # Phase 5: Cancel old scheduled reminder messages before updating
+            await self.cancel_appointment_messages(appointment_id)
+
             # Update appointment with new time
             update_result = self.supabase.table('appointments')\
                 .update({
@@ -759,6 +765,16 @@ class UnifiedAppointmentService:
                 },
                 source="internal"
             )
+
+            # Phase 5: Create new message plan with updated times
+            try:
+                await self._create_message_plan(
+                    appointment_id=appointment_id,
+                    clinic_id=appointment['clinic_id'],
+                    scheduled_at=new_start_time
+                )
+            except Exception as plan_error:
+                logger.warning(f"⚠️ Message plan creation failed after reschedule: {str(plan_error)}")
 
             return AppointmentResult(
                 success=True,
@@ -2043,6 +2059,17 @@ class UnifiedAppointmentService:
 
                 logger.info(f"✅ Successfully booked appointment {appointment_id}")
 
+                # Phase 5: Create SOTA message plan for reminders
+                try:
+                    await self._create_message_plan(
+                        appointment_id=appointment_id,
+                        clinic_id=request.clinic_id,
+                        scheduled_at=request.start_time
+                    )
+                except Exception as plan_error:
+                    # Message plan failure shouldn't fail the booking
+                    logger.warning(f"⚠️ Message plan creation failed: {str(plan_error)}")
+
                 return AppointmentResult(
                     success=True,
                     appointment_id=appointment_id,
@@ -2077,3 +2104,86 @@ class UnifiedAppointmentService:
                 success=False,
                 error=str(e)
             )
+
+    # ==========================================
+    # Phase 5: Message Plan Management
+    # ==========================================
+
+    async def _create_message_plan(
+        self,
+        appointment_id: str,
+        clinic_id: str,
+        scheduled_at: datetime
+    ):
+        """
+        Create SOTA message plan for this appointment.
+
+        Schedules:
+        - Immediate: Confirmation message
+        - T-24h: Reminder with confirm/reschedule prompt
+        - T-2h: Wayfinding reminder with location
+        """
+        now = datetime.now(timezone.utc)
+
+        # Define message schedule
+        messages = [
+            {
+                'message_type': 'confirmation',
+                'scheduled_at': now,  # Immediate
+                'template_key': 'booking_confirmation'
+            },
+            {
+                'message_type': 'reminder_24h',
+                'scheduled_at': scheduled_at - timedelta(hours=24),
+                'template_key': 'reminder_24h'
+            },
+            {
+                'message_type': 'reminder_2h',
+                'scheduled_at': scheduled_at - timedelta(hours=2),
+                'template_key': 'wayfinding_2h'
+            }
+        ]
+
+        for msg in messages:
+            # Skip if scheduled time is in the past
+            if msg['scheduled_at'] < now:
+                logger.info(f"Skipping {msg['message_type']} - scheduled time is in the past")
+                continue
+
+            idempotency_key = f"{appointment_id}:{msg['message_type']}"
+
+            try:
+                self.supabase.schema('healthcare').table('appointment_message_plan').insert({
+                    'appointment_id': appointment_id,
+                    'message_type': msg['message_type'],
+                    'scheduled_at': msg['scheduled_at'].isoformat(),
+                    'channel': 'whatsapp',
+                    'template_key': msg['template_key'],
+                    'status': 'scheduled',
+                    'idempotency_key': idempotency_key
+                }).execute()
+                logger.info(f"Scheduled {msg['message_type']} for appointment {appointment_id}")
+            except Exception as e:
+                # Idempotency key conflict = already exists, which is fine
+                if 'duplicate' not in str(e).lower() and 'unique' not in str(e).lower():
+                    logger.error(f"Failed to create message plan: {e}")
+
+    async def cancel_appointment_messages(self, appointment_id: str):
+        """
+        Cancel all scheduled (not yet sent) messages for an appointment.
+
+        Called when:
+        - Appointment is cancelled
+        - Appointment is rescheduled (before creating new plan)
+        """
+        try:
+            result = self.supabase.schema('healthcare').table('appointment_message_plan').update({
+                'status': 'cancelled',
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }).eq('appointment_id', appointment_id).eq('status', 'scheduled').execute()
+
+            cancelled_count = len(result.data) if result.data else 0
+            if cancelled_count > 0:
+                logger.info(f"Cancelled {cancelled_count} scheduled messages for appointment {appointment_id}")
+        except Exception as e:
+            logger.error(f"Failed to cancel messages for {appointment_id}: {e}")
