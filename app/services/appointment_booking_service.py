@@ -298,13 +298,21 @@ class AppointmentBookingService:
             return result.data
 
         # Create new patient with provided details
+        first_name = (appointment_details.get('first_name') or '').strip() or 'Pending'
+        last_name = (appointment_details.get('last_name') or '').strip() or 'Registration'
+        date_of_birth = (
+            appointment_details.get('dob')
+            or appointment_details.get('date_of_birth')
+            or '2000-01-01'
+        )
+
         patient_data = {
             'id': str(uuid.uuid4()),
             'clinic_id': clinic_id,
             'phone': clean_phone,
-            'first_name': appointment_details.get('first_name', 'Pending'),
-            'last_name': appointment_details.get('last_name', 'Registration'),
-            'date_of_birth': appointment_details.get('dob', '2000-01-01'),
+            'first_name': first_name,
+            'last_name': last_name,
+            'date_of_birth': date_of_birth,
             'email': appointment_details.get('email'),
             'preferred_contact_method': 'whatsapp',
             'registered_date': datetime.utcnow().date().isoformat()
