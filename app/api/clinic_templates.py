@@ -20,6 +20,14 @@ class TemplateRequest(BaseModel):
     language: str = "en"
 
 
+class AddProviderRequest(BaseModel):
+    clinic_id: str
+    name: str
+    email: Optional[str] = None
+    specialization: Optional[str] = None
+    phone: Optional[str] = None
+
+
 # Template definitions for dental services
 DENTAL_SERVICES: List[dict] = [
     {"name": "General Checkup", "category": "General", "description": "Comprehensive dental examination", "base_price": 150, "duration_minutes": 30},
@@ -195,3 +203,62 @@ async def list_templates():
             }
         ]
     }
+
+
+@router.post("/add-provider")
+async def add_provider(request: AddProviderRequest):
+    """Add a provider/doctor to a clinic during onboarding."""
+    healthcare_client = get_healthcare_client()
+
+    # Verify clinic exists
+    try:
+        clinic = healthcare_client.table("clinics").select("id, name").eq("id", request.clinic_id).single().execute()
+    except Exception as e:
+        logger.error(f"Failed to fetch clinic {request.clinic_id}: {e}")
+        raise HTTPException(status_code=404, detail="Clinic not found")
+
+    if not clinic.data:
+        raise HTTPException(status_code=404, detail="Clinic not found")
+
+    # Create the doctor
+    try:
+        # Generate default working hours (9 AM - 6 PM weekdays)
+        default_working_hours = {
+            "monday": {"start": "09:00", "end": "18:00"},
+            "tuesday": {"start": "09:00", "end": "18:00"},
+            "wednesday": {"start": "09:00", "end": "18:00"},
+            "thursday": {"start": "09:00", "end": "18:00"},
+            "friday": {"start": "09:00", "end": "17:00"},
+            "saturday": None,
+            "sunday": None
+        }
+
+        doctor_data = {
+            "clinic_id": request.clinic_id,
+            "name": request.name,
+            "email": request.email,
+            "phone": request.phone,
+            "specialization": request.specialization,
+            "working_hours": default_working_hours,
+            "active": True
+        }
+
+        result = healthcare_client.table("doctors").insert(doctor_data).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create provider")
+
+        doctor = result.data[0]
+        logger.info(f"Created provider {request.name} for clinic {request.clinic_id}")
+
+        return {
+            "success": True,
+            "doctor_id": doctor.get("id"),
+            "name": request.name
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create provider for clinic {request.clinic_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create provider: {str(e)}")
