@@ -2,10 +2,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 import logging
+import os
+import httpx
 
-from ..db.supabase_client import get_supabase_client
-from ..services.llm.llm_factory import get_llm_factory
-from ..services.llm.tiers import ModelTier
+from ..database import get_healthcare_client
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 logger = logging.getLogger(__name__)
@@ -25,16 +25,21 @@ class SimulationRequest(BaseModel):
 @router.post("/simulate")
 async def simulate_agent(request: SimulationRequest):
     """Simulate AI agent response for testing during onboarding."""
-    supabase = get_supabase_client()
+    supabase = get_healthcare_client()
 
     # Get clinic data
-    clinic = (
-        supabase.table("clinics")
-        .select("*")
-        .eq("id", request.clinic_id)
-        .single()
-        .execute()
-    )
+    try:
+        clinic = (
+            supabase.table("clinics")
+            .select("*")
+            .eq("id", request.clinic_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch clinic: {e}")
+        raise HTTPException(status_code=404, detail="Clinic not found")
+
     if not clinic.data:
         raise HTTPException(status_code=404, detail="Clinic not found")
 
@@ -102,8 +107,10 @@ Instructions:
 - If you don't know something specific, say so and suggest contacting the clinic directly"""
 
     try:
-        # Get LLM factory and generate response
-        llm = await get_llm_factory()
+        # Use direct OpenAI API call for reliability
+        openai_api_key = os.environ.get("OPENAI_API_KEY")
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY not configured")
 
         messages = [
             {"role": "system", "content": context},
@@ -111,15 +118,31 @@ Instructions:
             {"role": "user", "content": request.message},
         ]
 
-        response = await llm.generate_for_tier(
-            tier=ModelTier.ROUTING,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=500,
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": messages,
+                    "temperature": 0.7,
+                    "max_tokens": 500,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        content = data["choices"][0]["message"]["content"]
+        return {"success": True, "response": content}
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"OpenAI API error: {e.response.text}")
+        raise HTTPException(
+            status_code=500, detail=f"AI service error: {e.response.status_code}"
         )
-
-        return {"success": True, "response": response.content}
-
     except Exception as e:
         logger.error(f"Agent simulation failed: {e}")
         raise HTTPException(
