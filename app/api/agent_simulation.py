@@ -5,7 +5,7 @@ import logging
 import os
 import httpx
 
-from ..database import get_healthcare_client
+from ..database import get_healthcare_client, get_main_client
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 logger = logging.getLogger(__name__)
@@ -54,11 +54,13 @@ async def simulate_agent(request: SimulationRequest):
         .execute()
     )
 
-    # Get FAQs
+    # Get FAQs (from public schema)
+    public_client = get_main_client()
     faqs = (
-        supabase.table("faqs")
+        public_client.table("faqs")
         .select("question, answer")
         .eq("clinic_id", request.clinic_id)
+        .eq("is_active", True)
         .limit(20)
         .execute()
     )
