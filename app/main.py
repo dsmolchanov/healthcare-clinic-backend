@@ -555,6 +555,10 @@ app.include_router(hitl_router.router)
 from app.api import message_plan_api
 app.include_router(message_plan_api.router)
 
+# System Health API (Phase 3 - Run Dashboard)
+from app.api import system_health
+app.include_router(system_health.router)
+
 # ============================================================================
 # Health Check
 # ============================================================================
