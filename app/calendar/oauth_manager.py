@@ -30,12 +30,20 @@ class CalendarOAuthManager:
     """
 
     def __init__(self):
-        # Initialize with healthcare schema
-        options = ClientOptions(schema='healthcare')
+        # Initialize with healthcare schema for PHI data
+        healthcare_options = ClientOptions(schema='healthcare')
         self.supabase: Client = create_client(
             os.environ.get("SUPABASE_URL"),
             os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
-            options=options
+            options=healthcare_options
+        )
+
+        # Initialize with public schema for oauth_states
+        public_options = ClientOptions(schema='public')
+        self.public_supabase: Client = create_client(
+            os.environ.get("SUPABASE_URL"),
+            os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
+            options=public_options
         )
 
         self.vault = ComplianceVault()
@@ -82,8 +90,8 @@ class CalendarOAuthManager:
         # Generate secure state token
         state = secrets.token_urlsafe(32)
 
-        # Store state in database for verification
-        self.supabase.table('oauth_states').insert({
+        # Store state in database for verification (public schema)
+        self.public_supabase.table('oauth_states').insert({
             'state': state,
             'user_id': doctor_id,
             'provider': 'google',
@@ -134,8 +142,8 @@ class CalendarOAuthManager:
         # Generate secure state token
         state = secrets.token_urlsafe(32)
 
-        # Store state in database
-        self.supabase.table('oauth_states').insert({
+        # Store state in database (public schema)
+        self.public_supabase.table('oauth_states').insert({
             'state': state,
             'user_id': doctor_id,
             'provider': 'outlook',
@@ -189,8 +197,8 @@ class CalendarOAuthManager:
             # Parse state data
             state_data = json.loads(state)
 
-            # Verify state token
-            result = self.supabase.table('oauth_states').select('*').eq(
+            # Verify state token (public schema)
+            result = self.public_supabase.table('oauth_states').select('*').eq(
                 'state', state_data['state']
             ).eq('provider', 'google').single().execute()
 
@@ -277,8 +285,8 @@ class CalendarOAuthManager:
                 logger.warning(f"Failed to register webhook (will fallback to polling): {e}")
                 # Continue without webhook - polling will handle sync
 
-            # Clean up state token
-            self.supabase.table('oauth_states').delete().eq(
+            # Clean up state token (public schema)
+            self.public_supabase.table('oauth_states').delete().eq(
                 'state', state_data['state']
             ).execute()
 
@@ -387,8 +395,8 @@ class CalendarOAuthManager:
             # Parse state data
             state_data = json.loads(state)
 
-            # Verify state token
-            result = self.supabase.table('oauth_states').select('*').eq(
+            # Verify state token (public schema)
+            result = self.public_supabase.table('oauth_states').select('*').eq(
                 'state', state_data['state']
             ).eq('provider', 'outlook').single().execute()
 
@@ -464,8 +472,8 @@ class CalendarOAuthManager:
                 'p_scope': ' '.join(credentials_data.get('scopes', []))
             }).execute()
 
-            # Clean up state token
-            self.supabase.table('oauth_states').delete().eq(
+            # Clean up state token (public schema)
+            self.public_supabase.table('oauth_states').delete().eq(
                 'state', state_data['state']
             ).execute()
 
