@@ -1621,7 +1621,7 @@ async def places_autocomplete(query: str, types: str = "establishment"):
     Keeps API key server-side for security.
     """
     try:
-        google_api_key = os.environ.get("GOOGLE_PLACES_API_KEY")
+        google_api_key = os.environ.get("GOOGLE_API_KEY")
 
         if not google_api_key:
             # Return mock data for development
@@ -1681,7 +1681,7 @@ async def places_details(place_id: str):
     Returns structured address components and phone number.
     """
     try:
-        google_api_key = os.environ.get("GOOGLE_PLACES_API_KEY")
+        google_api_key = os.environ.get("GOOGLE_API_KEY")
 
         if not google_api_key:
             # Return mock data for development
