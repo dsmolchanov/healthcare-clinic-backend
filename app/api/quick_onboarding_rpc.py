@@ -1352,3 +1352,399 @@ async def activate_clinic(clinic_id: str):
             'error': str(e),
             'clinic_id': clinic_id
         }
+
+
+# =============================================================================
+# NEW SIMPLIFIED ONBOARDING ENDPOINTS
+# =============================================================================
+
+class QuickLaunchRequest(BaseModel):
+    """Minimal 1-step onboarding request"""
+    name: str
+    email: str
+    template_type: str = "custom"  # dental, medical, specialist, custom
+    timezone: Optional[str] = None
+    primary_language: Optional[str] = "en"
+    business_hours: Optional[Dict[str, Any]] = None
+    places_data: Optional[Dict[str, Any]] = None  # From Google Places API
+
+
+@router.post("/quick-launch")
+async def quick_launch(data: QuickLaunchRequest):
+    """
+    1-step onboarding: Creates organization, clinic, agent, and owner provider in one call.
+    Optionally applies template for services/FAQs.
+    """
+    try:
+        service = get_service()
+        import json
+
+        # Auto-detect timezone if not provided
+        timezone = data.timezone or "America/New_York"
+
+        # Default business hours
+        business_hours = data.business_hours or {
+            "monday": "9:00 AM - 6:00 PM",
+            "tuesday": "9:00 AM - 6:00 PM",
+            "wednesday": "9:00 AM - 6:00 PM",
+            "thursday": "9:00 AM - 6:00 PM",
+            "friday": "9:00 AM - 5:00 PM",
+            "saturday": "Closed",
+            "sunday": "Closed"
+        }
+
+        # Extract address info from places_data if available
+        places = data.places_data or {}
+        address = places.get('address', '')
+        city = places.get('city', '')
+        state = places.get('state', '')
+        zip_code = places.get('zip', '')
+        phone = places.get('phone', '')
+
+        # Step 1: Register clinic using existing RPC
+        register_result = await service.quick_register(QuickRegistration(
+            name=data.name,
+            email=data.email,
+            phone=phone or "000-000-0000",
+            user_email=data.email,  # Associate with logged-in user
+            timezone=timezone,
+            state=state or "CA",
+            city=city or "City",
+            address=address or "Address",
+            zip_code=zip_code or "00000",
+            business_hours=business_hours,
+            currency="USD",
+            primary_language=data.primary_language or "en"
+        ))
+
+        if not register_result.get('success'):
+            return {
+                'success': False,
+                'error': register_result.get('error', 'Registration failed'),
+                'message': 'Failed to create clinic'
+            }
+
+        clinic_id = register_result.get('clinic_id')
+        organization_id = register_result.get('organization_id')
+        agent_id = register_result.get('agent_id')
+        doctor_id = register_result.get('doctor_id')
+
+        # Step 2: Apply template if not custom
+        services_seeded = 0
+        faqs_seeded = 0
+
+        if data.template_type and data.template_type != "custom":
+            try:
+                # Call apply-template endpoint logic
+                template_result = service.supabase.rpc('apply_clinic_template', {
+                    'p_clinic_id': clinic_id,
+                    'p_template_type': data.template_type,
+                    'p_currency': 'USD',
+                    'p_language': data.primary_language or 'en'
+                }).execute()
+
+                if template_result.data:
+                    services_seeded = template_result.data.get('services_seeded', 0)
+                    faqs_seeded = template_result.data.get('faqs_seeded', 0)
+            except Exception as e:
+                logger.warning(f"Template application failed (non-critical): {e}")
+                # Continue anyway - template is optional
+
+        return {
+            'success': True,
+            'clinic_id': clinic_id,
+            'organization_id': organization_id,
+            'agent_id': agent_id,
+            'doctor_id': doctor_id,
+            'template_applied': data.template_type != "custom",
+            'services_seeded': services_seeded,
+            'faqs_seeded': faqs_seeded,
+            'message': f"Clinic '{data.name}' created successfully!"
+        }
+
+    except Exception as e:
+        logger.error(f"Quick launch failed: {e}")
+        return {
+            'success': False,
+            'error': str(e),
+            'message': 'Failed to launch clinic'
+        }
+
+
+@router.get("/setup-status")
+async def get_setup_status(clinic_id: str):
+    """
+    Get setup completion status for the progress banner.
+    Returns completion percentage and which steps are done.
+    """
+    try:
+        service = get_service()
+
+        # Fetch clinic details
+        clinic_result = service.supabase.rpc('fetch_clinic', {
+            'p_clinic_id': clinic_id
+        }).execute()
+
+        if not clinic_result.data or not clinic_result.data.get('success'):
+            return {
+                'success': False,
+                'error': 'Clinic not found'
+            }
+
+        clinic = clinic_result.data.get('data', {})
+        org_id = clinic.get('organization_id')
+
+        # Check each setup step
+        steps = []
+
+        # 1. Clinic Info - always complete if we got here
+        steps.append({
+            'id': 'clinic_info',
+            'label': 'Clinic Info',
+            'completed': bool(clinic.get('name') and clinic.get('email')),
+            'href': '/business/settings'
+        })
+
+        # 2. Services - check if at least 1 service exists with price
+        try:
+            from supabase.client import ClientOptions
+            healthcare_client = create_client(
+                os.environ.get("SUPABASE_URL"),
+                os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
+                options=ClientOptions(schema='healthcare')
+            )
+            services_result = healthcare_client.table('services').select('id, price').eq('clinic_id', clinic_id).eq('is_active', True).limit(10).execute()
+            services = services_result.data or []
+            has_services = len(services) > 0
+            has_priced_services = any(s.get('price') and s.get('price') > 0 for s in services)
+        except:
+            has_services = False
+            has_priced_services = False
+
+        steps.append({
+            'id': 'services',
+            'label': 'Services',
+            'completed': has_services and has_priced_services,
+            'href': '/business/resources?tab=services'
+        })
+
+        # 3. Providers - check if at least 1 provider exists
+        try:
+            providers_result = healthcare_client.table('doctors').select('id').eq('clinic_id', clinic_id).eq('is_active', True).limit(1).execute()
+            has_providers = len(providers_result.data or []) > 0
+        except:
+            has_providers = False
+
+        steps.append({
+            'id': 'providers',
+            'label': 'Providers',
+            'completed': has_providers,
+            'href': '/business/resources?tab=staff'
+        })
+
+        # 4. WhatsApp - check if connected
+        try:
+            whatsapp_result = healthcare_client.table('integrations').select('id').eq('organization_id', org_id).eq('type', 'whatsapp').eq('enabled', True).limit(1).execute()
+            has_whatsapp = len(whatsapp_result.data or []) > 0
+        except:
+            has_whatsapp = False
+
+        steps.append({
+            'id': 'whatsapp',
+            'label': 'WhatsApp',
+            'completed': has_whatsapp,
+            'href': '/intelligence/integrations'
+        })
+
+        # 5. FAQ (optional) - check if at least 3 FAQs
+        try:
+            public_client = create_client(
+                os.environ.get("SUPABASE_URL"),
+                os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+            )
+            faqs_result = public_client.table('faqs').select('id').eq('clinic_id', clinic_id).eq('is_active', True).limit(5).execute()
+            faq_count = len(faqs_result.data or [])
+            has_enough_faqs = faq_count >= 3
+        except:
+            faq_count = 0
+            has_enough_faqs = False
+
+        steps.append({
+            'id': 'faq',
+            'label': 'FAQ',
+            'completed': has_enough_faqs,
+            'optional': True,
+            'href': '/intelligence/knowledge?tab=faq'
+        })
+
+        # Calculate completion percentage (FAQ is optional, so 4 required steps)
+        required_steps = [s for s in steps if not s.get('optional')]
+        completed_required = sum(1 for s in required_steps if s['completed'])
+        completion_percent = int((completed_required / len(required_steps)) * 100)
+
+        # Find next incomplete step
+        next_step = None
+        for step in steps:
+            if not step['completed']:
+                next_step = {
+                    'id': step['id'],
+                    'message': f"Complete your {step['label'].lower()} setup",
+                    'href': step['href']
+                }
+                break
+
+        return {
+            'success': True,
+            'clinic_id': clinic_id,
+            'completion_percent': completion_percent,
+            'steps': steps,
+            'next_step': next_step,
+            'setup_complete': completion_percent >= 100
+        }
+
+    except Exception as e:
+        logger.error(f"Setup status check failed: {e}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+# =============================================================================
+# GOOGLE PLACES API PROXY
+# =============================================================================
+
+@router.get("/places/autocomplete")
+async def places_autocomplete(query: str, types: str = "establishment"):
+    """
+    Proxy to Google Places Autocomplete API.
+    Keeps API key server-side for security.
+    """
+    try:
+        google_api_key = os.environ.get("GOOGLE_PLACES_API_KEY")
+
+        if not google_api_key:
+            # Return mock data for development
+            return {
+                'predictions': [
+                    {
+                        'place_id': 'mock_place_1',
+                        'name': f'{query} Dental Clinic',
+                        'formatted_address': '123 Main St, Miami, FL 33101'
+                    },
+                    {
+                        'place_id': 'mock_place_2',
+                        'name': f'{query} Medical Center',
+                        'formatted_address': '456 Oak Ave, Tampa, FL 33602'
+                    }
+                ],
+                'mock': True
+            }
+
+        async with aiohttp.ClientSession() as session:
+            params = {
+                'input': query,
+                'types': types,
+                'key': google_api_key,
+                'components': 'country:us'  # Limit to US for now
+            }
+
+            async with session.get(
+                'https://maps.googleapis.com/maps/api/place/autocomplete/json',
+                params=params
+            ) as response:
+                if response.status != 200:
+                    raise ValueError(f"Places API error: {response.status}")
+
+                data = await response.json()
+
+                # Transform to simpler format
+                predictions = []
+                for p in data.get('predictions', []):
+                    predictions.append({
+                        'place_id': p.get('place_id'),
+                        'name': p.get('structured_formatting', {}).get('main_text', ''),
+                        'formatted_address': p.get('description', '')
+                    })
+
+                return {'predictions': predictions}
+
+    except Exception as e:
+        logger.error(f"Places autocomplete failed: {e}")
+        return {'predictions': [], 'error': str(e)}
+
+
+@router.get("/places/details")
+async def places_details(place_id: str):
+    """
+    Proxy to Google Places Details API.
+    Returns structured address components and phone number.
+    """
+    try:
+        google_api_key = os.environ.get("GOOGLE_PLACES_API_KEY")
+
+        if not google_api_key:
+            # Return mock data for development
+            return {
+                'phone': '(555) 123-4567',
+                'address_components': {
+                    'street': '123 Main St',
+                    'city': 'Miami',
+                    'state': 'FL',
+                    'zip': '33101',
+                    'country': 'US'
+                },
+                'mock': True
+            }
+
+        async with aiohttp.ClientSession() as session:
+            params = {
+                'place_id': place_id,
+                'fields': 'name,formatted_phone_number,address_components,formatted_address',
+                'key': google_api_key
+            }
+
+            async with session.get(
+                'https://maps.googleapis.com/maps/api/place/details/json',
+                params=params
+            ) as response:
+                if response.status != 200:
+                    raise ValueError(f"Places API error: {response.status}")
+
+                data = await response.json()
+                result = data.get('result', {})
+
+                # Parse address components
+                address_components = {}
+                for component in result.get('address_components', []):
+                    types = component.get('types', [])
+                    if 'street_number' in types:
+                        address_components['street_number'] = component.get('short_name')
+                    elif 'route' in types:
+                        address_components['route'] = component.get('short_name')
+                    elif 'locality' in types:
+                        address_components['city'] = component.get('long_name')
+                    elif 'administrative_area_level_1' in types:
+                        address_components['state'] = component.get('short_name')
+                    elif 'postal_code' in types:
+                        address_components['zip'] = component.get('short_name')
+                    elif 'country' in types:
+                        address_components['country'] = component.get('short_name')
+
+                # Build street address
+                street = ''
+                if address_components.get('street_number'):
+                    street = address_components['street_number']
+                if address_components.get('route'):
+                    street += f" {address_components['route']}" if street else address_components['route']
+                address_components['street'] = street
+
+                return {
+                    'phone': result.get('formatted_phone_number'),
+                    'address_components': address_components,
+                    'formatted_address': result.get('formatted_address')
+                }
+
+    except Exception as e:
+        logger.error(f"Places details failed: {e}")
+        return {'error': str(e)}
