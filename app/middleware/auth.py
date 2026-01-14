@@ -157,3 +157,76 @@ async def get_current_user_optional(
     Use for endpoints that work with or without auth but may behave differently.
     """
     return payload
+
+
+# Permission-based access control
+def require_permission(action: str):
+    """
+    Factory for permission-based access control.
+
+    Usage:
+        @app.post("/api/settings/billing")
+        async def update_billing(
+            user: TokenPayload = Depends(require_permission("settings:billing:update"))
+        ):
+            return {"success": True}
+    """
+    async def permission_checker(payload: TokenPayload = Depends(require_auth)) -> TokenPayload:
+        from app.services.permission_service import get_permission_service
+        permission_service = get_permission_service()
+
+        has_perm = await permission_service.has_permission(
+            user_id=payload.sub,
+            organization_id=payload.organization_id,
+            action=action
+        )
+
+        if not has_perm:
+            logger.warning(
+                f"Permission denied: user {payload.sub} lacks '{action}'"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"Missing required permission: {action}"
+            )
+
+        return payload
+
+    return permission_checker
+
+
+def require_any_permission(*actions: str):
+    """
+    Factory for checking if user has any of the specified permissions.
+
+    Usage:
+        @app.get("/api/dashboard")
+        async def dashboard(
+            user: TokenPayload = Depends(require_any_permission(
+                "reports:view", "appointments:view"
+            ))
+        ):
+            return {"data": "..."}
+    """
+    async def permission_checker(payload: TokenPayload = Depends(require_auth)) -> TokenPayload:
+        from app.services.permission_service import get_permission_service
+        permission_service = get_permission_service()
+
+        has_any = await permission_service.has_any_permission(
+            user_id=payload.sub,
+            organization_id=payload.organization_id,
+            actions=list(actions)
+        )
+
+        if not has_any:
+            logger.warning(
+                f"Permission denied: user {payload.sub} lacks any of {actions}"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"Missing required permissions: {', '.join(actions)}"
+            )
+
+        return payload
+
+    return permission_checker

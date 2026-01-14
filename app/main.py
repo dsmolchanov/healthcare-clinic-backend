@@ -24,6 +24,8 @@ from app.database import get_healthcare_client
 from app.api import quick_onboarding_rpc
 from app.api import multimodal_upload
 from app.api import services_upload
+from app.api import permissions_api
+from app.api import invitations_api
 from app.middleware.rate_limiter import webhook_limiter
 
 # Load environment variables FIRST before importing modules that need them
@@ -474,6 +476,12 @@ app.include_router(multimodal_upload.router)
 
 # Include Services Upload API
 app.include_router(services_upload.router)
+
+# Include Permissions API for RBAC
+app.include_router(permissions_api.router)
+
+# Include Invitations API for staff management
+app.include_router(invitations_api.router)
 
 # Include Medical Director API for enhanced rule engine specialty assignment
 from app.api import medical_director

@@ -30,6 +30,16 @@ USE_TOKEN_BASED_ROUTING = os.getenv("USE_TOKEN_BASED_ROUTING", "true").lower() =
 # Log deprecation warning for legacy routing
 LOG_LEGACY_WEBHOOK_USAGE = os.getenv("LOG_LEGACY_WEBHOOK_USAGE", "true").lower() == "true"
 
+# SMTP Configuration for email invitations
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.forwardemail.net")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "support@plaintalk.io")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "support@plaintalk.io")
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "PlainTalk")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://plaintalk-frontend.vercel.app")
+
 
 def get_redis_client() -> Redis:
     """
