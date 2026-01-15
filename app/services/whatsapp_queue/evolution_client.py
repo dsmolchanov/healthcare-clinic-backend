@@ -84,10 +84,11 @@ async def send_text(instance: str, to_number: str, text: str) -> dict:
                 # Extract provider message ID from response
                 # Evolution API returns message key in response
                 provider_message_id = None
+                response_data = None
                 try:
-                    data = response.json()
-                    if isinstance(data, dict):
-                        key = data.get('key', {})
+                    response_data = response.json()
+                    if isinstance(response_data, dict):
+                        key = response_data.get('key', {})
                         provider_message_id = key.get('id')
                 except Exception:
                     pass
@@ -100,7 +101,7 @@ async def send_text(instance: str, to_number: str, text: str) -> dict:
                 return {
                     'success': True,
                     'provider_message_id': provider_message_id,
-                    'response': data if 'data' in dir() else None
+                    'response': response_data
                 }
             else:
                 logger.error(f"❌ Failed to send message: HTTP {response.status_code}")
@@ -126,7 +127,7 @@ async def send_typing_indicator(instance: str, to_number: str) -> bool:
     Returns:
         True if typing indicator sent successfully, False otherwise
     """
-    url = f"{EVOLUTION_API_URL}/chat/presence/{instance}"
+    url = f"{EVOLUTION_API_URL}/chat/sendPresence/{instance}"
     headers = {
         "apikey": EVOLUTION_API_KEY,
         "Content-Type": "application/json"
@@ -142,14 +143,17 @@ async def send_typing_indicator(instance: str, to_number: str) -> bool:
     }
 
     try:
-        logger.debug(f"Sending typing indicator to {jid_number}")
+        logger.debug(f"[Typing] Sending to {url} with number={jid_number}")
         async with httpx.AsyncClient(timeout=EVOLUTION_HTTP_TIMEOUT) as client:
             response = await client.post(url, headers=headers, json=payload)
 
             if response.status_code < 400:
-                logger.debug(f"✅ Typing indicator sent")
+                logger.debug(f"[Typing] ✅ Typing indicator sent successfully")
                 return True
             else:
+                logger.warning(
+                    f"[Typing] Response: {response.status_code} - {response.text[:200]}"
+                )
                 logger.warning(f"⚠️ Failed to send typing indicator: HTTP {response.status_code}")
                 return False
 
@@ -310,7 +314,7 @@ async def send_presence_unavailable(instance: str, to_number: str) -> bool:
     Returns:
         True if presence was set successfully, False otherwise
     """
-    url = f"{EVOLUTION_API_URL}/chat/presence/{instance}"
+    url = f"{EVOLUTION_API_URL}/chat/sendPresence/{instance}"
     headers = {
         "apikey": EVOLUTION_API_KEY,
         "Content-Type": "application/json"
