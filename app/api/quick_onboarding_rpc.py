@@ -1646,7 +1646,7 @@ async def places_autocomplete(query: str, types: str = "establishment"):
                 'input': query,
                 'types': types,
                 'key': google_api_key,
-                'components': 'country:us'  # Limit to US for now
+                # Removed country restriction to support international clinics (Mexico, Canada, etc.)
             }
 
             async with session.get(
