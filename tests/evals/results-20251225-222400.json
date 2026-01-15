@@ -1,0 +1,64 @@
+{
+  "timestamp": "20251225-222400",
+  "summary": {
+    "total": 13,
+    "passed": 0,
+    "failed": 13,
+    "success_rate": 0.0
+  },
+  "results": [],
+  "errors": [
+    {
+      "scenario": "MT-001 - Two-Turn Tool Chain (Check Availability -> Book)",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-002 - Three-Turn Tool Chain (Get Info -> Availability -> Book)",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-003 - Multi-Turn with Tool Result Synthesis",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-004 - Context Preservation Across User Turns",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-005 - Constraints Persistence Across Turns",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-006 - Primary Provider Timeout Fallback",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-007 - Provider Error Fallback with Tool Calling",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-008 - Gemini Thought Signature Preservation",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-009 - Gemini Raw Content Preservation",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-010 - Max Tool Turns Boundary",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-011 - Early Exit When No More Tool Calls",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-012 - Tool Call ID Correlation",
+      "error": "'messages'"
+    },
+    {
+      "scenario": "MT-013 - Provider Metadata in LLMResponse",
+      "error": "'messages'"
+    }
+  ]
+}

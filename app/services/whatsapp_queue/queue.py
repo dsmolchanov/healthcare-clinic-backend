@@ -19,6 +19,7 @@ def get_redis_client() -> Redis:
 STREAM_KEY_TEMPLATE = "wa:{instance}:stream"
 DLQ_KEY_TEMPLATE = "wa:{instance}:dlq"
 IDEMP_KEY_TEMPLATE = "wa:msg:{message_id}"
+NOTIFICATION_CHANNEL_TEMPLATE = "wa:wake:{instance}"
 
 def stream_key(instance: str) -> str:
     """Get Redis stream key for an instance"""
@@ -31,6 +32,10 @@ def dlq_key(instance: str) -> str:
 def idempotency_key(message_id: str) -> str:
     """Get idempotency key for a message"""
     return IDEMP_KEY_TEMPLATE.format(message_id=message_id)
+
+def notification_channel(instance: str) -> str:
+    """Get Pub/Sub notification channel for an instance"""
+    return NOTIFICATION_CHANNEL_TEMPLATE.format(instance=instance)
 
 def ensure_group(r: Redis, instance: str):
     """
@@ -112,6 +117,16 @@ async def enqueue_message(
         )
 
         logger.info(f"Message {message_id} queued to stream: {redis_msg_id}")
+
+        # Notify worker via Pub/Sub (push-based, eliminates polling)
+        try:
+            channel = notification_channel(instance)
+            subscribers = r.publish(channel, "1")
+            logger.debug(f"Published notification to {channel} ({subscribers} subscriber(s))")
+        except Exception as e:
+            # Non-critical: worker will pick up message on fallback poll
+            logger.warning(f"Failed to publish notification: {e}")
+
         return True
 
     try:

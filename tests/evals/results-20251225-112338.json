@@ -1,0 +1,566 @@
+{
+  "timestamp": "20251225-112338",
+  "provider": "openai",
+  "summary": {
+    "total": 11,
+    "passed": 11,
+    "failed": 0,
+    "success_rate": 100.0,
+    "single_turn": {
+      "total": 0,
+      "passed": 0,
+      "failed": 0
+    },
+    "multiturn": {
+      "total": 11,
+      "passed": 11,
+      "failed": 0
+    }
+  },
+  "results": [],
+  "multiturn_results": [
+    {
+      "scenario_name": "MT-001 - Two-Turn Tool Chain (Check Availability -> Book)",
+      "description": "Tests tool chaining where check_availability result feeds into book_appointment",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "Book me a cleaning appointment tomorrow at 10am. My name is John Smith, phone 555-123-4567.",
+          "agent_response": "",
+          "expected_tools": [
+            "check_availability"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        },
+        {
+          "turn_id": 2,
+          "user_message": "[Continuation from previous turn]",
+          "agent_response": "",
+          "expected_tools": [
+            "book_appointment"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {
+        "tool_chain_correct": false
+      },
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": false,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    },
+    {
+      "scenario_name": "MT-002 - Three-Turn Tool Chain (Get Info -> Availability -> Book)",
+      "description": "Tests three-step tool chain requiring doctor ID lookup before availability",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "I want to book a consultation with Dr. Shtern tomorrow morning. I'm Maria Garcia, 555-987-6543.",
+          "agent_response": "",
+          "expected_tools": [
+            "get_clinic_info"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        },
+        {
+          "turn_id": 2,
+          "user_message": "[Continuation from previous turn]",
+          "agent_response": "",
+          "expected_tools": [
+            "check_availability"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        },
+        {
+          "turn_id": 3,
+          "user_message": "[Continuation from previous turn]",
+          "agent_response": "",
+          "expected_tools": [
+            "book_appointment"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {
+        "tool_chain_correct": false
+      },
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": false,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    },
+    {
+      "scenario_name": "MT-003 - Multi-Turn with Tool Result Synthesis",
+      "description": "Tests LLM's ability to synthesize results from multiple tool calls",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "I need to compare prices and availability for cleaning vs whitening for tomorrow afternoon.",
+          "agent_response": "",
+          "expected_tools": [
+            "query_service_prices"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        },
+        {
+          "turn_id": 2,
+          "user_message": "[Continuation from previous turn]",
+          "agent_response": "",
+          "expected_tools": [
+            "check_availability"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        },
+        {
+          "turn_id": 3,
+          "user_message": "[Continuation from previous turn]",
+          "agent_response": "",
+          "expected_tools": [
+            "check_availability"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {
+        "tool_chain_correct": false
+      },
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": false,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    },
+    {
+      "scenario_name": "MT-004 - Context Preservation Across User Turns",
+      "description": "Tests that prior tool results are preserved when user provides additional info",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "Do you have any openings tomorrow for Dr. Shtern?",
+          "agent_response": "",
+          "expected_tools": [
+            "check_availability"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        },
+        {
+          "turn_id": 2,
+          "user_message": "The 10am slot works. Book it please. I'm Ana Martinez, 555-111-2222.",
+          "agent_response": "",
+          "expected_tools": [
+            "book_appointment"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {
+        "tool_chain_correct": false,
+        "metadata_preserved": true
+      },
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": false,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    },
+    {
+      "scenario_name": "MT-005 - Constraints Persistence Across Turns",
+      "description": "Tests that constraints are persisted and used in subsequent turns",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "Check availability for cleaning tomorrow with Dr. Smith",
+          "agent_response": "",
+          "expected_tools": [
+            "check_availability"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        },
+        {
+          "turn_id": 2,
+          "user_message": "Book the 9am slot. I'm Test User, 555-000-0000.",
+          "agent_response": "",
+          "expected_tools": [
+            "book_appointment"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {
+        "tool_chain_correct": false,
+        "metadata_preserved": true
+      },
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": false,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    },
+    {
+      "scenario_name": "MT-006 - Primary Provider Timeout Fallback",
+      "description": "Tests fallback when primary provider times out",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "What are your hours on Saturday?",
+          "agent_response": "",
+          "expected_tools": [],
+          "actual_tools": [],
+          "tool_choice_correct": true,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {
+        "fallback_triggered": false
+      },
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": true,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    },
+    {
+      "scenario_name": "MT-007 - Provider Error Fallback with Tool Calling",
+      "description": "Tests fallback when primary provider fails during tool calling",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "Book a cleaning for tomorrow at 2pm. I'm Test User, 555-999-8888.",
+          "agent_response": "",
+          "expected_tools": [
+            "check_availability"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        },
+        {
+          "turn_id": 2,
+          "user_message": "[Continuation from previous turn]",
+          "agent_response": "",
+          "expected_tools": [
+            "book_appointment"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {
+        "tool_chain_correct": false,
+        "fallback_triggered": false
+      },
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": false,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    },
+    {
+      "scenario_name": "MT-010 - Max Tool Turns Boundary",
+      "description": "Tests behavior when max_tool_turns (5) is reached",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "Keep checking different dates until you find availability for next month",
+          "agent_response": "",
+          "expected_tools": [],
+          "actual_tools": [],
+          "tool_choice_correct": true,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {
+        "max_turns_reached": false
+      },
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": true,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    },
+    {
+      "scenario_name": "MT-011 - Early Exit When No More Tool Calls",
+      "description": "Tests that loop exits early when LLM stops requesting tools",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "What time do you close on Fridays?",
+          "agent_response": "",
+          "expected_tools": [],
+          "actual_tools": [],
+          "tool_choice_correct": true,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {
+        "early_exit": true
+      },
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": true,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    },
+    {
+      "scenario_name": "MT-012 - Tool Call ID Correlation",
+      "description": "Tests that tool call IDs are correctly correlated across turns",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "Check availability for cleaning tomorrow and book the first slot. I'm ID Test, 555-666-7777.",
+          "agent_response": "",
+          "expected_tools": [
+            "check_availability"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        },
+        {
+          "turn_id": 2,
+          "user_message": "[Continuation from previous turn]",
+          "agent_response": "",
+          "expected_tools": [
+            "book_appointment"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {
+        "tool_chain_correct": false
+      },
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": false,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    },
+    {
+      "scenario_name": "MT-013 - Provider Metadata in LLMResponse",
+      "description": "Tests that LLMResponse contains correct provider metadata",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user_message": "How much is a root canal?",
+          "agent_response": "",
+          "expected_tools": [
+            "query_service_prices"
+          ],
+          "actual_tools": [],
+          "tool_choice_correct": false,
+          "tool_args_correct": true,
+          "criteria_results": {},
+          "metadata": {},
+          "latency_ms": 0,
+          "pass_turn": true,
+          "score": 0.0,
+          "reasoning": "",
+          "error": "PipelineMessageProcessor.process_message() got an unexpected keyword argument 'message'"
+        }
+      ],
+      "e2e_validation": {},
+      "provider": "openai",
+      "model": "",
+      "all_turns_passed": true,
+      "tool_chain_correct": true,
+      "metadata_preserved": true,
+      "total_latency_ms": 0,
+      "total_score": 0.0,
+      "error": null
+    }
+  ],
+  "errors": []
+}

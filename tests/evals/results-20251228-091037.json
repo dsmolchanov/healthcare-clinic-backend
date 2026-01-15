@@ -1,0 +1,34 @@
+{
+  "timestamp": "20251228-091037",
+  "summary": {
+    "total": 1,
+    "passed": 0,
+    "failed": 1,
+    "success_rate": 0.0
+  },
+  "results": [
+    {
+      "scenario": "Test Booking",
+      "result": {
+        "score": 3,
+        "pass": false,
+        "reasoning": "The agent failed to meet the expected behavior by not asking for the service type, which is a critical step in booking an appointment. This omission violates the Argument Validation criterion, as the agent did not extract specific parameters needed for the task. Additionally, the agent's response was not empathetic or efficient, as it did not guide the user towards the next steps. No tools were called, which indicates a lack of proper tool usage to verify availability or service options. Overall, the response did not align with the expected behavior or criteria for a successful interaction."
+      },
+      "transcript": [
+        {
+          "role": "user",
+          "content": "I need an appointment for tomorrow."
+        },
+        {
+          "role": "assistant",
+          "content": "I'm not sure how to help with that. Could you rephrase?"
+        }
+      ],
+      "internal_tools_called": [],
+      "internal_tools_failed": [],
+      "validation_errors": [],
+      "hallucination_blocked": false
+    }
+  ],
+  "errors": []
+}
