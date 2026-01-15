@@ -15,7 +15,7 @@ from .config import (
     logger
 )
 from .queue import (
-    stream_key, dlq_key, ensure_group, get_redis_client, notification_channel
+    stream_key, dlq_key, ensure_group, get_redis_client
 )
 from .evolution_client import is_connected, send_text
 from .rate_limiter import TokenBucket
@@ -26,10 +26,6 @@ from .rate_limiter import TokenBucket
 CLAIM_IDLE_MS: int = int(os.getenv("WA_STREAM_CLAIM_IDLE_MS", "15000"))  # XAUTOCLAIM min idle
 READ_COUNT:    int = int(os.getenv("WA_READ_COUNT", "32"))                # Messages per read (increased from 10)
 BLOCK_MS:      int = int(os.getenv("WA_READ_BLOCK_MS", "250"))            # Read timeout (reduced from 5000ms)
-
-# Pub/Sub notification settings (Phase 2: Push-based wake-up)
-USE_PUBSUB = os.getenv("WA_USE_PUBSUB", "1") != "0"                      # Enable Pub/Sub notifications
-PUBSUB_TIMEOUT = int(os.getenv("WA_PUBSUB_TIMEOUT", "30"))               # Fallback poll interval (seconds)
 
 # Worker performance tunables
 MAX_CONCURRENCY = int(os.getenv("WA_WORKER_CONCURRENCY", "4"))           # Max in-flight messages
@@ -86,10 +82,6 @@ class WhatsAppWorker:
 
         # Concurrency guard for bounded parallelism
         self._sema = asyncio.Semaphore(MAX_CONCURRENCY)
-
-        # Pub/Sub client for push notifications (Phase 2)
-        self.pubsub = None
-        self.pubsub_notifications_received = 0
 
         # Ensure consumer group exists
         ensure_group(self.redis, instance)
@@ -197,89 +189,8 @@ class WhatsAppWorker:
             new_msg_id = self.redis.xadd(key, fields={"payload": json.dumps(payload)})
             logger.debug(f"Requeued message {message_id} as {new_msg_id}")
 
-    async def _drain_queue(self):
-        """
-        Drain all pending messages from the queue.
-        Called when notified via Pub/Sub or on fallback poll.
-        """
-        key = stream_key(self.instance)
-        loop = asyncio.get_event_loop()
-
-        # 1) Claim orphaned messages
-        def _autoclaim():
-            try:
-                reply = self.redis.xautoclaim(
-                    key,
-                    CONSUMER_GROUP,
-                    self.consumer_name,
-                    min_idle_time=CLAIM_IDLE_MS,
-                    start_id=self._autoclaim_cursor,
-                    count=READ_COUNT,
-                )
-                if isinstance(reply, (list, tuple)) and len(reply) >= 2:
-                    next_id = reply[0]
-                    claimed = reply[1] or []
-                    self._autoclaim_cursor = next_id if isinstance(next_id, str) else str(next_id)
-                    if claimed:
-                        return [(key, claimed)]
-                return []
-            except Exception as e:
-                logger.debug(f"XAUTOCLAIM failed: {e}")
-                return []
-
-        msgs = await loop.run_in_executor(None, _autoclaim)
-
-        # 2) Read new messages (non-blocking)
-        if not msgs:
-            def _read_new():
-                return self.redis.xreadgroup(
-                    groupname=CONSUMER_GROUP,
-                    consumername=self.consumer_name,
-                    streams={key: ">"},
-                    count=READ_COUNT,
-                    block=100  # Short block (100ms) to avoid hanging
-                )
-            msgs = await loop.run_in_executor(None, _read_new)
-
-        if not msgs:
-            return  # No messages to process
-
-        # 3) Process all messages
-        tasks = []
-        for _, entries in msgs:
-            if len(entries) > 0:
-                logger.info(f"📬 Processing {len(entries)} message(s) from queue")
-            for msg_id, fields in entries:
-                async def _one(msg_id=msg_id, fields=fields):
-                    async with self._sema:
-                        try:
-                            payload = json.loads(fields.get("payload", "{}"))
-                        except json.JSONDecodeError as e:
-                            logger.error(f"Failed to parse message {msg_id}: {e}")
-                            self.redis.xadd(
-                                dlq_key(self.instance),
-                                fields={"payload": json.dumps({"error": f"json_decode_error: {str(e)}", "raw": str(fields)})}
-                            )
-                            self.redis.xack(key, CONSUMER_GROUP, msg_id)
-                            self.redis.xdel(key, msg_id)
-                            return
-                        try:
-                            await self.process_message(msg_id, payload)
-                        except Exception as e:
-                            logger.error(f"Error processing message {msg_id}: {e}", exc_info=True)
-                            self.redis.xadd(
-                                dlq_key(self.instance),
-                                fields={"payload": json.dumps({"error": f"processing_error: {str(e)}", "raw": str(fields)})}
-                            )
-                            self.redis.xack(key, CONSUMER_GROUP, msg_id)
-                            self.redis.xdel(key, msg_id)
-                tasks.append(asyncio.create_task(_one()))
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
     async def run(self):
-        """Main worker loop - processes messages from Redis Streams with Pub/Sub notifications"""
+        """Main worker loop - processes messages from Redis Streams"""
         key = stream_key(self.instance)
         self.running = True
 
@@ -288,9 +199,8 @@ class WhatsAppWorker:
         logger.info(f"Consumer group: {CONSUMER_GROUP}")
         logger.info(f"Consumer name: {self.consumer_name}")
         logger.info(f"Configuration: rate={TOKENS_PER_SECOND} msg/s, max_deliveries={MAX_DELIVERIES}")
-        logger.info(f"Pub/Sub enabled: {USE_PUBSUB} (fallback poll every {PUBSUB_TIMEOUT}s)")
 
-        # Inspect current group/consumers
+        # Inspect current group/consumers, but do NOT force reset (avoids accidental duplicates)
         try:
             depth = self.redis.xlen(key)
             logger.info(f"Initial queue depth: {depth} messages")
@@ -305,10 +215,11 @@ class WhatsAppWorker:
         except Exception as e:
             logger.error(f"Failed to query stream stats: {e}")
 
-        # Register this worker as a consumer
+        # Register this worker as a consumer with a no-op read (ensures it shows up in XINFO CONSUMERS)
         try:
             loop = asyncio.get_event_loop()
             def _register_consumer():
+                # count=0 gives immediate return; block small just in case
                 return self.redis.xreadgroup(
                     groupname=CONSUMER_GROUP,
                     consumername=self.consumer_name,
@@ -321,20 +232,9 @@ class WhatsAppWorker:
         except Exception as e:
             logger.debug(f"Consumer registration noop failed (non-fatal): {e}")
 
-        # Subscribe to Pub/Sub notifications if enabled
-        if USE_PUBSUB:
-            try:
-                self.pubsub = self.redis.pubsub()
-                channel = notification_channel(self.instance)
-                self.pubsub.subscribe(channel)
-                logger.info(f"✅ Subscribed to Pub/Sub channel: {channel}")
-            except Exception as e:
-                logger.error(f"Failed to subscribe to Pub/Sub: {e}. Falling back to polling.")
-                self.pubsub = None
-
         iteration = 0
         last_heartbeat = time.time()
-        heartbeat_interval = 300  # 5 minutes
+        heartbeat_interval = 300  # 5 minutes in seconds
 
         while self.running:
             try:
@@ -343,124 +243,112 @@ class WhatsAppWorker:
                 # Log heartbeat every 5 minutes
                 current_time = time.time()
                 if current_time - last_heartbeat >= heartbeat_interval:
-                    logger.info(
-                        f"Worker heartbeat - processed={self.processed_count}, "
-                        f"failed={self.failed_count}, pubsub_notifications={self.pubsub_notifications_received}"
-                    )
+                    logger.info(f"Worker heartbeat - processed={self.processed_count}, failed={self.failed_count}")
                     last_heartbeat = current_time
 
-                # === Phase 2: Pub/Sub-based wake-up ===
-                if USE_PUBSUB and self.pubsub:
-                    # Wait for notification or timeout
-                    loop = asyncio.get_event_loop()
+                # Run Redis operations in thread pool (redis client is synchronous)
+                loop = asyncio.get_event_loop()
 
-                    def _get_message():
-                        # get_message() blocks up to timeout (in seconds)
-                        return self.pubsub.get_message(timeout=PUBSUB_TIMEOUT, ignore_subscribe_messages=True)
+                # 1) Adopt orphaned/pending entries (e.g., stuck under debug consumers) using XAUTOCLAIM
+                def _autoclaim():
+                    """
+                    Robust XAUTOCLAIM wrapper.
+                    Redis replies:
+                      - (next_id, [(id, {fields})...])                         # Redis 6.2 / redis-py classic
+                      - (next_id, [(id, {fields})...], entries_deleted)        # Redis 7.x (some clients)
+                    When no claimable entries remain, next_id is '0-0' and list is empty.
+                    """
+                    try:
+                        reply = self.redis.xautoclaim(
+                            key,
+                            CONSUMER_GROUP,
+                            self.consumer_name,
+                            min_idle_time=CLAIM_IDLE_MS,
+                            start_id=self._autoclaim_cursor,
+                            count=READ_COUNT,
+                        )
 
-                    msg = await loop.run_in_executor(None, _get_message)
+                        # Normalize reply to (next_id, claimed_list[, *_])
+                        if isinstance(reply, (list, tuple)) and len(reply) >= 2:
+                            next_id = reply[0]
+                            claimed = reply[1] or []
+                            # Advance cursor
+                            self._autoclaim_cursor = next_id if isinstance(next_id, str) else str(next_id)
 
-                    if msg and msg['type'] == 'message':
-                        # Notification received! Drain the queue
-                        self.pubsub_notifications_received += 1
-                        logger.debug(f"Pub/Sub notification received, draining queue")
-                        await self._drain_queue()
-                    elif msg is None:
-                        # Timeout reached (30s), do fallback poll
-                        logger.debug(f"Pub/Sub timeout ({PUBSUB_TIMEOUT}s), fallback poll")
-                        await self._drain_queue()
-                    # else: ignore other message types (subscribe confirmations, etc.)
+                            if not claimed:
+                                # Expected when nothing is claimable; keep noise low.
+                                logger.debug("XAUTOCLAIM: no entries to claim (cursor=%s)", self._autoclaim_cursor)
+                                return []
 
-                else:
-                    # === Legacy: Polling mode (if Pub/Sub disabled) ===
-                    loop = asyncio.get_event_loop()
+                            # Shape to match xreadgroup: [(stream, [(id, fields), ...])]
+                            return [(key, claimed)]
 
-                    # 1) Claim orphaned messages
-                    def _autoclaim():
-                        try:
-                            reply = self.redis.xautoclaim(
-                                key,
-                                CONSUMER_GROUP,
-                                self.consumer_name,
-                                min_idle_time=CLAIM_IDLE_MS,
-                                start_id=self._autoclaim_cursor,
-                                count=READ_COUNT,
-                            )
-                            if isinstance(reply, (list, tuple)) and len(reply) >= 2:
-                                next_id = reply[0]
-                                claimed = reply[1] or []
-                                self._autoclaim_cursor = next_id if isinstance(next_id, str) else str(next_id)
-                                if claimed:
-                                    return [(key, claimed)]
-                            return []
-                        except Exception as e:
-                            logger.debug(f"XAUTOCLAIM failed: {e}")
-                            return []
+                        # Unexpected-but-nonfatal shapes: log at debug, not warning.
+                        logger.debug("XAUTOCLAIM: non-standard reply shape: %r", reply)
+                        return []
 
-                    msgs = await loop.run_in_executor(None, _autoclaim)
+                    except Exception as e:
+                        logger.debug("XAUTOCLAIM unavailable/failed: %s", e)
+                        return []
 
-                    # 2) Read new messages
-                    if not msgs:
-                        def _read_new():
-                            return self.redis.xreadgroup(
-                                groupname=CONSUMER_GROUP,
-                                consumername=self.consumer_name,
-                                streams={key: ">"},
-                                count=READ_COUNT,
-                                block=BLOCK_MS
-                            )
-                        msgs = await loop.run_in_executor(None, _read_new)
+                msgs = await loop.run_in_executor(None, _autoclaim)
 
-                    if not msgs:
-                        # No messages available - sleep briefly
-                        await asyncio.sleep(IDLE_SLEEP_BASE * random.uniform(0.9, 1.3))
-                        continue
+                # 2) If nothing claimed, read NEW messages only
+                if not msgs:
+                    def _read_new():
+                        return self.redis.xreadgroup(
+                            groupname=CONSUMER_GROUP,
+                            consumername=self.consumer_name,
+                            streams={key: ">"},
+                            count=READ_COUNT,
+                            block=BLOCK_MS
+                        )
+                    msgs = await loop.run_in_executor(None, _read_new)
 
-                    # Process messages
-                    tasks = []
-                    for _, entries in msgs:
-                        if len(entries) > 0:
-                            logger.info(f"📬 Processing {len(entries)} message(s) from queue")
-                        for msg_id, fields in entries:
-                            async def _one(msg_id=msg_id, fields=fields):
-                                async with self._sema:
-                                    try:
-                                        payload = json.loads(fields.get("payload", "{}"))
-                                    except json.JSONDecodeError as e:
-                                        logger.error(f"Failed to parse message {msg_id}: {e}")
-                                        self.redis.xadd(
-                                            dlq_key(self.instance),
-                                            fields={"payload": json.dumps({"error": f"json_decode_error: {str(e)}", "raw": str(fields)})}
-                                        )
-                                        self.redis.xack(key, CONSUMER_GROUP, msg_id)
-                                        self.redis.xdel(key, msg_id)
-                                        return
-                                    try:
-                                        await self.process_message(msg_id, payload)
-                                    except Exception as e:
-                                        logger.error(f"Error processing message {msg_id}: {e}", exc_info=True)
-                                        self.redis.xadd(
-                                            dlq_key(self.instance),
-                                            fields={"payload": json.dumps({"error": f"processing_error: {str(e)}", "raw": str(fields)})}
-                                        )
-                                        self.redis.xack(key, CONSUMER_GROUP, msg_id)
-                                        self.redis.xdel(key, msg_id)
-                            tasks.append(asyncio.create_task(_one()))
+                if not msgs:
+                    # No messages available - sleep briefly with jitter
+                    await asyncio.sleep(IDLE_SLEEP_BASE * random.uniform(0.9, 1.3))
+                    continue
 
-                    if tasks:
-                        await asyncio.gather(*tasks, return_exceptions=True)
+                # Process messages with bounded concurrency
+                tasks = []
+                for stream_name, entries in msgs:
+                    n = len(entries)
+                    if n > 0:
+                        logger.info(f"📬 Processing {n} message(s) from queue")
+                    for msg_id, fields in entries:
+                        async def _one(msg_id=msg_id, fields=fields):
+                            async with self._sema:
+                                try:
+                                    payload = json.loads(fields.get("payload", "{}"))
+                                except json.JSONDecodeError as e:
+                                    logger.error(f"Failed to parse message {msg_id}: {e}")
+                                    self.redis.xadd(
+                                        dlq_key(self.instance),
+                                        fields={"payload": json.dumps({"error": f"json_decode_error: {str(e)}", "raw": str(fields)})}
+                                    )
+                                    self.redis.xack(key, CONSUMER_GROUP, msg_id)
+                                    self.redis.xdel(key, msg_id)
+                                    return
+                                try:
+                                    await self.process_message(msg_id, payload)
+                                except Exception as e:
+                                    logger.error(f"Error processing message {msg_id}: {e}", exc_info=True)
+                                    self.redis.xadd(
+                                        dlq_key(self.instance),
+                                        fields={"payload": json.dumps({"error": f"processing_error: {str(e)}", "raw": str(fields)})}
+                                    )
+                                    self.redis.xack(key, CONSUMER_GROUP, msg_id)
+                                    self.redis.xdel(key, msg_id)
+                        tasks.append(asyncio.create_task(_one()))
+
+                if tasks:
+                    # Let tasks finish; avoid unhandled exceptions
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
             except Exception as e:
                 logger.error(f"Error in worker loop: {e}", exc_info=True)
                 await asyncio.sleep(0.5)
-
-        # Cleanup on shutdown
-        if self.pubsub:
-            try:
-                self.pubsub.unsubscribe()
-                self.pubsub.close()
-            except Exception as e:
-                logger.debug(f"Error closing Pub/Sub: {e}")
 
         logger.info(f"Worker stopped. Processed: {self.processed_count}, Failed: {self.failed_count}")
 
@@ -476,10 +364,7 @@ class WhatsAppWorker:
             "consumer_name": self.consumer_name,
             "running": self.running,
             "processed_count": self.processed_count,
-            "failed_count": self.failed_count,
-            "pubsub_enabled": USE_PUBSUB,
-            "pubsub_notifications_received": self.pubsub_notifications_received,
-            "pubsub_connected": self.pubsub is not None
+            "failed_count": self.failed_count
         }
 
 
