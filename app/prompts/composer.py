@@ -347,6 +347,17 @@ class PromptComposer:
         else:
             todays_hours = weekday_hours
 
+        # Language detection - use session language (persisted), detected language, or default to English
+        user_lang_code = ctx.session_language or ctx.detected_language or 'en'
+        language_names = {
+            'ru': 'Russian',
+            'es': 'Spanish',
+            'en': 'English',
+            'he': 'Hebrew',
+            'pt': 'Portuguese',
+        }
+        user_language_name = language_names.get(user_lang_code, 'English')
+
         return {
             'clinic_name': ctx.clinic_name,
             'clinic_id': ctx.effective_clinic_id,
@@ -363,6 +374,8 @@ class PromptComposer:
             'tomorrow_day': tomorrow_day,
             'todays_hours': todays_hours,
             'from_phone': ctx.from_phone,
+            'user_language_name': user_language_name,
+            'user_language_code': user_lang_code,
         }
 
     def _build_narrowing_control_block(self, instruction) -> str:
