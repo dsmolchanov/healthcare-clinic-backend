@@ -1429,7 +1429,41 @@ async def quick_launch(data: QuickLaunchRequest):
         agent_id = register_result.get('agent_id')
         doctor_id = register_result.get('doctor_id')
 
-        # Step 2: Apply template if not custom
+        # Step 2: Update user metadata with organization_id and clinic_id
+        # This is critical for the frontend to know the user has completed onboarding
+        try:
+            # Find the user by email
+            user_list = service.supabase.auth.admin.list_users()
+            target_user = None
+            for user in user_list:
+                if user.email and user.email.lower() == data.email.lower():
+                    target_user = user
+                    break
+
+            if target_user:
+                # Merge existing metadata with new org/clinic IDs
+                existing_metadata = target_user.user_metadata or {}
+                updated_metadata = {
+                    **existing_metadata,
+                    "organization_id": str(organization_id),
+                    "clinic_id": str(clinic_id)
+                }
+
+                # Update user metadata with org and clinic IDs
+                service.supabase.auth.admin.update_user_by_id(
+                    target_user.id,
+                    {"user_metadata": updated_metadata}
+                )
+                logger.info(f"Updated user metadata for {data.email}: org={organization_id}, clinic={clinic_id}")
+            else:
+                logger.warning(f"User not found for email: {data.email}")
+        except Exception as e:
+            logger.error(f"Failed to update user metadata: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continue anyway - the clinic was created successfully
+
+        # Step 3: Apply template if not custom
         services_seeded = 0
         faqs_seeded = 0
 
