@@ -13,13 +13,15 @@ import pickle
 from functools import wraps
 from enum import Enum
 
+import os
 import redis.asyncio as redis
 from redis.asyncio.lock import Lock
 from redis.exceptions import RedisError, ConnectionError as RedisConnectionError
 
-from app.core.config import settings
-
 logger = logging.getLogger(__name__)
+
+# Get Redis URL from environment
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 
 class CacheTTL(Enum):
@@ -53,7 +55,7 @@ class RedisManager:
         decode_responses: bool = False,
         enable_cluster: bool = False
     ):
-        self.redis_url = redis_url or settings.REDIS_URL or "redis://localhost:6379"
+        self.redis_url = redis_url or REDIS_URL
         self.max_connections = max_connections
         self.decode_responses = decode_responses
         self.enable_cluster = enable_cluster

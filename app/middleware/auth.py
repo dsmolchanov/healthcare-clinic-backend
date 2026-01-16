@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 
 security = HTTPBearer(auto_error=False)
 
-# Get JWT secret - validated at startup by startup_validation.py
-# In development, falls back to a default (insecure for prod)
-JWT_SECRET = os.getenv("JWT_SECRET", "development-secret-change-in-production")
+# Get JWT secret - use Supabase JWT secret for verifying Supabase tokens
+# Falls back to JWT_SECRET for backward compatibility
+JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET") or os.getenv("JWT_SECRET", "development-secret-change-in-production")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
 
@@ -28,8 +28,22 @@ class TokenPayload:
     """Decoded JWT token payload."""
     def __init__(self, payload: dict):
         self.sub = payload.get("sub")  # Subject (user ID)
-        self.clinic_id = payload.get("clinic_id")
-        self.organization_id = payload.get("organization_id")
+
+        # Supabase puts custom claims in user_metadata, check there first
+        user_metadata = payload.get("user_metadata", {}) or {}
+        app_metadata = payload.get("app_metadata", {}) or {}
+
+        # Try user_metadata first, then app_metadata, then root level
+        self.clinic_id = (
+            user_metadata.get("clinic_id") or
+            app_metadata.get("clinic_id") or
+            payload.get("clinic_id")
+        )
+        self.organization_id = (
+            user_metadata.get("organization_id") or
+            app_metadata.get("organization_id") or
+            payload.get("organization_id")
+        )
         self.role = payload.get("role", "user")
         self.exp = payload.get("exp")
         self.iat = payload.get("iat")
@@ -60,7 +74,8 @@ async def verify_token(
         payload = jwt.decode(
             token,
             JWT_SECRET,
-            algorithms=[JWT_ALGORITHM]
+            algorithms=[JWT_ALGORITHM],
+            audience="authenticated"  # Supabase sets aud to "authenticated"
         )
         return TokenPayload(payload)
 

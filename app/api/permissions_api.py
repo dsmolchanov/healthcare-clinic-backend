@@ -1,9 +1,12 @@
 """API endpoints for permission management."""
+import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from app.middleware.auth import require_auth, require_permission, TokenPayload
 from app.services.permission_service import get_permission_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/permissions", tags=["permissions"])
 
@@ -21,12 +24,22 @@ class ClearCacheRequest(BaseModel):
 @router.get("/me", response_model=UserPermissionsResponse)
 async def get_my_permissions(user: TokenPayload = Depends(require_auth)):
     """Get current user's permissions."""
+    # Debug logging
+    logger.info(f"[PERMISSIONS DEBUG] user.sub={user.sub}")
+    logger.info(f"[PERMISSIONS DEBUG] user.organization_id={user.organization_id}")
+    logger.info(f"[PERMISSIONS DEBUG] user.role={user.role}")
+    logger.info(f"[PERMISSIONS DEBUG] raw_payload keys={list(user._raw.keys()) if user._raw else 'None'}")
+    if user._raw:
+        logger.info(f"[PERMISSIONS DEBUG] user_metadata={user._raw.get('user_metadata')}")
+
     permission_service = get_permission_service()
 
     permissions = await permission_service.get_user_permissions(
         user_id=user.sub,
         organization_id=user.organization_id
     )
+
+    logger.info(f"[PERMISSIONS DEBUG] Returning {len(permissions)} permissions")
 
     return UserPermissionsResponse(
         permissions=permissions,
