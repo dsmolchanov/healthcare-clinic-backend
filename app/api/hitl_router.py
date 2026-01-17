@@ -359,3 +359,117 @@ async def lock_session_for_human(
     except Exception as e:
         logger.error(f"Error locking session {session_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to lock session: {str(e)}")
+
+
+# ============================================================================
+# HITL Settings Endpoints
+# ============================================================================
+
+class HITLSettingsRequest(BaseModel):
+    """Request body for updating HITL settings."""
+    hitl_auto_release_hours: int = Field(
+        ge=0,
+        le=168,
+        description="Hours after which human-controlled sessions auto-release. 0 = disabled, max 168 (1 week)"
+    )
+
+
+class HITLSettingsResponse(BaseModel):
+    """Response model for HITL settings."""
+    clinic_id: str
+    hitl_auto_release_hours: int
+
+
+@router.get("/settings/{clinic_id}", response_model=HITLSettingsResponse)
+async def get_hitl_settings(
+    clinic_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get HITL settings for a clinic.
+
+    Args:
+        clinic_id: UUID of the clinic
+
+    Returns:
+        HITLSettingsResponse with current settings
+    """
+    try:
+        supabase = get_supabase_client()
+
+        result = supabase.schema('healthcare').table('clinics').select(
+            'id, hitl_auto_release_hours'
+        ).eq('id', clinic_id).single().execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail=f"Clinic {clinic_id} not found")
+
+        return HITLSettingsResponse(
+            clinic_id=result.data['id'],
+            hitl_auto_release_hours=result.data.get('hitl_auto_release_hours', 24) or 24
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting HITL settings for clinic {clinic_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get HITL settings: {str(e)}"
+        )
+
+
+@router.put("/settings/{clinic_id}", response_model=HITLSettingsResponse)
+async def update_hitl_settings(
+    clinic_id: str,
+    request: HITLSettingsRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Update HITL settings for a clinic.
+
+    Args:
+        clinic_id: UUID of the clinic
+        request: New settings values
+
+    Returns:
+        HITLSettingsResponse with updated settings
+    """
+    try:
+        supabase = get_supabase_client()
+
+        # Verify clinic exists first
+        check_result = supabase.schema('healthcare').table('clinics').select(
+            'id'
+        ).eq('id', clinic_id).single().execute()
+
+        if not check_result.data:
+            raise HTTPException(status_code=404, detail=f"Clinic {clinic_id} not found")
+
+        # Update settings
+        result = supabase.schema('healthcare').table('clinics').update({
+            'hitl_auto_release_hours': request.hitl_auto_release_hours,
+            'updated_at': datetime.now(timezone.utc).isoformat()
+        }).eq('id', clinic_id).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to update settings")
+
+        logger.info(
+            f"HITL settings updated for clinic {clinic_id[:8]}...: "
+            f"auto_release_hours={request.hitl_auto_release_hours}"
+        )
+
+        return HITLSettingsResponse(
+            clinic_id=clinic_id,
+            hitl_auto_release_hours=request.hitl_auto_release_hours
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating HITL settings for clinic {clinic_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update HITL settings: {str(e)}"
+        )
