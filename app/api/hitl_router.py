@@ -104,7 +104,7 @@ async def unlock_session(
 
         # Get current session state
         result = supabase.schema('healthcare').table('conversation_sessions').select(
-            'id, control_mode, locked_by, lock_reason, phone_number'
+            'id, control_mode, locked_by, lock_reason, user_identifier'
         ).eq('id', session_id).single().execute()
 
         if not result.data:
@@ -189,11 +189,12 @@ async def list_human_controlled_sessions(
         # Build query
         query = supabase.schema('healthcare').table('conversation_sessions').select(
             'id, control_mode, locked_by, locked_at, lock_reason, lock_source, '
-            'unread_for_human_count, last_human_message_at, phone_number, clinic_id'
+            'unread_for_human_count, last_human_message_at, user_identifier, metadata'
         ).in_('control_mode', ['human', 'paused'])
 
         if clinic_id:
-            query = query.eq('clinic_id', clinic_id)
+            # Filter by clinic_id in metadata (consistent with hitl_service.py)
+            query = query.eq('metadata->>clinic_id', clinic_id)
 
         # Order by most recently locked first
         query = query.order('locked_at', desc=True).range(offset, offset + limit - 1)
@@ -219,7 +220,7 @@ async def list_human_controlled_sessions(
         ).in_('control_mode', ['human', 'paused'])
 
         if clinic_id:
-            count_query = count_query.eq('clinic_id', clinic_id)
+            count_query = count_query.eq('metadata->>clinic_id', clinic_id)
 
         count_result = count_query.execute()
         total = count_result.count if hasattr(count_result, 'count') else len(sessions)
