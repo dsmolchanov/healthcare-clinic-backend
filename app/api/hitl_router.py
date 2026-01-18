@@ -165,6 +165,7 @@ async def unlock_session(
 @router.get("/sessions", response_model=HumanControlledSessionsResponse)
 async def list_human_controlled_sessions(
     clinic_id: Optional[str] = Query(None, description="Filter by clinic ID"),
+    organization_id: Optional[str] = Query(None, description="Filter by organization ID (returns sessions for all clinics in the organization)"),
     limit: int = Query(50, ge=1, le=200, description="Max results to return"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
     current_user: dict = Depends(get_current_user)
@@ -176,7 +177,8 @@ async def list_human_controlled_sessions(
     most recent lock time.
 
     Args:
-        clinic_id: Optional clinic ID filter
+        clinic_id: Optional clinic ID filter (direct filter)
+        organization_id: Optional organization ID filter (looks up all clinics in org)
         limit: Maximum number of results (default 50)
         offset: Pagination offset (default 0)
 
@@ -186,15 +188,27 @@ async def list_human_controlled_sessions(
     try:
         supabase = get_supabase_client()
 
+        # If organization_id is provided, look up all clinic IDs for that organization
+        clinic_ids_to_filter = []
+        if organization_id:
+            clinics_result = supabase.schema('healthcare').table('clinics').select(
+                'id'
+            ).eq('organization_id', organization_id).execute()
+
+            clinic_ids_to_filter = [c['id'] for c in (clinics_result.data or [])]
+            logger.debug(f"Found {len(clinic_ids_to_filter)} clinics for organization {organization_id}")
+        elif clinic_id:
+            clinic_ids_to_filter = [clinic_id]
+
         # Build query
         query = supabase.schema('healthcare').table('conversation_sessions').select(
             'id, control_mode, locked_by, locked_at, lock_reason, lock_source, '
             'unread_for_human_count, last_human_message_at, user_identifier, metadata'
         ).in_('control_mode', ['human', 'paused'])
 
-        if clinic_id:
-            # Filter by clinic_id in metadata (consistent with hitl_service.py)
-            query = query.eq('metadata->>clinic_id', clinic_id)
+        if clinic_ids_to_filter:
+            # Filter by clinic_id in metadata using 'in' for multiple clinics
+            query = query.in_('metadata->>clinic_id', clinic_ids_to_filter)
 
         # Order by most recently locked first
         query = query.order('locked_at', desc=True).range(offset, offset + limit - 1)
@@ -219,8 +233,8 @@ async def list_human_controlled_sessions(
             'id', count='exact'
         ).in_('control_mode', ['human', 'paused'])
 
-        if clinic_id:
-            count_query = count_query.eq('metadata->>clinic_id', clinic_id)
+        if clinic_ids_to_filter:
+            count_query = count_query.in_('metadata->>clinic_id', clinic_ids_to_filter)
 
         count_result = count_query.execute()
         total = count_result.count if hasattr(count_result, 'count') else len(sessions)
