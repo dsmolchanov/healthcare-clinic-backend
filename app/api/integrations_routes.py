@@ -568,6 +568,36 @@ async def get_evolution_status(instance_name: str):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/evolution/qr/{instance_name}")
+async def get_evolution_qr_code(instance_name: str):
+    """Get the QR code for an Evolution instance (for pairing)"""
+    try:
+        async with EvolutionAPIClient() as evolution_client:
+            # Get QR code from Evolution API
+            qr_code = await evolution_client.get_qr_code(instance_name)
+
+            if qr_code:
+                return {
+                    "success": True,
+                    "instance_name": instance_name,
+                    "qrcode": qr_code
+                }
+            else:
+                # Instance might already be connected or not exist
+                status = await evolution_client.get_connection_status(instance_name)
+                return {
+                    "success": False,
+                    "instance_name": instance_name,
+                    "qrcode": None,
+                    "state": status.get("state", "unknown"),
+                    "message": "No QR code available - instance may already be connected"
+                }
+    except Exception as e:
+        print(f"Error getting QR code for {instance_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.post("/evolution/refresh-qr/{instance_name}")
 async def refresh_evolution_qr(instance_name: str):
     """
