@@ -17,12 +17,14 @@ def register_core_routers(app: FastAPI):
     from app.api import services_upload
     from app.api import permissions_api
     from app.api import invitations_api
+    from app.api import sales_invitations_api
 
     app.include_router(quick_onboarding_rpc.router)
     app.include_router(multimodal_upload.router)
     app.include_router(services_upload.router)
     app.include_router(permissions_api.router)
     app.include_router(invitations_api.router)
+    app.include_router(sales_invitations_api.router)
 
 
 def register_onboarding_routers(app: FastAPI):

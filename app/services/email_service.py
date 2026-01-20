@@ -117,6 +117,58 @@ class EmailService:
 
         return await self.send_email(to_email, subject, html_content, text_content)
 
+    async def send_sales_invitation(
+        self,
+        to_email: str,
+        inviter_name: str,
+        org_name: str,
+        role: str,
+        invitation_url: str
+    ) -> bool:
+        """Send sales team invitation email (async)."""
+        role_display = {
+            'admin': 'Administrator',
+            'manager': 'Manager',
+            'rep': 'Sales Representative'
+        }.get(role, role.title())
+
+        subject = f"{inviter_name} invited you to join {org_name}"
+
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2>You've been invited to join {org_name}</h2>
+            <p>{inviter_name} has invited you to join the sales team as a <strong>{role_display}</strong>.</p>
+            <p>Click the button below to accept the invitation and create your account:</p>
+            <p style="text-align: center; margin: 30px 0;">
+                <a href="{invitation_url}"
+                   style="background-color: #10B981; color: white; padding: 12px 24px;
+                          text-decoration: none; border-radius: 6px; display: inline-block;">
+                    Accept Invitation
+                </a>
+            </p>
+            <p style="color: #666; font-size: 14px;">
+                This invitation link will expire in 7 days.
+            </p>
+            <p style="color: #666; font-size: 14px;">
+                If you didn't expect this invitation, you can safely ignore this email.
+            </p>
+        </body>
+        </html>
+        """
+
+        text_content = f"""
+        You've been invited to join {org_name}
+
+        {inviter_name} has invited you to join the sales team as a {role_display}.
+
+        Click this link to accept: {invitation_url}
+
+        This invitation expires in 7 days.
+        """
+
+        return await self.send_email(to_email, subject, html_content, text_content)
+
 _email_service: Optional[EmailService] = None
 
 def get_email_service() -> EmailService:
