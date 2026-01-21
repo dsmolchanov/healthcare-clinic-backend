@@ -160,6 +160,13 @@ def register_hitl_routers(app: FastAPI):
     app.include_router(message_plan_api.router)
 
 
+def register_sales_routers(app: FastAPI):
+    """Register sales-specific routers."""
+    from app.api import sales_calendar_api
+
+    app.include_router(sales_calendar_api.router)
+
+
 def register_langgraph_router(app: FastAPI):
     """Register LangGraph service router with graceful fallback."""
     try:
@@ -186,5 +193,6 @@ def register_all_routers(app: FastAPI):
     register_compliance_routers(app)
     register_hitl_routers(app)
     register_langgraph_router(app)
+    register_sales_routers(app)
 
     logger.info("✅ All routers registered")

@@ -4,6 +4,14 @@ P1 Enhancement #3: Single source of truth for outbound message delivery
 
 Processes messages from healthcare.outbound_messages table and delivers them
 through the existing WhatsApp queue infrastructure with circuit breaker protection.
+
+HYBRID ARCHITECTURE (v2):
+- Supabase Realtime subscription for instant delivery (primary)
+- Exponential backoff polling as safety net (fallback)
+- Self-healing reconnection on subscription failure
+
+This reduces Supabase load from ~120 queries/min to ~2 queries/min when idle,
+while maintaining instant delivery under normal conditions.
 """
 
 import asyncio
@@ -19,20 +27,48 @@ logger = logging.getLogger(__name__)
 
 class OutboxProcessor:
     """
-    Processes outbound_messages table as authoritative queue
-    Delivers messages through existing queue infrastructure
+    Processes outbound_messages table as authoritative queue.
+    Delivers messages through existing queue infrastructure.
+
+    Uses hybrid Realtime + polling for optimal efficiency:
+    - Realtime: Instant notification on INSERT (primary path)
+    - Polling: Exponential backoff safety net (catches missed events)
     """
+
+    # Backoff configuration
+    MIN_POLL_INTERVAL = 1.0      # Minimum poll interval (when active)
+    MAX_POLL_INTERVAL = 30.0     # Maximum poll interval (when idle)
+    BACKOFF_MULTIPLIER = 2.0     # Exponential backoff multiplier
+    REALTIME_RESET_INTERVAL = 5.0  # Reset to fast polling after Realtime event
 
     def __init__(self):
         self._supabase = None
+        self._realtime_client = None
+        self._realtime_channel = None
         self.running = False
-        self.poll_interval = float(os.getenv('OUTBOX_POLL_INTERVAL', '0.5'))  # 500ms
+
+        # Polling configuration (now with backoff)
+        self.current_poll_interval = self.MIN_POLL_INTERVAL
         self.batch_size = int(os.getenv('OUTBOX_BATCH_SIZE', '10'))
         self.max_retries = int(os.getenv('OUTBOX_MAX_RETRIES', '5'))
 
+        # Realtime state
+        self._realtime_connected = False
+        self._wake_event = asyncio.Event()  # Signaled by Realtime on INSERT
+        self._last_realtime_event = 0.0     # Timestamp of last Realtime event
+
+        # Stats for monitoring
+        self._stats = {
+            'realtime_events': 0,
+            'poll_cycles': 0,
+            'messages_processed': 0,
+            'realtime_reconnects': 0,
+        }
+
         logger.info(
-            f"OutboxProcessor initialized: poll_interval={self.poll_interval}s, "
-            f"batch_size={self.batch_size}, max_retries={self.max_retries}"
+            f"OutboxProcessor initialized (hybrid mode): "
+            f"batch_size={self.batch_size}, max_retries={self.max_retries}, "
+            f"poll_range={self.MIN_POLL_INTERVAL}s-{self.MAX_POLL_INTERVAL}s"
         )
 
     def _get_supabase(self, force_new: bool = False):
@@ -51,33 +87,222 @@ class OutboxProcessor:
         return self._supabase
 
     async def start(self):
-        """Start processing loop"""
+        """Start processing loop with hybrid Realtime + polling."""
         self.running = True
-        logger.info("OutboxProcessor started")
+        logger.info("OutboxProcessor started (hybrid mode)")
+
+        # Start Realtime subscription in background
+        realtime_task = asyncio.create_task(self._realtime_loop())
+
+        try:
+            await self._polling_loop()
+        finally:
+            # Clean up Realtime on shutdown
+            realtime_task.cancel()
+            try:
+                await realtime_task
+            except asyncio.CancelledError:
+                pass
+            await self._disconnect_realtime()
+
+    async def _polling_loop(self):
+        """
+        Polling loop with exponential backoff.
+
+        This is the safety net - catches messages if Realtime misses them.
+        Backs off when idle, resets to fast polling on Realtime events.
+        """
+        import time
 
         while self.running:
             try:
+                self._stats['poll_cycles'] += 1
+
                 # Fetch pending/failed messages with retry budget remaining
                 messages = await self._fetch_pending_messages()
 
                 if messages:
                     logger.debug(f"Processing {len(messages)} outbox messages")
+                    # Reset to fast polling when we find work
+                    self.current_poll_interval = self.MIN_POLL_INTERVAL
 
-                    # Process each message
                     for msg in messages:
                         await self._process_message(msg)
+                        self._stats['messages_processed'] += 1
+                else:
+                    # No messages - apply exponential backoff
+                    # But reset if we got a recent Realtime event
+                    if time.time() - self._last_realtime_event < self.REALTIME_RESET_INTERVAL:
+                        self.current_poll_interval = self.MIN_POLL_INTERVAL
+                    else:
+                        self.current_poll_interval = min(
+                            self.current_poll_interval * self.BACKOFF_MULTIPLIER,
+                            self.MAX_POLL_INTERVAL
+                        )
 
-                # Poll interval
-                await asyncio.sleep(self.poll_interval)
+                # Wait for either:
+                # 1. Poll interval to elapse
+                # 2. Realtime wake event (instant wake)
+                try:
+                    await asyncio.wait_for(
+                        self._wake_event.wait(),
+                        timeout=self.current_poll_interval
+                    )
+                    # Woken by Realtime - clear event and process immediately
+                    self._wake_event.clear()
+                    self.current_poll_interval = self.MIN_POLL_INTERVAL
+                except asyncio.TimeoutError:
+                    # Normal timeout - continue polling
+                    pass
 
             except Exception as e:
                 logger.error(f"Outbox processor error: {e}", exc_info=True)
                 await asyncio.sleep(1)  # Brief pause on error
 
+    async def _realtime_loop(self):
+        """
+        Realtime subscription loop with automatic reconnection.
+
+        Subscribes to INSERT events on outbound_messages table.
+        On new message, wakes up the polling loop immediately.
+        """
+        while self.running:
+            try:
+                await self._connect_realtime()
+
+                # Keep alive while connected
+                while self.running and self._realtime_connected:
+                    await asyncio.sleep(5)  # Health check interval
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Realtime subscription error: {e}")
+                self._realtime_connected = False
+                self._stats['realtime_reconnects'] += 1
+
+                # Wait before reconnecting (with jitter)
+                import random
+                await asyncio.sleep(5 + random.random() * 5)
+
+    async def _connect_realtime(self):
+        """
+        Connect to Supabase Realtime and subscribe to outbound_messages INSERTs.
+        """
+        try:
+            supabase_url = os.getenv("SUPABASE_URL")
+            supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+
+            if not supabase_url or not supabase_key:
+                logger.warning("Supabase credentials not found, Realtime disabled")
+                return
+
+            # Import Realtime client
+            try:
+                from realtime import AsyncRealtimeClient, RealtimeSubscribeStates
+            except ImportError:
+                logger.warning("realtime-py not installed, falling back to polling only")
+                return
+
+            # Build Realtime URL (extract project ID from URL)
+            # URL format: https://<project-id>.supabase.co
+            project_id = supabase_url.replace("https://", "").replace("http://", "").split(".")[0]
+            realtime_url = f"wss://{project_id}.supabase.co/realtime/v1/websocket"
+
+            # Create Realtime client
+            self._realtime_client = AsyncRealtimeClient(realtime_url, supabase_key)
+            await self._realtime_client.connect()
+
+            # Subscribe to INSERT events on outbound_messages
+            def on_insert(_payload):
+                """Handle INSERT event from Realtime."""
+                import time as t
+                self._stats['realtime_events'] += 1
+                self._last_realtime_event = t.time()
+                self._wake_event.set()  # Wake up polling loop
+                logger.debug("Realtime: new outbound message detected")
+
+            def on_subscribe(status, err):
+                """Handle subscription status changes."""
+                if status == RealtimeSubscribeStates.SUBSCRIBED:
+                    self._realtime_connected = True
+                    logger.info("✅ Realtime subscription active for outbound_messages")
+                elif err:
+                    logger.error(f"Realtime subscription error: {err}")
+                    self._realtime_connected = False
+
+            # Create channel and subscribe to postgres changes
+            self._realtime_channel = self._realtime_client.channel('outbox-inserts')
+            self._realtime_channel.on_postgres_changes(
+                "INSERT",
+                schema='public',
+                table='outbound_messages',
+                callback=on_insert
+            )
+            self._realtime_channel.subscribe(on_subscribe)
+
+            # Start listening (this keeps the connection alive)
+            # Run in background task since listen() blocks
+            asyncio.create_task(self._realtime_listen())
+
+        except Exception as e:
+            logger.error(f"Failed to connect Realtime: {e}")
+            self._realtime_connected = False
+            raise
+
+    async def _realtime_listen(self):
+        """Keep Realtime connection alive by listening for messages."""
+        try:
+            if self._realtime_client:
+                await self._realtime_client.listen()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"Realtime listen error: {e}")
+            self._realtime_connected = False
+
+    async def _disconnect_realtime(self):
+        """Disconnect from Supabase Realtime."""
+        try:
+            if self._realtime_channel:
+                try:
+                    self._realtime_channel.unsubscribe()
+                except Exception:
+                    pass  # May already be unsubscribed
+                self._realtime_channel = None
+
+            if self._realtime_client:
+                try:
+                    await self._realtime_client.close()
+                except Exception:
+                    pass  # May already be closed
+                self._realtime_client = None
+
+            self._realtime_connected = False
+            logger.info("Realtime subscription closed")
+
+        except Exception as e:
+            logger.warning(f"Error disconnecting Realtime: {e}")
+
     async def stop(self):
-        """Stop processing loop"""
+        """Stop processing loop."""
         self.running = False
-        logger.info("OutboxProcessor stopped")
+        self._wake_event.set()  # Wake up polling loop to exit
+        logger.info(
+            f"OutboxProcessor stopped. Stats: "
+            f"realtime_events={self._stats['realtime_events']}, "
+            f"poll_cycles={self._stats['poll_cycles']}, "
+            f"messages_processed={self._stats['messages_processed']}, "
+            f"realtime_reconnects={self._stats['realtime_reconnects']}"
+        )
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get processor statistics for monitoring."""
+        return {
+            **self._stats,
+            'realtime_connected': self._realtime_connected,
+            'current_poll_interval': self.current_poll_interval,
+        }
 
     async def _fetch_pending_messages(self) -> list:
         """
@@ -284,9 +509,9 @@ class OutboxProcessor:
         self,
         message_id: str,
         status: str,
-        provider_message_id: str = None,
-        text_hash: str = None,
-        remote_jid: str = None,
+        provider_message_id: Optional[str] = None,
+        text_hash: Optional[str] = None,
+        remote_jid: Optional[str] = None,
         **kwargs
     ):
         """
@@ -300,31 +525,32 @@ class OutboxProcessor:
             remote_jid: WhatsApp JID of recipient (for fallback matching)
             **kwargs: Additional fields to update (queued_at, delivered_at, etc.)
         """
+        # Build update data outside try block to ensure it's defined for retry
+        update_data: Dict[str, Any] = {'delivery_status': status}
+
+        # Add HITL correlation fields if provided
+        if provider_message_id:
+            update_data['provider_message_id'] = provider_message_id
+        if text_hash:
+            update_data['text_hash'] = text_hash
+        if remote_jid:
+            update_data['remote_jid'] = remote_jid
+
+        # Add timestamp fields
+        if 'queued_at' in kwargs:
+            update_data['queued_at'] = kwargs['queued_at'].isoformat()
+        if 'delivered_at' in kwargs:
+            update_data['delivered_at'] = kwargs['delivered_at'].isoformat()
+        if 'failed_at' in kwargs:
+            update_data['failed_at'] = kwargs['failed_at'].isoformat()
+
+        # Add error/retry fields
+        if 'error_message' in kwargs:
+            update_data['error_message'] = kwargs['error_message']
+        if 'retry_count' in kwargs:
+            update_data['retry_count'] = kwargs['retry_count']
+
         try:
-            update_data = {'delivery_status': status}
-
-            # Add HITL correlation fields if provided
-            if provider_message_id:
-                update_data['provider_message_id'] = provider_message_id
-            if text_hash:
-                update_data['text_hash'] = text_hash
-            if remote_jid:
-                update_data['remote_jid'] = remote_jid
-
-            # Add timestamp fields
-            if 'queued_at' in kwargs:
-                update_data['queued_at'] = kwargs['queued_at'].isoformat()
-            if 'delivered_at' in kwargs:
-                update_data['delivered_at'] = kwargs['delivered_at'].isoformat()
-            if 'failed_at' in kwargs:
-                update_data['failed_at'] = kwargs['failed_at'].isoformat()
-
-            # Add error/retry fields
-            if 'error_message' in kwargs:
-                update_data['error_message'] = kwargs['error_message']
-            if 'retry_count' in kwargs:
-                update_data['retry_count'] = kwargs['retry_count']
-
             supabase = self._get_supabase()
             supabase.table('outbound_messages').update(update_data).eq(
                 'id', message_id
