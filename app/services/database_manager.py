@@ -117,11 +117,16 @@ class DatabaseManager:
         configs = {}
 
         # Main database configuration (no PHI)
-        if os.getenv('MAIN_SUPABASE_URL'):
+        # Check for MAIN_SUPABASE_URL first, fallback to standard SUPABASE_URL
+        main_url = os.getenv('MAIN_SUPABASE_URL') or os.getenv('SUPABASE_URL')
+        main_anon_key = os.getenv('MAIN_SUPABASE_ANON_KEY') or os.getenv('SUPABASE_ANON_KEY')
+        main_service_key = os.getenv('MAIN_SUPABASE_SERVICE_KEY') or os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+
+        if main_url and main_service_key:
             configs[DatabaseType.MAIN] = DatabaseConfig(
-                url=os.getenv('MAIN_SUPABASE_URL'),
-                anon_key=os.getenv('MAIN_SUPABASE_ANON_KEY'),
-                service_key=os.getenv('MAIN_SUPABASE_SERVICE_KEY'),
+                url=main_url,
+                anon_key=main_anon_key or '',
+                service_key=main_service_key,
                 schema='public',
                 requires_baa=False
             )
