@@ -166,9 +166,23 @@ class OutboxProcessor:
         Subscribes to INSERT events on outbound_messages table.
         On new message, wakes up the polling loop immediately.
         """
+        import random
+
         while self.running:
             try:
                 await self._connect_realtime()
+
+                # Wait for connection to be established (with timeout)
+                for _ in range(50):  # 5 second timeout (50 * 0.1s)
+                    if self._realtime_connected:
+                        break
+                    await asyncio.sleep(0.1)
+
+                if not self._realtime_connected:
+                    logger.warning("Realtime connection timed out, will retry")
+                    await self._disconnect_realtime()
+                    await asyncio.sleep(5 + random.random() * 5)
+                    continue
 
                 # Keep alive while connected
                 while self.running and self._realtime_connected:
@@ -182,7 +196,6 @@ class OutboxProcessor:
                 self._stats['realtime_reconnects'] += 1
 
                 # Wait before reconnecting (with jitter)
-                import random
                 await asyncio.sleep(5 + random.random() * 5)
 
     async def _connect_realtime(self):
@@ -206,8 +219,9 @@ class OutboxProcessor:
 
             # Build Realtime URL (extract project ID from URL)
             # URL format: https://<project-id>.supabase.co
+            # Note: realtime-py adds /websocket automatically, so don't include it here
             project_id = supabase_url.replace("https://", "").replace("http://", "").split(".")[0]
-            realtime_url = f"wss://{project_id}.supabase.co/realtime/v1/websocket"
+            realtime_url = f"wss://{project_id}.supabase.co/realtime/v1"
 
             # Create Realtime client
             self._realtime_client = AsyncRealtimeClient(realtime_url, supabase_key)
