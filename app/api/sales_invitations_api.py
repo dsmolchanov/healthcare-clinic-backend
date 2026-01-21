@@ -425,10 +425,22 @@ async def validate_invitation_token(token: str):
 
     org_name = org_result.data.get('name', '') if org_result.data else ''
 
+    # Check if user already exists
+    existing_user = False
+    try:
+        users = supabase.auth.admin.list_users()
+        for u in users:
+            if u.email and u.email.lower() == inv['email'].lower():
+                existing_user = True
+                break
+    except Exception as e:
+        logger.warning(f"Could not check for existing user: {e}")
+
     return {
         "valid": True,
         "email": inv['email'],
         "role": inv['role'],
         "organization_name": org_name,
-        "expires_at": inv['expires_at']
+        "expires_at": inv['expires_at'],
+        "existing_user": existing_user
     }
