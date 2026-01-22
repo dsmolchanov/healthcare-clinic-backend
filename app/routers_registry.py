@@ -163,8 +163,12 @@ def register_hitl_routers(app: FastAPI):
 def register_sales_routers(app: FastAPI):
     """Register sales-specific routers."""
     from app.api import sales_calendar_api
+    from app.api import sales_teams_api
+    from app.api import sales_members_api
 
     app.include_router(sales_calendar_api.router)
+    app.include_router(sales_teams_api.router)
+    app.include_router(sales_members_api.router)
 
 
 def register_langgraph_router(app: FastAPI):

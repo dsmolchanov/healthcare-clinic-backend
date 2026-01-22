@@ -27,6 +27,7 @@ class InviteSalesStaffRequest(BaseModel):
     role: str = 'rep'  # admin, manager, rep
     name: Optional[str] = None
     organization_id: Optional[str] = None  # Required for superadmin inviting to specific org
+    team_id: Optional[str] = None  # Optional team to assign on join
 
 
 class InviteSalesStaffResponse(BaseModel):
@@ -186,8 +187,18 @@ async def invite_sales_staff(
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(days=7)
 
+    # Validate team_id if provided
+    if request.team_id:
+        team_check = supabase.schema('sales').table('teams')\
+            .select('id')\
+            .eq('id', request.team_id)\
+            .eq('organization_id', org_id)\
+            .execute()
+        if not team_check.data:
+            raise HTTPException(status_code=400, detail="Invalid team ID")
+
     # Create invitation record
-    invitation = supabase.schema('sales').table('staff_invitations').insert({
+    invitation_data = {
         'organization_id': org_id,
         'email': email_lower,
         'role': request.role,
@@ -195,7 +206,11 @@ async def invite_sales_staff(
         'invited_by': user.sub,
         'expires_at': expires_at.isoformat(),
         'status': 'pending'
-    }).execute()
+    }
+    if request.team_id:
+        invitation_data['team_id'] = request.team_id
+
+    invitation = supabase.schema('sales').table('staff_invitations').insert(invitation_data).execute()
 
     if not invitation.data:
         raise HTTPException(status_code=500, detail="Failed to create invitation")
@@ -352,13 +367,18 @@ async def accept_sales_invitation(request: AcceptSalesInvitationRequest):
 
     # Add user to sales team_members (with cleanup on failure)
     try:
-        supabase.schema('sales').table('team_members').insert({
+        member_data = {
             'user_id': user_id,
             'organization_id': inv['organization_id'],
             'role': inv['role'],
             'name': user_name,
             'email': inv['email']
-        }).execute()
+        }
+        # Include team_id if invitation had one
+        if inv.get('team_id'):
+            member_data['team_id'] = inv['team_id']
+
+        supabase.schema('sales').table('team_members').insert(member_data).execute()
     except Exception as e:
         # Cleanup orphan user if we just created it
         if not existing_user and user_id:
