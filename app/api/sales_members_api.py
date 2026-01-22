@@ -53,10 +53,11 @@ async def list_members(
     if not membership:
         raise HTTPException(status_code=403, detail="Not a member of any sales organization")
 
-    # Build query with team join
+    # Build query with team join - exclude superadmins from regular member lists
     query = supabase.schema('sales').table('team_members')\
         .select('*, teams:team_id(name)')\
         .eq('organization_id', membership['organization_id'])\
+        .eq('is_superadmin', False)\
         .order('name')
 
     if team_id:
