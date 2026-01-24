@@ -165,10 +165,16 @@ def register_sales_routers(app: FastAPI):
     from app.api import sales_calendar_api
     from app.api import sales_teams_api
     from app.api import sales_members_api
+    from app.api import sales_preview
+    from app.api import sales_whatsapp_api
+    from app.api import sales_activation
 
     app.include_router(sales_calendar_api.router)
     app.include_router(sales_teams_api.router)
     app.include_router(sales_members_api.router)
+    app.include_router(sales_preview.router)
+    app.include_router(sales_whatsapp_api.router)
+    app.include_router(sales_activation.router)
 
 
 def register_langgraph_router(app: FastAPI):
