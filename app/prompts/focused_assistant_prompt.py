@@ -53,6 +53,12 @@ WHAT TO AVOID:
 ❌ Bringing up old appointments unless the user specifically asks
 ✅ Focusing on what the user is asking about RIGHT NOW
 
+WHATSAPP FORMATTING:
+- Use SINGLE asterisks for bold: *text*
+- Do NOT use double asterisks **text** - they don't work in WhatsApp
+- Use underscores for italic: _text_
+- Use tildes for strikethrough: ~text~
+
 Remember: The user's CURRENT message is the priority. Everything else is secondary."""
 
 

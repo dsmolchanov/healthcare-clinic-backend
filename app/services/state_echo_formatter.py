@@ -20,10 +20,10 @@ class StateEchoFormatter:
                 "{time_line}"
                 "Проверяю доступность..."
             ),
-            'service_set': "• Услуга — **{service}**\n",
-            'doctor_set': "• Предпочитаемый врач — **{doctor}**\n",
+            'service_set': "• Услуга — *{service}*\n",
+            'doctor_set': "• Предпочитаемый врач — *{doctor}*\n",
             'exclusions': "• Не предлагаю: {items}\n",
-            'time_window': "• Период — **{window}**\n"
+            'time_window': "• Период — *{window}*\n"
         },
         'en': {
             'correction_acknowledged': (
@@ -34,10 +34,10 @@ class StateEchoFormatter:
                 "{time_line}"
                 "Checking availability..."
             ),
-            'service_set': "• Service: **{service}**\n",
-            'doctor_set': "• Preferred doctor: **{doctor}**\n",
+            'service_set': "• Service: *{service}*\n",
+            'doctor_set': "• Preferred doctor: *{doctor}*\n",
             'exclusions': "• Will not suggest: {items}\n",
-            'time_window': "• Time window: **{window}**\n"
+            'time_window': "• Time window: *{window}*\n"
         },
         'es': {
             'correction_acknowledged': (
@@ -48,10 +48,10 @@ class StateEchoFormatter:
                 "{time_line}"
                 "Verificando disponibilidad..."
             ),
-            'service_set': "• Servicio: **{service}**\n",
-            'doctor_set': "• Doctor preferido: **{doctor}**\n",
+            'service_set': "• Servicio: *{service}*\n",
+            'doctor_set': "• Doctor preferido: *{doctor}*\n",
             'exclusions': "• No sugeriré: {items}\n",
-            'time_window': "• Período: **{window}**\n"
+            'time_window': "• Período: *{window}*\n"
         },
         'he': {
             'correction_acknowledged': (
@@ -62,10 +62,10 @@ class StateEchoFormatter:
                 "{time_line}"
                 "בודק זמינות..."
             ),
-            'service_set': "• שירות: **{service}**\n",
-            'doctor_set': "• רופא מועדף: **{doctor}**\n",
+            'service_set': "• שירות: *{service}*\n",
+            'doctor_set': "• רופא מועדף: *{doctor}*\n",
             'exclusions': "• לא אציע: {items}\n",
-            'time_window': "• תקופה: **{window}**\n"
+            'time_window': "• תקופה: *{window}*\n"
         }
     }
 
