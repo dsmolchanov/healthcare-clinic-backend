@@ -23,7 +23,7 @@ email-validator==2.1.1  # Required for pydantic EmailStr validation
 cryptography>=43.0.0
 certifi>=2024.0.0
 PyJWT==2.10.1  # JWT authentication (Phase 5)
-protobuf>=5.29.0,<6.0.0  # CVE-2026-0994 affects 6.x
+# Note: protobuf CVE-2026-0994 affects ALL versions, no fix released yet
 
 # Redis Cache
 redis==5.0.1
