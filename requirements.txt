@@ -2,7 +2,7 @@
 fastapi>=0.115.14  # Allow updates for starlette CVE fixes
 uvicorn[standard]==0.32.0
 python-dotenv==1.0.0
-python-multipart==0.0.18  # CVE-2024-24762, CVE-2024-53981
+python-multipart==0.0.22  # Fixed: CVE-2024-24762, CVE-2024-53981, CVE-2026-24486
 starlette>=0.49.1  # Explicit pin for CVE fixes
 
 # Database
@@ -23,6 +23,7 @@ email-validator==2.1.1  # Required for pydantic EmailStr validation
 cryptography>=43.0.0
 certifi>=2024.0.0
 PyJWT==2.10.1  # JWT authentication (Phase 5)
+protobuf>=5.29.0,<6.0.0  # CVE-2026-0994 affects 6.x
 
 # Redis Cache
 redis==5.0.1
