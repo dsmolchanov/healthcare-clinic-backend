@@ -8,8 +8,9 @@ Usage:
 
 Environment Variables:
     INSTANCE_NAME - WhatsApp instance to process (optional if passed as arg)
+    INSTANCE_NAME_FALLBACK - Fallback instance if auto-detection fails
     REDIS_URL - Redis connection URL
-    EVOLUTION_API_URL - Evolution API base URL
+    EVOLUTION_API_URL / EVOLUTION_SERVER_URL - Evolution API base URL
     EVOLUTION_API_KEY - Evolution API key
 """
 import asyncio
@@ -46,6 +47,19 @@ from app.services.whatsapp_queue import WhatsAppWorker
 worker_instance = None
 
 
+def _extract_instance_name(integration: dict) -> str | None:
+    """Extract instance name from integration record with legacy key support."""
+    if not integration:
+        return None
+
+    instance_name = integration.get("instance_name")
+    if instance_name:
+        return instance_name
+
+    config = integration.get("config") or {}
+    return config.get("instance_name") or config.get("instance") or config.get("instanceName")
+
+
 def signal_handler(signum, frame):
     """Handle graceful shutdown on SIGINT/SIGTERM"""
     logger.info(f"Received signal {signum}, shutting down gracefully...")
@@ -72,27 +86,32 @@ async def main():
 
                 # Get ALL active Evolution instances from integrations (more reliable)
                 integration_result = supabase.schema('healthcare').table('integrations') \
-                    .select('config, enabled, organization_id') \
+                    .select('instance_name, config, enabled, organization_id, created_at, updated_at') \
                     .eq('type', 'whatsapp') \
                     .eq('enabled', True) \
                     .execute()
 
-                if integration_result.data and len(integration_result.data) > 0:
+                integrations = integration_result.data or []
+                if integrations:
                     # Log all found instances
-                    logger.info(f"Found {len(integration_result.data)} active WhatsApp integration(s)")
-                    for idx, integration in enumerate(integration_result.data):
-                        config = integration.get('config', {})
-                        inst = config.get('instance_name')
-                        logger.info(f"  [{idx}] Instance: {inst}, Org: {integration.get('organization_id')}")
+                    logger.info(f"Found {len(integrations)} active WhatsApp integration(s)")
+                    candidates = []
+                    for idx, integration in enumerate(integrations):
+                        inst = _extract_instance_name(integration)
+                        logger.info(f"  [{idx}] Instance: {inst or 'MISSING'}, Org: {integration.get('organization_id')}")
+                        if inst:
+                            candidates.append((integration, inst))
 
-                    # Use the first enabled integration
-                    config = integration_result.data[0].get('config', {})
-                    instance_name = config.get('instance_name')
-                    if instance_name:
+                    if candidates:
+                        # Prefer the most recently updated/created integration if timestamps exist
+                        candidates.sort(
+                            key=lambda item: item[0].get("updated_at") or item[0].get("created_at") or "",
+                            reverse=True
+                        )
+                        instance_name = candidates[0][1]
                         logger.info(f"✅ Selected instance: {instance_name}")
                     else:
-                        logger.warning("⚠️ Instance config missing 'instance' field, checking fallback...")
-                        instance_name = None
+                        logger.warning("⚠️ No instance name found in active integrations, checking fallback tables...")
 
                 # Fallback to whatsapp_instances table
                 if not instance_name:
@@ -111,15 +130,23 @@ async def main():
                         instance_name = result.data[0]['instance_name']
                         logger.info(f"✅ Selected most recent: {instance_name}")
                     else:
-                        # Final fallback to hardcoded default (updated to current instance)
-                        instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1763141478931"
-                        logger.warning(f"⚠️ No active instances found, using current fallback: {instance_name}")
+                        fallback_instance = os.getenv("INSTANCE_NAME_FALLBACK")
+                        if fallback_instance:
+                            instance_name = fallback_instance
+                            logger.warning(f"⚠️ No active instances found, using INSTANCE_NAME_FALLBACK: {instance_name}")
+                        else:
+                            logger.error("❌ No active instances found. Set INSTANCE_NAME or INSTANCE_NAME_FALLBACK.")
+                            sys.exit(1)
 
             except Exception as e:
                 logger.error(f"Failed to auto-detect instance: {e}", exc_info=True)
-                # Fallback to current default (updated to current instance)
-                instance_name = "clinic-4e8ddba1-ad52-4613-9a03-ec64636b3f6c-1763141478931"
-                logger.warning(f"Using fallback instance: {instance_name}")
+                fallback_instance = os.getenv("INSTANCE_NAME_FALLBACK")
+                if fallback_instance:
+                    instance_name = fallback_instance
+                    logger.warning(f"Using INSTANCE_NAME_FALLBACK: {instance_name}")
+                else:
+                    logger.error("❌ No INSTANCE_NAME_FALLBACK set. Exiting.")
+                    sys.exit(1)
 
     logger.info("="*80)
     logger.info("WhatsApp Queue Worker Starting")
@@ -133,13 +160,16 @@ async def main():
         # Strip credentials: redis://user:pass@host:port → host:port
         redis_info = redis_url.split('@')[-1] if '@' in redis_url else 'configured'
         logger.info(f"Redis URL: {redis_info}")
-    logger.info(f"Evolution API: {os.getenv('EVOLUTION_SERVER_URL', 'NOT SET')}")
+    evolution_url = os.getenv("EVOLUTION_API_URL") or os.getenv("EVOLUTION_SERVER_URL")
+    logger.info(f"Evolution API: {evolution_url or 'NOT SET'}")
     logger.info(f"Evolution API Key: {'SET' if os.getenv('EVOLUTION_API_KEY') else 'NOT SET'}")
     logger.info("="*80)
 
     # Validate required environment variables
-    required_vars = ['REDIS_URL', 'EVOLUTION_SERVER_URL', 'EVOLUTION_API_KEY']
+    required_vars = ['REDIS_URL', 'EVOLUTION_API_KEY']
     missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if not evolution_url:
+        missing_vars.append("EVOLUTION_API_URL or EVOLUTION_SERVER_URL")
 
     if missing_vars:
         logger.error(f"❌ Missing required environment variables: {', '.join(missing_vars)}")
