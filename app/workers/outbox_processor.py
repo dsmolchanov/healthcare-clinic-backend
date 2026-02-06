@@ -41,6 +41,12 @@ class OutboxProcessor:
     BACKOFF_MULTIPLIER = 2.0     # Exponential backoff multiplier
     REALTIME_RESET_INTERVAL = 5.0  # Reset to fast polling after Realtime event
 
+    # Realtime subscription configuration
+    REALTIME_SUBSCRIBE_TIMEOUT = 15.0  # Seconds to wait for SUBSCRIBED state
+    REALTIME_MAX_CONSECUTIVE_FAILURES = 5  # Give up on Realtime after N failures
+    REALTIME_BACKOFF_BASE = 10.0  # Base reconnect delay (seconds)
+    REALTIME_BACKOFF_MAX = 300.0  # Max reconnect delay (5 minutes)
+
     def __init__(self):
         self._supabase = None
         self._realtime_client = None
@@ -54,6 +60,8 @@ class OutboxProcessor:
 
         # Realtime state
         self._realtime_connected = False
+        self._realtime_gave_up = False  # True when falling back to polling-only
+        self._realtime_consecutive_failures = 0
         self._wake_event = asyncio.Event()  # Signaled by Realtime on INSERT
         self._last_realtime_event = 0.0     # Timestamp of last Realtime event
 
@@ -161,42 +169,94 @@ class OutboxProcessor:
 
     async def _realtime_loop(self):
         """
-        Realtime subscription loop with automatic reconnection.
+        Realtime subscription loop with automatic reconnection and backoff.
 
         Subscribes to INSERT events on outbound_messages table.
         On new message, wakes up the polling loop immediately.
+        Falls back to polling-only after repeated failures.
         """
         import random
 
         while self.running:
+            # Check if we've given up on Realtime
+            if self._realtime_gave_up:
+                # Sleep for a long time, then try again periodically
+                logger.info(
+                    "Realtime disabled (polling-only mode). "
+                    f"Will retry in {self.REALTIME_BACKOFF_MAX}s"
+                )
+                await asyncio.sleep(self.REALTIME_BACKOFF_MAX)
+                self._realtime_gave_up = False
+                self._realtime_consecutive_failures = 0
+                continue
+
             try:
                 await self._connect_realtime()
 
-                # Wait for connection to be established (with timeout)
-                for _ in range(50):  # 5 second timeout (50 * 0.1s)
-                    if self._realtime_connected:
-                        break
-                    await asyncio.sleep(0.1)
+                # Wait for subscription to reach SUBSCRIBED state
+                timeout = self.REALTIME_SUBSCRIBE_TIMEOUT
+                elapsed = 0.0
+                while elapsed < timeout and not self._realtime_connected:
+                    await asyncio.sleep(0.2)
+                    elapsed += 0.2
 
                 if not self._realtime_connected:
-                    logger.warning("Realtime connection timed out, will retry")
+                    self._realtime_consecutive_failures += 1
+                    logger.warning(
+                        f"Realtime subscription timed out after {timeout}s "
+                        f"(failure {self._realtime_consecutive_failures}/"
+                        f"{self.REALTIME_MAX_CONSECUTIVE_FAILURES})"
+                    )
                     await self._disconnect_realtime()
-                    await asyncio.sleep(5 + random.random() * 5)
+
+                    # Check if we should give up
+                    if self._realtime_consecutive_failures >= self.REALTIME_MAX_CONSECUTIVE_FAILURES:
+                        self._realtime_gave_up = True
+                        logger.warning(
+                            "Realtime subscription failed too many times. "
+                            "Falling back to polling-only mode. "
+                            "Check that healthcare.outbound_messages is added to "
+                            "supabase_realtime publication."
+                        )
+                        continue
+
+                    # Exponential backoff with jitter
+                    delay = min(
+                        self.REALTIME_BACKOFF_BASE * (2 ** (self._realtime_consecutive_failures - 1)),
+                        self.REALTIME_BACKOFF_MAX
+                    )
+                    delay *= random.uniform(0.8, 1.2)
+                    logger.info(f"Retrying Realtime in {delay:.0f}s")
+                    await asyncio.sleep(delay)
                     continue
+
+                # Connected successfully - reset failure counter
+                self._realtime_consecutive_failures = 0
+                logger.info("Realtime subscription active, monitoring connection")
 
                 # Keep alive while connected
                 while self.running and self._realtime_connected:
-                    await asyncio.sleep(5)  # Health check interval
+                    await asyncio.sleep(10)  # Health check interval
+
+                # If we get here, connection was lost
+                if self.running:
+                    logger.warning("Realtime connection lost, will reconnect")
 
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error(f"Realtime subscription error: {e}")
                 self._realtime_connected = False
+                self._realtime_consecutive_failures += 1
                 self._stats['realtime_reconnects'] += 1
 
-                # Wait before reconnecting (with jitter)
-                await asyncio.sleep(5 + random.random() * 5)
+                # Backoff with jitter
+                delay = min(
+                    self.REALTIME_BACKOFF_BASE * (2 ** (self._realtime_consecutive_failures - 1)),
+                    self.REALTIME_BACKOFF_MAX
+                )
+                delay *= random.uniform(0.8, 1.2)
+                await asyncio.sleep(delay)
 
     async def _connect_realtime(self):
         """
@@ -249,11 +309,11 @@ class OutboxProcessor:
             self._realtime_channel = self._realtime_client.channel('outbox-inserts')
             self._realtime_channel.on_postgres_changes(
                 "INSERT",
-                schema='public',
+                schema='healthcare',
                 table='outbound_messages',
                 callback=on_insert
             )
-            self._realtime_channel.subscribe(on_subscribe)
+            await self._realtime_channel.subscribe(on_subscribe)
 
             # Start listening (this keeps the connection alive)
             # Run in background task since listen() blocks
@@ -280,7 +340,7 @@ class OutboxProcessor:
         try:
             if self._realtime_channel:
                 try:
-                    self._realtime_channel.unsubscribe()
+                    await self._realtime_channel.unsubscribe()
                 except Exception:
                     pass  # May already be unsubscribed
                 self._realtime_channel = None

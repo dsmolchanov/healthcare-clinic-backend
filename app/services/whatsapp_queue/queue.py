@@ -8,12 +8,28 @@ import time
 import uuid
 from typing import Dict, Any, Optional
 from redis import Redis
+from redis.backoff import ExponentialBackoff
+from redis.exceptions import (
+    ConnectionError as RedisConnectionError,
+    TimeoutError as RedisTimeoutError,
+)
+from redis.retry import Retry
 
 from .config import REDIS_URL, CONSUMER_GROUP, logger
 
 def get_redis_client() -> Redis:
-    """Get Redis client (synchronous)"""
-    return Redis.from_url(REDIS_URL, decode_responses=True)
+    """Get Redis client with automatic retry on connection errors."""
+    retry = Retry(ExponentialBackoff(cap=10, base=0.5), retries=3)
+    return Redis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        retry=retry,
+        retry_on_error=[RedisConnectionError, RedisTimeoutError],
+        socket_keepalive=True,
+        socket_timeout=30,
+        socket_connect_timeout=10,
+        health_check_interval=60,
+    )
 
 # Stream key patterns
 STREAM_KEY_TEMPLATE = "wa:{instance}:stream"

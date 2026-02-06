@@ -9,6 +9,8 @@ import time
 import random
 from typing import Dict, Any, Optional
 
+from redis.exceptions import ConnectionError as RedisConnectionError
+
 from .config import (
     CONSUMER_GROUP, MAX_DELIVERIES,
     BASE_BACKOFF, MAX_BACKOFF, TOKENS_PER_SECOND, BUCKET_CAPACITY,
@@ -346,9 +348,26 @@ class WhatsAppWorker:
                     # Let tasks finish; avoid unhandled exceptions
                     await asyncio.gather(*tasks, return_exceptions=True)
 
+            except (ConnectionError, RedisConnectionError, OSError, TimeoutError) as e:
+                logger.warning(f"Redis connection error: {e}. Reconnecting...")
+                try:
+                    self.redis = get_redis_client()
+                    ensure_group(self.redis, self.instance)
+                    logger.info("Redis reconnected successfully")
+                except Exception as reconnect_err:
+                    logger.error(f"Redis reconnect failed: {reconnect_err}")
+                await asyncio.sleep(2)
             except Exception as e:
                 logger.error(f"Error in worker loop: {e}", exc_info=True)
-                await asyncio.sleep(0.5)
+                # Check if it's a redis connection error wrapped in another exception
+                if "Connection" in str(e) or "closed" in str(e).lower():
+                    try:
+                        self.redis = get_redis_client()
+                        ensure_group(self.redis, self.instance)
+                        logger.info("Redis reconnected after wrapped connection error")
+                    except Exception:
+                        pass
+                await asyncio.sleep(1)
 
         logger.info(f"Worker stopped. Processed: {self.processed_count}, Failed: {self.failed_count}")
 
