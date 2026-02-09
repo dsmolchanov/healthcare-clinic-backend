@@ -343,7 +343,7 @@ class CalendarOAuthManager:
         Returns:
             Webhook registration result from Google API
         """
-        webhook_url = f"{os.getenv('APP_BASE_URL', 'https://healthcare-clinic-backend.fly.dev')}/webhooks/calendar/google"
+        webhook_url = f"{os.getenv('APP_BASE_URL', 'https://api.plaintalk.io')}/webhooks/calendar/google"
         channel_id = f"clinic_{clinic_id}_{uuid.uuid4().hex[:8]}"
 
         async with aiohttp.ClientSession() as session:

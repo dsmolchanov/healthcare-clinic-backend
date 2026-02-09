@@ -43,7 +43,7 @@ async def _register_google_webhook(
     options = ClientOptions(schema='healthcare')
     supabase = create_client(supabase_url, supabase_key, options=options)
 
-    webhook_url = f"{os.getenv('APP_BASE_URL', 'https://healthcare-clinic-backend.fly.dev')}/webhooks/calendar/google"
+    webhook_url = f"{os.getenv('APP_BASE_URL', 'https://api.plaintalk.io')}/webhooks/calendar/google"
     channel_id = f"clinic_{clinic_id}_{uuid.uuid4().hex[:8]}"
 
     async with aiohttp.ClientSession() as session:
@@ -648,7 +648,7 @@ async def setup_calendar(clinic_id: str, data: QuickCalendar):
         # Generate Google OAuth URL for calendar access
         google_client_id = os.environ.get("GOOGLE_CLIENT_ID")
         google_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
-        redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "https://healthcare-clinic-backend.fly.dev/api/onboarding/calendar/callback")
+        redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "https://api.plaintalk.io/api/onboarding/calendar/callback")
 
         # Validate credentials exist - if not, return mock success for demo
         if not google_client_id or not google_client_secret:
@@ -775,7 +775,7 @@ async def handle_calendar_callback(code: str = None, state: str = None, error: s
 
         google_client_id = os.environ.get("GOOGLE_CLIENT_ID")
         google_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
-        redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "https://healthcare-clinic-backend.fly.dev/api/onboarding/calendar/callback")
+        redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "https://api.plaintalk.io/api/onboarding/calendar/callback")
 
         token_url = "https://oauth2.googleapis.com/token"
         token_data = {
