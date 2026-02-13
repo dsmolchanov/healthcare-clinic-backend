@@ -272,8 +272,8 @@ class SalesCalendarOAuthManager:
         """
         try:
             result = self.supabase.table('calendar_integrations').select(
-                'id, provider, calendar_id, token_expires_at, sync_enabled'
-            ).eq('rep_id', rep_id).single().execute()
+                'id, provider, calendar_id, token_expires_at, sync_enabled, refresh_token'
+            ).eq('rep_id', rep_id).execute()
 
             if not result.data:
                 return {
@@ -282,21 +282,16 @@ class SalesCalendarOAuthManager:
                     'message': 'No calendar connected'
                 }
 
-            integration = result.data
-            expires_at = integration.get('token_expires_at')
-            expired = False
-
-            if expires_at:
-                expires_dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-                expired = expires_dt < datetime.utcnow().replace(tzinfo=expires_dt.tzinfo)
+            integration = result.data[0]
+            has_refresh_token = bool(integration.get('refresh_token'))
 
             return {
                 'connected': True,
                 'provider': integration.get('provider'),
                 'calendar_id': integration.get('calendar_id'),
                 'sync_enabled': integration.get('sync_enabled'),
-                'expired': expired,
-                'message': 'Calendar connected' if not expired else 'Calendar connection expired'
+                'expired': not has_refresh_token,
+                'message': 'Calendar connected' if has_refresh_token else 'Calendar connection expired - please reconnect'
             }
 
         except Exception as e:

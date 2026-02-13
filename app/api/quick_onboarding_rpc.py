@@ -750,14 +750,40 @@ async def handle_calendar_callback(code: str = None, state: str = None, error: s
             # Production mode - parse JSON state
             try:
                 state_data = json.loads(state)
-                clinic_id = state_data.get('clinic_id')
-                state_token = state_data.get('token')
-                demo_mode = False
-            except:
+            except (json.JSONDecodeError, ValueError):
                 return {
                     'success': False,
                     'error': 'Invalid state parameter'
                 }
+
+            # Delegate to SalesCalendarOAuthManager for sales schema flows
+            if state_data.get('schema_type') == 'sales':
+                try:
+                    from app.calendar.sales_oauth_manager import get_sales_calendar_oauth_manager
+                    from fastapi.responses import HTMLResponse
+                    sales_mgr = get_sales_calendar_oauth_manager()
+                    result = await sales_mgr.handle_google_callback(code=code, state=state)
+                    if result.get('success'):
+                        return HTMLResponse(content="""
+                        <!DOCTYPE html><html><head><title>Calendar Connected</title>
+                        <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%)}.container{background:white;padding:40px;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.3);text-align:center;max-width:400px}h1{color:#10b981;margin-bottom:10px}p{color:#6b7280}</style>
+                        <script>setTimeout(function(){window.close()},2000);</script>
+                        </head><body><div class="container"><h1>Calendar Connected!</h1>
+                        <p>Your Google Calendar has been successfully connected. This window will close automatically.</p>
+                        </div></body></html>""")
+                    return result
+                except Exception as e:
+                    print(f"Sales calendar callback error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return {
+                        'success': False,
+                        'error': f'Failed to store calendar integration: {str(e)}'
+                    }
+
+            clinic_id = state_data.get('clinic_id')
+            state_token = state_data.get('token')
+            demo_mode = False
 
         # Verify state token (optional for quick onboarding)
         try:
