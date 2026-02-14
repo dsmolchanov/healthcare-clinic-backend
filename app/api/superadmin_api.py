@@ -373,6 +373,43 @@ async def get_organization_details(
 # Endpoint 4: Recent Errors
 # ============================================================================
 
+@router.delete("/organizations/{org_id}")
+async def delete_organization(
+    org_id: str,
+    user: TokenPayload = Depends(require_superadmin()),
+):
+    """
+    Permanently delete an organization and all its data. Superadmin only.
+    Uses the sales.delete_organization RPC which cascades to all child tables.
+    """
+    supabase = _get_supabase()
+
+    try:
+        result = supabase.rpc('delete_organization', {
+            'p_organization_id': org_id,
+            'p_user_id': user.sub,
+        }).execute()
+
+        data = result.data
+        if not data or not data.get('success'):
+            error = (data or {}).get('error', 'unknown')
+            message = (data or {}).get('message', 'Failed to delete organization')
+            if error == 'not_found':
+                raise HTTPException(status_code=404, detail=message)
+            if error == 'unauthorized':
+                raise HTTPException(status_code=403, detail=message)
+            raise HTTPException(status_code=400, detail=message)
+
+        logger.info(f"Superadmin {user.sub} deleted organization {org_id}")
+        return data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting organization {org_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete organization")
+
+
 @router.get("/recent-errors")
 async def get_recent_errors(
     limit: int = Query(100, ge=1, le=500),
