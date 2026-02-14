@@ -128,9 +128,11 @@ class EvolutionAPIClient:
 
             # Extract QR code if present in the response
             qrcode_data = None
-            # Evolution API returns QR code in 'qr' field, not 'qrcode'
+            # Evolution API returns QR code in both 'qr.base64' and 'qrcode' fields
             if isinstance(result.get("qr"), dict):
                 qrcode_data = result["qr"].get("base64")
+            if not qrcode_data and result.get("qrcode"):
+                qrcode_data = result["qrcode"]
 
             return {
                 "success": True,

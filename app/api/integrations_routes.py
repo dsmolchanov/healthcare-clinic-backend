@@ -361,161 +361,155 @@ async def create_evolution_instance(data: EvolutionInstanceCreate):
     """Create a new Evolution API instance for WhatsApp"""
     try:
         from ..main import supabase
-        import uuid as uuid_lib
 
-        # PREVENTION STRATEGY 2: Check for existing integration and orphaned instances
+        # Resolve instance_name from agents.integrations (canonical source)
+        agents_integration = None
+        instance_name = data.instance_name
         try:
-            existing = supabase.schema("healthcare").table("integrations").select("*").eq(
-                "organization_id", data.organization_id
-            ).eq("type", "whatsapp").eq("provider", "evolution").eq("enabled", True).execute()
+            agents_result = supabase.schema("agents").table("integrations").select(
+                "id, instance_name, webhook_token, team_id, status"
+            ).eq("organization_id", data.organization_id).eq(
+                "type", "whatsapp"
+            ).eq("enabled", True).limit(1).execute()
 
-            if existing.data and len(existing.data) > 0:
-                existing_instance = existing.data[0]
-                instance_name = existing_instance.get("config", {}).get("instance_name")
+            if agents_result.data:
+                agents_integration = agents_result.data[0]
+                if agents_integration.get("instance_name"):
+                    instance_name = agents_integration["instance_name"]
+                    print(f"[Create] Using instance_name from agents.integrations: {instance_name}")
+        except Exception as e:
+            print(f"[Create] Could not check agents.integrations: {e}")
 
-                # Check if the instance still exists in Evolution
-                async with EvolutionAPIClient() as evolution_client:
-                    try:
-                        status = await evolution_client.get_instance_status(instance_name)
-
-                        if status.get("exists"):
-                            # Instance exists in both DB and Evolution - return existing
-                            print(f"✅ Found existing instance in DB and Evolution: {instance_name}")
-                            return {
-                                "success": True,
-                                "instance_name": instance_name,
-                                "reused": True,
-                                "status": existing_instance.get("status"),
-                                "message": "Reusing existing WhatsApp integration",
-                                "qrcode": None  # Frontend will call /status to get QR if needed
-                            }
-                        else:
-                            # Instance in DB but not in Evolution (orphaned DB record)
-                            print(f"⚠️  Found orphaned DB record for {instance_name} - cleaning up")
-                            supabase.schema("healthcare").table("integrations").delete().eq(
-                                "id", existing_instance["id"]
-                            ).execute()
-                            print(f"✅ Cleaned up orphaned database record")
-                            # Continue to create new instance
-                    except Exception as evolution_check_error:
-                        print(f"⚠️  Failed to check Evolution status: {evolution_check_error}")
-                        # If we can't check Evolution, assume it's orphaned and clean it up
-                        # This handles cases where Evolution API is down or instance is truly orphaned
-                        print(f"⚠️  Treating as orphaned record and cleaning up: {instance_name}")
-                        try:
-                            supabase.schema("healthcare").table("integrations").delete().eq(
-                                "id", existing_instance["id"]
-                            ).execute()
-                            print(f"✅ Cleaned up potentially orphaned database record")
-                            # Continue to create new instance
-                        except Exception as cleanup_error:
-                            print(f"❌ Failed to clean up orphaned record: {cleanup_error}")
-                            return {
-                                "success": False,
-                                "error": "Failed to clean up existing integration",
-                                "message": "Please manually delete the existing integration and try again"
-                            }
-        except Exception as check_error:
-            print(f"Warning: Failed to check for existing integration: {check_error}")
-            # Continue anyway - RPC has its own check
-
-        # Initialize Evolution API client using async context manager
-        async with EvolutionAPIClient() as evolution_client:
-            # ORPHAN CLEANUP: Delete any orphaned instances for this organization
-            # This prevents multiple instances from accumulating when frontend retries
+        # Fallback: check healthcare.integrations for legacy orgs
+        if not agents_integration:
             try:
-                print(f"[Create] Checking for orphaned instances for org {data.organization_id}...")
+                existing = supabase.schema("healthcare").table("integrations").select("*").eq(
+                    "organization_id", data.organization_id
+                ).eq("type", "whatsapp").eq("provider", "evolution").eq("enabled", True).execute()
+
+                if existing.data and len(existing.data) > 0:
+                    existing_instance = existing.data[0]
+                    legacy_name = existing_instance.get("config", {}).get("instance_name")
+
+                    async with EvolutionAPIClient() as evolution_client:
+                        try:
+                            status = await evolution_client.get_instance_status(legacy_name)
+                            if status.get("exists"):
+                                print(f"✅ Found existing instance in DB and Evolution: {legacy_name}")
+                                return {
+                                    "success": True,
+                                    "instance_name": legacy_name,
+                                    "reused": True,
+                                    "status": existing_instance.get("status"),
+                                    "message": "Reusing existing WhatsApp integration",
+                                    "qrcode": None
+                                }
+                        except Exception:
+                            pass
+                    # Orphaned legacy record — clean up
+                    supabase.schema("healthcare").table("integrations").delete().eq(
+                        "id", existing_instance["id"]
+                    ).execute()
+            except Exception as check_error:
+                print(f"Warning: Failed to check healthcare.integrations: {check_error}")
+
+        # Initialize Evolution API client
+        async with EvolutionAPIClient() as evolution_client:
+            # Clean up orphaned Evolution instances for this org
+            try:
                 all_instances = await evolution_client.fetch_all_instances()
-
-                # Find instances that belong to this organization
                 org_prefix = f"clinic-{data.organization_id}-"
-                orphaned_instances = []
-
                 for inst_data in all_instances:
                     inst = inst_data.get('instance', {})
                     inst_name = inst.get('instanceName', '')
-
-                    # Check if this is an instance for our organization
-                    if inst_name.startswith(org_prefix) and inst_name != data.instance_name:
-                        orphaned_instances.append(inst_name)
-
-                # Delete orphaned instances
-                if orphaned_instances:
-                    print(f"[Create] Found {len(orphaned_instances)} orphaned instance(s) for org {data.organization_id}")
-                    for orphan in orphaned_instances:
+                    if inst_name.startswith(org_prefix) and inst_name != instance_name:
                         try:
-                            print(f"[Create] Deleting orphaned instance: {orphan}")
-                            await evolution_client.delete_instance(orphan)
-                            print(f"[Create] ✅ Deleted orphaned instance: {orphan}")
-                        except Exception as delete_error:
-                            print(f"[Create] ⚠️ Failed to delete orphaned instance {orphan}: {delete_error}")
-                            # Continue anyway - best effort cleanup
-                else:
-                    print(f"[Create] No orphaned instances found for org {data.organization_id}")
-
+                            await evolution_client.delete_instance(inst_name)
+                            print(f"[Create] Deleted orphaned instance: {inst_name}")
+                        except Exception:
+                            pass
             except Exception as cleanup_error:
-                print(f"[Create] ⚠️ Orphan cleanup failed (non-fatal): {cleanup_error}")
-                # Continue with instance creation even if cleanup fails
+                print(f"[Create] Orphan cleanup failed (non-fatal): {cleanup_error}")
 
             # Create the instance
             result = await evolution_client.create_instance(
-                tenant_id=data.organization_id,  # Use organization_id as tenant_id
-                instance_name=data.instance_name
+                tenant_id=data.organization_id,
+                instance_name=instance_name
             )
 
-            # CRITICAL: Set webhook configuration AFTER instance creation
-            # Evolution API requires a separate webhook setup call
+            # Set webhook configuration after instance creation
             if result.get("success"):
-                try:
-                    webhook_url = result.get("webhook_url", f"{os.getenv('EVOLUTION_SERVER_URL', 'https://evolution-api-prod.fly.dev')}/webhook/{data.instance_name}")
+                # Determine the correct webhook URL
+                webhook_url = None
+                if agents_integration and agents_integration.get("webhook_token"):
+                    # New agents schema: use token-based webhook URL
+                    token = agents_integration["webhook_token"]
+                    webhook_url = f"https://claude-agent-prod.fly.dev/webhooks/evolution/whatsapp/{token}"
+                    print(f"[Create] Using agents webhook URL: {webhook_url}")
+                else:
+                    # Legacy: instance-name-based webhook URL
+                    webhook_url = f"https://healthcare-clinic-backend.fly.dev/webhooks/evolution/{instance_name}"
+                    print(f"[Create] Using legacy webhook URL: {webhook_url}")
 
-                    print(f"[Create] Setting up webhooks for {data.instance_name}...")
+                try:
                     webhook_result = await evolution_client.set_webhook(
-                        instance_name=data.instance_name,
-                        webhook_url=webhook_url.replace('/webhook/', '/webhooks/evolution/'),  # Use correct URL
+                        instance_name=instance_name,
+                        webhook_url=webhook_url,
                         events=[
                             "QRCODE_UPDATED",
                             "MESSAGES_UPSERT",
                             "MESSAGES_UPDATE",
-                            "CONNECTION_UPDATE",  # CRITICAL for pairing
+                            "CONNECTION_UPDATE",
                             "SEND_MESSAGE"
                         ]
                     )
-
                     if webhook_result.get("success"):
                         print(f"[Create] ✅ Webhooks configured successfully")
                     else:
-                        print(f"[Create] ⚠️  Webhook configuration failed: {webhook_result.get('error')}")
-
+                        print(f"[Create] ⚠️  Webhook config failed: {webhook_result.get('error')}")
                 except Exception as webhook_error:
                     print(f"[Create] ⚠️  Warning: Failed to configure webhooks: {webhook_error}")
-                    # Continue anyway - webhooks can be configured later
 
-            # Save integration to database immediately using RPC
+            # Save integration to database
             if result.get("success"):
-                try:
-                    webhook_url = result.get("webhook_url", f"{os.getenv('EVOLUTION_SERVER_URL', 'https://evolution-api-prod.fly.dev')}/webhook/{data.instance_name}")
-
-                    db_result = supabase.rpc('save_evolution_integration', {
-                        'p_organization_id': data.organization_id,
-                        'p_instance_name': data.instance_name,
-                        'p_phone_number': None,  # Not connected yet
-                        'p_webhook_url': webhook_url
-                    }).execute()
-
-                    print(f"Created database record for {data.instance_name}: {db_result.data}")
-                    result["integration_saved"] = True
-
-                    # Notify workers about new instance
+                if agents_integration:
+                    # Update existing agents.integrations record with instance_name
                     try:
-                        notifier = InstanceNotifier()
-                        notifier.notify_added(data.instance_name, data.organization_id)
-                    except Exception as notify_error:
-                        print(f"Warning: Failed to notify workers about new instance: {notify_error}")
+                        supabase.schema("agents").table("integrations").update({
+                            "instance_name": instance_name,
+                            "status": "pending",
+                            "updated_at": datetime.utcnow().isoformat()
+                        }).eq("id", agents_integration["id"]).execute()
+                        print(f"[Create] Updated agents.integrations record for {instance_name}")
+                        result["integration_saved"] = True
+                    except Exception as db_error:
+                        print(f"Warning: Failed to update agents.integrations: {db_error}")
+                        result["integration_saved"] = False
+                else:
+                    # Legacy: save to healthcare.integrations via RPC
+                    try:
+                        db_result = supabase.rpc('save_evolution_integration', {
+                            'p_organization_id': data.organization_id,
+                            'p_instance_name': instance_name,
+                            'p_phone_number': None,
+                            'p_webhook_url': webhook_url
+                        }).execute()
+                        print(f"Created database record for {instance_name}: {db_result.data}")
+                        result["integration_saved"] = True
+                    except Exception as db_error:
+                        print(f"Warning: Failed to save to healthcare.integrations: {db_error}")
+                        result["integration_saved"] = False
 
-                except Exception as db_error:
-                    print(f"Warning: Failed to save integration to database: {db_error}")
-                    result["integration_saved"] = False
+                # Notify workers about new instance
+                try:
+                    notifier = InstanceNotifier()
+                    notifier.notify_added(instance_name, data.organization_id)
+                except Exception:
+                    pass
+
+            # Override instance_name in result to match what we used
+            if result.get("success"):
+                result["instance_name"] = instance_name
 
             return result
     except Exception as e:
