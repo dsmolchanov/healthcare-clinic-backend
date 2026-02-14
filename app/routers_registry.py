@@ -111,11 +111,13 @@ def register_admin_routers(app: FastAPI):
     from app.api import agents_api
     from app.api import memory_health
     from app.api import system_health
+    from app.api import superadmin_api
 
     app.include_router(admin_streams.router)
     app.include_router(agents_api.router)
     app.include_router(memory_health.router)
     app.include_router(system_health.router)
+    app.include_router(superadmin_api.router)
 
 
 def register_billing_routers(app: FastAPI):

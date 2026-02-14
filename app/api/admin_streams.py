@@ -1,14 +1,17 @@
 """
 Admin endpoints for Redis Streams management
 Provides operational tools for debugging and fixing queue issues
+
+All endpoints require superadmin authentication.
 """
-from fastapi import APIRouter, HTTPException
-from typing import Dict, Any
+from fastapi import APIRouter, Depends, HTTPException
+from typing import Dict, Any, Optional
 import os
 
 from app.services.whatsapp_queue.queue import stream_key, dlq_key
 from app.services.whatsapp_queue.config import CONSUMER_GROUP
 from app.config import get_redis_client
+from app.middleware.auth import require_superadmin, TokenPayload
 
 router = APIRouter(prefix="/admin/streams", tags=["admin"])
 
@@ -19,7 +22,7 @@ def get_instance_name() -> str:
 
 
 @router.post("/reset-to-latest")
-def reset_to_latest(instance: str = None):
+def reset_to_latest(instance: Optional[str] = None, _user: TokenPayload = Depends(require_superadmin())):
     """
     Reset consumer group to '$' (latest) - skip all existing messages.
     Use this to clear backlogs and start fresh from new messages only.
@@ -69,7 +72,7 @@ def reset_to_latest(instance: str = None):
 
 
 @router.post("/reset-to-begin")
-def reset_to_begin(instance: str = None):
+def reset_to_begin(instance: Optional[str] = None, _user: TokenPayload = Depends(require_superadmin())):
     """
     Reset consumer group to '0' (beginning) - reprocess all messages.
     ⚠️ Use with caution: messages will be redelivered (relies on idempotency).
@@ -120,7 +123,7 @@ def reset_to_begin(instance: str = None):
 
 
 @router.delete("/destroy-recreate")
-def destroy_recreate(instance: str = None):
+def destroy_recreate(instance: Optional[str] = None, _user: TokenPayload = Depends(require_superadmin())):
     """
     Destroy and recreate consumer group from scratch.
     ⚠️ DESTRUCTIVE: All pending message references are lost.
@@ -182,7 +185,7 @@ def destroy_recreate(instance: str = None):
 
 
 @router.post("/claim-pending-to-worker")
-def claim_pending_to_worker(instance: str = None, worker_consumer: str = None):
+def claim_pending_to_worker(instance: Optional[str] = None, worker_consumer: Optional[str] = None, _user: TokenPayload = Depends(require_superadmin())):
     """
     Claim all pending messages from idle/dead consumers to specified worker.
     Uses XAUTOCLAIM for efficient bulk transfer.
@@ -257,7 +260,7 @@ def claim_pending_to_worker(instance: str = None, worker_consumer: str = None):
 
 
 @router.get("/health")
-def streams_health(instance: str = None):
+def streams_health(instance: Optional[str] = None, _user: TokenPayload = Depends(require_superadmin())):
     """
     Comprehensive health check for streams.
     Alerts if queue is stuck or worker is not consuming.

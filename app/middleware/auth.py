@@ -210,6 +210,41 @@ def require_permission(action: str):
     return permission_checker
 
 
+def require_superadmin():
+    """
+    Factory for superadmin-only access control.
+
+    Checks `is_superadmin = TRUE` in `sales.team_members` for the authenticated user.
+    Stricter than require_permission() — even users with all permissions but no
+    is_superadmin flag are blocked.
+
+    Usage:
+        @app.get("/api/superadmin/overview")
+        async def overview(user: TokenPayload = Depends(require_superadmin())):
+            return {"data": "..."}
+    """
+    async def superadmin_checker(payload: TokenPayload = Depends(require_auth)) -> TokenPayload:
+        from app.services.database_manager import get_database_manager, DatabaseType
+        db_manager = get_database_manager()
+        supabase = db_manager.get_client(DatabaseType.MAIN)
+
+        result = supabase.schema('sales').table('team_members') \
+            .select('is_superadmin') \
+            .eq('user_id', payload.sub) \
+            .eq('is_superadmin', True) \
+            .execute()
+
+        if not result.data:
+            logger.warning(f"Superadmin access denied for user {payload.sub}")
+            raise HTTPException(
+                status_code=403,
+                detail="Superadmin access required"
+            )
+        return payload
+
+    return superadmin_checker
+
+
 def require_any_permission(*actions: str):
     """
     Factory for checking if user has any of the specified permissions.
