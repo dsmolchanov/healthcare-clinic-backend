@@ -114,6 +114,49 @@ async def list_integrations(
         except Exception as e:
             print(f"Healthcare WhatsApp integrations query error (non-fatal): {e}")
 
+        # Get WhatsApp integrations from agents schema (new orgs)
+        try:
+            agents_options = ClientOptions(schema='agents')
+            agents_supabase = create_client(
+                os.getenv("SUPABASE_URL"),
+                os.getenv("SUPABASE_SERVICE_ROLE_KEY"),
+                agents_options
+            )
+
+            query = agents_supabase.from_('integrations').select('*')
+            if organization_id:
+                query = query.eq("organization_id", organization_id)
+            query = query.eq("type", "whatsapp")
+
+            result = query.execute()
+
+            # Track IDs already added from healthcare to avoid duplicates
+            existing_ids = {i['id'] for i in all_integrations}
+
+            for integration in result.data:
+                if integration.get('id') in existing_ids:
+                    continue
+                all_integrations.append({
+                    'id': integration.get('id'),
+                    'organization_id': integration.get('organization_id'),
+                    'integration_type': 'whatsapp',
+                    'provider': integration.get('provider', 'evolution'),
+                    'status': integration.get('status', 'pending'),
+                    'display_name': integration.get('config', {}).get('display_name', 'WhatsApp Integration'),
+                    'description': 'Evolution API WhatsApp integration',
+                    'is_enabled': integration.get('enabled', False),
+                    'config': {
+                        **(integration.get('config') or {}),
+                        'instance_name': integration.get('instance_name'),
+                    },
+                    'webhook_token': integration.get('webhook_token'),
+                    'webhook_url': integration.get('webhook_url'),
+                    'created_at': integration.get('created_at'),
+                    'updated_at': integration.get('updated_at')
+                })
+        except Exception as e:
+            print(f"Agents WhatsApp integrations query error (non-fatal): {e}")
+
         # Get calendar integrations ONLY from healthcare schema
         try:
             healthcare_options = ClientOptions(schema='healthcare')
@@ -532,24 +575,42 @@ async def get_evolution_status(instance_name: str):
         # Update database if connected
         if status.get("is_truly_connected"):
             try:
-                # Find existing integration by instance name
-                result = supabase.schema("healthcare").table("integrations").select("*").eq(
-                    "config->>instance_name", instance_name
-                ).eq("type", "whatsapp").execute()
+                updated = False
 
-                # If found, update it
-                if result.data and len(result.data) > 0:
-                    org_id = result.data[0]["organization_id"]
+                # Try agents schema first
+                try:
+                    agents_result = supabase.schema("agents").table("integrations").select(
+                        "id, organization_id"
+                    ).eq("instance_name", instance_name).eq(
+                        "type", "whatsapp"
+                    ).limit(1).execute()
 
-                    # Use RPC to update
-                    supabase.rpc('save_evolution_integration', {
-                        'p_organization_id': org_id,
-                        'p_instance_name': instance_name,
-                        'p_phone_number': status.get('phone_number'),
-                        'p_webhook_url': f"{os.getenv('EVOLUTION_SERVER_URL', 'https://evolution-api-prod.fly.dev')}/webhook/{instance_name}"
-                    }).execute()
+                    if agents_result.data:
+                        supabase.schema("agents").table("integrations").update({
+                            "status": "active",
+                            "phone_number": status.get('phone_number'),
+                            "updated_at": datetime.utcnow().isoformat()
+                        }).eq("id", agents_result.data[0]["id"]).execute()
+                        print(f"Updated agents.integrations for {instance_name}")
+                        updated = True
+                except Exception:
+                    pass
 
-                    print(f"Updated WhatsApp integration for organization {org_id}")
+                # Fallback to healthcare schema
+                if not updated:
+                    result = supabase.schema("healthcare").table("integrations").select("*").eq(
+                        "config->>instance_name", instance_name
+                    ).eq("type", "whatsapp").execute()
+
+                    if result.data and len(result.data) > 0:
+                        org_id = result.data[0]["organization_id"]
+                        supabase.rpc('save_evolution_integration', {
+                            'p_organization_id': org_id,
+                            'p_instance_name': instance_name,
+                            'p_phone_number': status.get('phone_number'),
+                            'p_webhook_url': f"{os.getenv('EVOLUTION_SERVER_URL', 'https://evolution-api-prod.fly.dev')}/webhook/{instance_name}"
+                        }).execute()
+                        print(f"Updated healthcare.integrations for {instance_name}")
             except Exception as db_error:
                 print(f"Warning: Failed to update database: {db_error}")
                 import traceback
