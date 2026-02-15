@@ -250,6 +250,31 @@ async def accept_invitation(request: AcceptInvitationRequest):
             'is_active': True,
             'joined_at': now.isoformat()
         }).execute()
+
+        # Also create agents.team_members row with custom_role_id
+        team_result = supabase.schema('agents').table('teams')\
+            .select('id')\
+            .eq('organization_id', inv['organization_id'])\
+            .eq('is_active', True)\
+            .limit(1)\
+            .maybe_single()\
+            .execute()
+
+        team_id = team_result.data['id'] if team_result.data else None
+
+        team_member_data = {
+            'user_id': user_id,
+            'organization_id': inv['organization_id'],
+            'team_id': team_id,
+            'role': inv['role'],
+            'email': inv['email'],
+            'is_owner': False,
+        }
+        if inv.get('custom_role_id'):
+            team_member_data['custom_role_id'] = inv['custom_role_id']
+
+        supabase.schema('agents').table('team_members').insert(team_member_data).execute()
+
     except Exception as e:
         # Cleanup: if we just created the user and DB insert failed, delete the orphan auth user
         if not existing_user and user_id:
