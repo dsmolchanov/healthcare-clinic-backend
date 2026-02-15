@@ -20,12 +20,14 @@ invite_limiter = RateLimiter()
 
 class InviteStaffRequest(BaseModel):
     email: EmailStr
-    role: str  # Will validate against user_role enum
+    role: str = "member"  # System role: 'admin' or 'member'
+    custom_role_id: Optional[str] = None  # UUID of custom role label
 
 class InviteStaffResponse(BaseModel):
     invitation_id: str
     email: str
     role: str
+    custom_role_id: Optional[str] = None
     expires_at: str
 
 @router.post("/invite", response_model=InviteStaffResponse)
@@ -44,9 +46,25 @@ async def invite_staff_member(
     supabase = db_manager.get_client(DatabaseType.MAIN) if DatabaseType.MAIN in db_manager.clients else list(db_manager.clients.values())[0]
     email_service = get_email_service()
 
-    # Validate role
-    valid_roles = ['owner', 'director', 'doctor', 'receptionist', 'viewer']
-    if request.role not in valid_roles:
+    # Validate system role
+    valid_roles = ['admin', 'member']
+    role = request.role
+
+    # If custom_role_id is provided, derive system role from the custom role
+    custom_role_id = request.custom_role_id
+    if custom_role_id:
+        custom_role = supabase.schema('agents').table('custom_roles')\
+            .select('system_role')\
+            .eq('id', custom_role_id)\
+            .eq('organization_id', user.organization_id)\
+            .single()\
+            .execute()
+        if custom_role.data:
+            role = custom_role.data['system_role']
+        else:
+            raise HTTPException(status_code=400, detail="Invalid custom_role_id")
+
+    if role not in valid_roles:
         raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {', '.join(valid_roles)}")
 
     # Normalize email to lowercase for case-insensitive comparison
@@ -90,15 +108,23 @@ async def invite_staff_member(
     expires_at = now + timedelta(days=7)
 
     # Create invitation record
-    invitation = supabase.schema('public').table('staff_invitations').insert({
+    invitation_data = {
         'organization_id': user.organization_id,
         'email': email_lower,
-        'role': request.role,
+        'role': role,
         'token_hash': token_hash,  # Store hash, not raw token
         'invited_by': user.sub,
         'expires_at': expires_at.isoformat(),
         'status': 'pending'
-    }).execute()
+    }
+    if custom_role_id:
+        invitation_data['custom_role_id'] = custom_role_id
+
+    # Try agents schema first (unified), fall back to public
+    try:
+        invitation = supabase.schema('agents').table('staff_invitations').insert(invitation_data).execute()
+    except Exception:
+        invitation = supabase.schema('public').table('staff_invitations').insert(invitation_data).execute()
 
     if not invitation.data:
         raise HTTPException(status_code=500, detail="Failed to create invitation")
@@ -135,7 +161,8 @@ async def invite_staff_member(
     return InviteStaffResponse(
         invitation_id=invitation.data[0]['id'],
         email=request.email,
-        role=request.role,
+        role=role,
+        custom_role_id=custom_role_id,
         expires_at=expires_at.isoformat()
     )
 
